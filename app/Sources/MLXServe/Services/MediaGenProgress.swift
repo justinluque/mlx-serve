@@ -66,6 +66,7 @@ enum MediaGenError: LocalizedError {
 enum MediaSSE {
     enum Event: Equatable {
         case progress(step: Int, total: Int, stage: String)
+        case preview(step: Int, total: Int, width: Int, height: Int, image: Data)
         case complete
         case failed(String)
         case ignored
@@ -77,6 +78,19 @@ enum MediaSSE {
             return .progress(step: ev["step"] as? Int ?? 0,
                              total: ev["total"] as? Int ?? 0,
                              stage: ev["stage"] as? String ?? "Generating")
+        case "preview":
+            let step = ev["step"] as? Int ?? 0
+            let total = ev["total"] as? Int ?? 0
+            let width = ev["width"] as? Int ?? 0
+            let height = ev["height"] as? Int ?? 0
+            if let imgStr = ev["image"] as? String,
+               let commaIdx = imgStr.range(of: ",") {
+                let b64 = String(imgStr[commaIdx.upperBound...])
+                if let data = Data(base64Encoded: b64) {
+                    return .preview(step: step, total: total, width: width, height: height, image: data)
+                }
+            }
+            return .ignored
         case "complete":
             return .complete
         case "error":

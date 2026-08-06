@@ -51,6 +51,10 @@ struct ImageGenView: View {
     @State private var condWeightsText: String = ""
     /// Style LoRA (Advanced): .safetensors adapter path ("" = none).
     @State private var loraPath: String = ""
+    /// Live-preview testing knobs (Advanced): see `advancedSection`'s
+    /// "Live preview (testing)" toggles.
+    @State private var previewLatentRGB: Bool = true
+    @State private var previewTAESD: Bool = true
     /// True while `hydrate()` seeds `@State` from saved settings. Hydrating
     /// `model`/`quality` fires their `.onChange` (applyModelDefaults /
     /// applyQualityDefaults) which would clobber the just-restored
@@ -75,6 +79,7 @@ struct ImageGenView: View {
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
             downloads.ensureNsfwClassifier() // best-effort: provision the shared content filter
+            downloads.ensurePreviewDecoder(for: model.bundle) // best-effort: provision the live-preview decoder
         }
         // Persist every other sticky field on change (model/quality persist in
         // their sections after applying preset defaults).
@@ -299,7 +304,11 @@ struct ImageGenView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
+            .onChange(of: model) { _, _ in
+                guard !hydrating else { return }
+                applyModelDefaults(); persist()
+                downloads.ensurePreviewDecoder(for: model.bundle)
+            }
             Text(lanModel.map { "Runs on \(LanPick.peer(of: $0)) over your network — nothing to download." } ?? "~\(model.approxRAMGB) GB RAM")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -482,6 +491,22 @@ struct ImageGenView: View {
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
             }
             } // model.supportsLoRA
+
+            Divider()
+            Text("Live preview (testing)").font(.caption.weight(.semibold))
+            Toggle("Latent RGB", isOn: $previewLatentRGB)
+                .font(.caption)
+                .help("The cheap per-step linear latent→RGB projection. On by default. Uncheck to test the TAESD decoder in isolation — if it fails or isn't downloaded, no preview frame is shown instead of silently falling back to this.")
+                .onChange(of: previewLatentRGB) { _, _ in guard !hydrating else { return }; persist() }
+            Toggle("TAESD", isOn: $previewTAESD)
+                .font(.caption)
+                .help("Prefer the sharper TAESD-family decoder when it's downloaded. On by default. Uncheck to compare against the plain Latent RGB projection.")
+                .onChange(of: previewTAESD) { _, _ in guard !hydrating else { return }; persist() }
+            if !previewLatentRGB && !previewTAESD {
+                Text("Both are off — live previews will be disabled for this generation.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -598,11 +623,34 @@ struct ImageGenView: View {
                     ContentUnavailableView("No generation yet", systemImage: "photo", description: Text("Enter a prompt and press Generate."))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
-                        ProgressView(value: Double(step), total: max(1, Double(total)))
-                            .progressViewStyle(.linear)
-                            .frame(width: 240)
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
-                    }
+                        if let preview = service.previewImage {
+                            Image(nsImage: preview)
+                                .resizable()
+                                .scaledToFit()
+                                .opacity(0.7)
+                                .cornerRadius(6)  
+                                .animation(.easeInOut(duration: 0.15), value: service.previewImage) 
+                                .overlay(alignment: .bottom) {
+                                    VStack(spacing: 6) {
+                                        ProgressView(value: Double(step), total: max(1, Double(total)))
+                                            .progressViewStyle(.linear)
+                                            .tint(.white)
+                                        Text(message)
+                                            .font(.footnote)
+                                            .foregroundStyle(.white)
+                                    }
+                                    .padding(8)
+                                    .background(.ultraThinMaterial)
+                                    .cornerRadius(6)
+                                    .padding(8)
+                                }
+                        } else {
+                            ProgressView(value: Double(step), total: max(1, Double(total)))
+                                .progressViewStyle(.linear)
+                                .frame(width: 240)
+                            Text(message).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }                    
                 case .completed(let path):
                     completedPreview(path: path)
                 case .failed(let msg):
@@ -678,6 +726,8 @@ struct ImageGenView: View {
         condGain = s.condGain
         condWeightsText = s.condWeightsText
         loraPath = s.loraPath
+        previewLatentRGB = s.previewLatentRGB
+        previewTAESD = s.previewTAESD
         // The LoRA file may have moved since last session — drop a stale path.
         if !loraPath.isEmpty && !FileManager.default.fileExists(atPath: loraPath) {
             loraPath = ""
@@ -699,6 +749,8 @@ struct ImageGenView: View {
         s.condGain = condGain
         s.condWeightsText = condWeightsText
         s.loraPath = loraPath
+        s.previewLatentRGB = previewLatentRGB
+        s.previewTAESD = previewTAESD
         s.save()
     }
 
@@ -738,7 +790,9 @@ struct ImageGenView: View {
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             condGain: condGain,
             condWeightsText: condWeightsText,
-            loraPath: loraPath.isEmpty ? nil : loraPath
+            loraPath: loraPath.isEmpty ? nil : loraPath,
+            previewLatentRGB: previewLatentRGB,
+            previewTAESD: previewTAESD
         )
         persist()  // final capture — the agent's generate_image reuses these
 

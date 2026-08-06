@@ -160,7 +160,8 @@ struct WelcomeView: View {
                         .foregroundStyle(.yellow)
                     Text("Enjoying MLX Core? ")
                         .foregroundStyle(.secondary)
-                    + Text("Star us on GitHub")
+                    +
+                    Text("Star us on GitHub")
                         .foregroundStyle(Color.accentColor)
                         .underline()
                     + Text(" — it really helps!")

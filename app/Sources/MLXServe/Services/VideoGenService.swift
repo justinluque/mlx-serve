@@ -227,6 +227,8 @@ final class VideoGenService: ObservableObject {
                     throw MediaGenError.server(m)
                 case .ignored:
                     break
+                case .preview:
+                    break
                 }
             }
             guard let frames = decoded else {

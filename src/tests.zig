@@ -45,6 +45,8 @@ test {
     _ = @import("tts.zig");
     _ = @import("flux.zig");
     _ = @import("krea.zig");
+    _ = @import("latent_preview.zig");
+    _ = @import("taesd.zig");
     _ = @import("mage_flow.zig");
     _ = @import("lora.zig");
     _ = @import("nsfw.zig");

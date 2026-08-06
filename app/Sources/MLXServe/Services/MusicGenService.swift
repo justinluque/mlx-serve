@@ -209,6 +209,8 @@ final class MusicGenService: ObservableObject {
                     throw MediaGenError.server(m)
                 case .ignored:
                     break
+                case .preview:
+                    break
                 }
             }
             guard let wav, wav.count > 44 else {

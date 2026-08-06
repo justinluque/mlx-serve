@@ -21,6 +21,11 @@ final class ImageGenService: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var recent: [String] = []  // recent output paths, newest first
     @Published private(set) var log: [String] = []
+    /// Latest per-step "ghost image" from the server (see MediaSSE.Event.preview),
+    /// when the request opted in with `livePreview`. Cleared at the start of
+    /// each generation and on completion/failure/cancel — never shown stale
+    /// against a different prompt's progress bar.
+    @Published private(set) var previewImage: NSImage? = nil
 
     private var task: Task<Void, Never>?
     private let api = APIClient()
@@ -52,6 +57,7 @@ final class ImageGenService: ObservableObject {
 
         task?.cancel()
         phase = .running(step: 0, total: request.steps, message: "Loading model…")
+        previewImage = nil
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
@@ -78,36 +84,40 @@ final class ImageGenService: ObservableObject {
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/images/generations",
                     json: genJson) {
-                    switch ev["type"] as? String {
-                    case "progress":
-                        let step = ev["step"] as? Int ?? 0
-                        let total = ev["total"] as? Int ?? steps
-                        let stage = ev["stage"] as? String ?? "Generating"
-                        phase = .running(step: step, total: max(total, 1), message: "\(stage)…")
-                    case "complete":
+                    switch MediaSSE.classify(ev) {
+                    case .progress(let step, let total, let stage):
+                        phase = .running(step: step, total: max(total == 0 ? steps : total, 1), message: "\(stage)…")
+                    case .preview(_, _, _, _, let imageData):
+                        previewImage = NSImage(data: imageData) ?? previewImage
+                    case .complete:
                         png = Self.decodePngB64(ev)
-                    case "error":
+                    case .failed(let message):
                         await releaseIfNeeded()
-                        phase = .failed(ev["message"] as? String ?? "Generation failed.")
+                        phase = .failed(message)
+                        previewImage = nil
                         return
-                    default:
+                    case .ignored:
                         break
                     }
                 }
                 await releaseIfNeeded()
                 guard let png else {
                     phase = .failed("Server returned no image data.")
+                    previewImage = nil
                     return
                 }
                 try png.write(to: URL(fileURLWithPath: outputPath))
                 phase = .completed(path: outputPath)
+                previewImage = nil
                 insertRecent(outputPath)
             } catch is CancellationError {
                 await releaseIfNeeded()
                 phase = .idle
+                previewImage = nil
             } catch {
                 await releaseIfNeeded()
                 phase = .failed(error.localizedDescription)
+                previewImage = nil
             }
         }
     }
@@ -163,6 +173,8 @@ final class ImageGenService: ObservableObject {
             for try await ev in api.streamGeneration(
                 port: port, path: "/v1/images/generations", json: genJson) {
                 switch MediaSSE.classify(ev) {
+                case .preview(let step, let total, let width, let height, let image):
+                    report(step, total, "preview")
                 case .progress(let step, let total, let stage):
                     report(step, total == 0 ? steps : total, MediaSSE.stageLabel(stage))
                 case .complete:
@@ -202,6 +214,9 @@ final class ImageGenService: ObservableObject {
             json["size"] = "\(request.width)x\(request.height)"
         }
         if !request.safeMode { json["safety"] = false }
+        if request.livePreview { json["preview"] = true }
+        if !request.previewLatentRGB { json["preview_latent_rgb"] = false }
+        if !request.previewTAESD { json["preview_taesd"] = false }
         if let src = request.initImagePath,
            let data = FileManager.default.contents(atPath: src) {
             json["image"] = data.base64EncodedString()

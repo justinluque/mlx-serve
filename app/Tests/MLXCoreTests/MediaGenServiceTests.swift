@@ -698,6 +698,23 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(json["cond_gain"])
         XCTAssertNil(json["cond_weights"])
         XCTAssertNil(json["lora_path"])
+        // Live-preview testing knobs default on and stay silent on the wire.
+        XCTAssertNil(json["preview_latent_rgb"])
+        XCTAssertNil(json["preview_taesd"])
+    }
+
+    func testImageRequestJsonIncludesPreviewTogglesOnlyWhenDisabled() {
+        var req = ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 4)
+        req.previewTAESD = false
+        let taesdOff = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(taesdOff["preview_taesd"] as? Bool, false)
+        XCTAssertNil(taesdOff["preview_latent_rgb"])
+
+        req.previewTAESD = true
+        req.previewLatentRGB = false
+        let rgbOff = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(rgbOff["preview_latent_rgb"] as? Bool, false)
+        XCTAssertNil(rgbOff["preview_taesd"])
     }
 
     func testImageRequestJsonIncludesImg2ImgFields() throws {

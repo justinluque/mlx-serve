@@ -18,6 +18,7 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const sse = @import("gen_sse.zig");
 const png = @import("png.zig");
+const latent_preview = @import("latent_preview.zig");
 const tok_mod = @import("tokenizer.zig");
 const lora_mod = @import("lora.zig");
 
@@ -1556,23 +1557,36 @@ pub const Vae = struct {
         for (&self.up_blocks) |*b| b.deinit();
     }
 
+    /// denorm: latent * STD + MEAN (per-channel over the 16 real channels).
+    /// Split out of `decode` so the live-preview path (krea.zig's denoise
+    /// loop, see latent_preview.zig) can apply the SAME denormalization to
+    /// the raw sampling latent before projecting it — mirrors flux.zig's
+    /// `Vae.bnDenorm` split for exactly the same reason: skipping this step
+    /// leaves the preview's channel→RGB factors (and the taef1 decoder,
+    /// both fit on the denormalized space) on the wrong numeric scale.
+    pub fn denorm(self: *Vae, latent: mlx.mlx_array) !mlx.mlx_array {
+        const s = self.s;
+        const lf = try astype(latent, .float32, s);
+        defer _ = mlx.mlx_array_free(lf);
+        const stdv = mlx.mlx_array_new_data(&LATENTS_STD, &[_]c_int{ 1, 16, 1, 1 }, 4, .float32);
+        defer _ = mlx.mlx_array_free(stdv);
+        const meanv = mlx.mlx_array_new_data(&LATENTS_MEAN, &[_]c_int{ 1, 16, 1, 1 }, 4, .float32);
+        defer _ = mlx.mlx_array_free(meanv);
+        const sc = try mulA(lf, stdv, s);
+        defer _ = mlx.mlx_array_free(sc);
+        return addA(sc, meanv, s);
+    }
+
     /// latent [1,16,lat_h,lat_w] f32 → image [1,3,H,W] f32 in [-1,1].
     pub fn decode(self: *Vae, latent: mlx.mlx_array) !mlx.mlx_array {
         const s = self.s;
         const sh = mlx.getShape(latent); // [1,16,lat_h,lat_w]
         const lh = sh[2];
         const lw = sh[3];
+        const dn4 = try self.denorm(latent);
+        defer _ = mlx.mlx_array_free(dn4);
         // → [1,16,1,lat_h,lat_w]
-        const l5 = try reshape(latent, &[_]c_int{ 1, 16, 1, lh, lw }, s);
-        defer _ = mlx.mlx_array_free(l5);
-        // denorm: latent * STD + MEAN  (per-channel)
-        const stdv = mlx.mlx_array_new_data(&LATENTS_STD, &[_]c_int{ 1, 16, 1, 1, 1 }, 5, .float32);
-        defer _ = mlx.mlx_array_free(stdv);
-        const meanv = mlx.mlx_array_new_data(&LATENTS_MEAN, &[_]c_int{ 1, 16, 1, 1, 1 }, 5, .float32);
-        defer _ = mlx.mlx_array_free(meanv);
-        const sc = try mulA(l5, stdv, s);
-        defer _ = mlx.mlx_array_free(sc);
-        const dn = try addA(sc, meanv, s);
+        const dn = try reshape(dn4, &[_]c_int{ 1, 16, 1, lh, lw }, s);
         defer _ = mlx.mlx_array_free(dn);
         // post_quant_conv (1x1x1, pad 0)
         var h = try causalConv3d(dn, self.pq_w, self.pq_b, 0, s);
@@ -2246,7 +2260,36 @@ pub const Engine = struct {
             _ = mlx.mlx_array_free(img);
             img = ni;
             _ = mlx.mlx_array_eval(img);
-            if (progress) |p| p.emit("Generating", @intCast(i + 1 - start_step), run_steps);
+            if (progress) |p| {
+                const step_no: u32 = @intCast(i + 1 - start_step);
+                if (p.wantsPreview() and latent_preview.shouldPreviewStep(step_no, run_steps)) preview_blk: {
+                    // Same unpatchify the final VAE decode uses (tokens →
+                    // [1,16,lat_h,lat_w]), then the SAME per-channel
+                    // denorm `Vae.decode` applies before its own
+                    // post_quant_conv (see `Vae.denorm`) — skipping it puts
+                    // the preview on the wrong numeric scale, same bug the
+                    // FLUX.2 path had before it started calling `bnDenorm`
+                    // here — then projected straight to RGB (or through the
+                    // tiny taesd decoder). See latent_preview.zig.
+                    const unpk = unpatchify(img, @intCast(cfg.patch), @intCast(h_), @intCast(w_), @intCast(cfg.channels), s) catch |err| {
+                        log.warn("[image] krea preview step {d}/{d} skipped (unpatchify: {s})\n", .{ step_no, run_steps, @errorName(err) });
+                        break :preview_blk;
+                    };
+                    defer _ = mlx.mlx_array_free(unpk);
+                    const denorm_unpk = self.vae.denorm(unpk) catch |err| {
+                        log.warn("[image] krea preview step {d}/{d} skipped (denorm: {s})\n", .{ step_no, run_steps, @errorName(err) });
+                        break :preview_blk;
+                    };
+                    defer _ = mlx.mlx_array_free(denorm_unpk);
+                    const pv = latent_preview.previewToPng(allocator, denorm_unpk, latent_preview.flux1_16ch, p.taesd_decoder, p.allow_linear_fallback, s) catch |err| {
+                        log.warn("[image] krea preview step {d}/{d} skipped (previewToPng: {s}, taesd_decoder={}, allow_linear_fallback={})\n", .{ step_no, run_steps, @errorName(err), p.taesd_decoder != null, p.allow_linear_fallback });
+                        break :preview_blk;
+                    };
+                    defer allocator.free(pv.bytes);
+                    p.preview(@intCast(step_no), run_steps, pv.bytes, pv.width, pv.height);
+                }
+                p.emit("Generating", @intCast(step_no), run_steps);
+            }
         }
         if (progress) |p| p.emit("Decoding image", steps, steps);
 
@@ -2545,6 +2588,32 @@ test "krea applyCondRebalance scales tapped layers and global gain" {
 
 // VAE encoder guard: encode a synthetic smooth image, decode it back — the
 // pixels must round-trip through the oracle-validated decoder.  KREA_TEST_MODEL
+test "Vae.denorm applies latent * STD + MEAN per-channel" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // Only `.s` is touched by `denorm` — no need to load real VAE weights.
+    var vae: Vae = undefined;
+    vae.s = s;
+    const H = 2;
+    const W = 2;
+    var buf: [16 * H * W]f32 = @splat(1.0); // every channel/pixel = 1.0
+    const sh = [_]c_int{ 1, 16, H, W };
+    const lat = mlx.mlx_array_new_data(&buf, &sh, 4, .float32);
+    defer _ = mlx.mlx_array_free(lat);
+
+    const out = try vae.denorm(lat);
+    defer _ = mlx.mlx_array_free(out);
+    _ = mlx.mlx_array_eval(out);
+    const d = mlx.mlx_array_data_float32(out) orelse return error.NoData;
+    const plane = H * W;
+    for (0..16) |c| {
+        const expected = LATENTS_STD[c] + LATENTS_MEAN[c]; // 1.0 * STD + MEAN
+        for (0..plane) |p| {
+            try testing.expectApproxEqAbs(expected, d[c * plane + p], 1e-4);
+        }
+    }
+}
+
 test "krea VAE encoder round-trips through the decoder" {
     const model_dir = std.mem.span(std.c.getenv("KREA_TEST_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;

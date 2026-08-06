@@ -1029,11 +1029,28 @@ struct ImageGenRequest {
     /// the user typed them — comma/space separated, `condWeightCount` values
     /// (12 for Krea, 3 for FLUX). Empty = off.
     var condWeightsText: String = ""
+    /// Whether to request live per-step ghost-image previews from the server
+    /// (streamed as SSE "preview" events). Always on for interactive generations;
+    /// the agent path can opt out if it doesn't render them.
+    var livePreview: Bool = true
     /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
     /// to the DiT at runtime. nil = none.
     var loraPath: String? = nil
     /// LoRA strength multiplier (on top of the file's own alpha/rank scale).
     var loraScale: Double = 1.0
+    /// Live-preview testing knobs (Advanced): independently enable/disable
+    /// each preview mechanism (see the Image gen window's "Latent RGB" /
+    /// "TAESD" checkboxes) so they can be compared/debugged in isolation.
+    /// Both default true (normal operation). Sent to the server as
+    /// `preview_latent_rgb` / `preview_taesd` only when off — see
+    /// `ImageGenService.requestJson`.
+    var previewLatentRGB: Bool = true
+    var previewTAESD: Bool = true
+
+    struct LoraAttachment {
+            var path: String
+            var scale: Double
+        }
 }
 
 extension ImageModelPreset {

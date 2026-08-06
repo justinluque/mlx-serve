@@ -2216,7 +2216,7 @@ private struct SandboxSectionContent: View {
                 Button("Delete All Sandbox Data", role: .destructive) {
                     resetting = true
                     AgentSandbox.shared.resetAllData {
-                        resetting = false
+                        DispatchQueue.main.async { resetting = false }
                     }
                 }
                 Button("Cancel", role: .cancel) {}

@@ -38,6 +38,13 @@ struct ImageGenSettings: Codable, Equatable {
     /// Style LoRA (Advanced): sticky adapter path ("" = none) + strength.
     var loraPath: String = ""
     var loraScale: Double = 1.0
+    /// Live-preview testing knobs (Advanced): independently enable/disable
+    /// each preview mechanism so they can be compared/debugged in
+    /// isolation. Both default on (normal operation: prefer TAESD, fall
+    /// back to the linear Latent RGB projection). Unchecking both disables
+    /// live previews entirely for this request.
+    var previewLatentRGB: Bool = true
+    var previewTAESD: Bool = true
 
     private static let storageKey = "imageGenSettings"
 
@@ -86,6 +93,8 @@ extension ImageGenSettings {
         if let v = try c.decodeIfPresent(String.self, forKey: .condWeightsText) { condWeightsText = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .loraPath) { loraPath = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .loraScale) { loraScale = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .previewLatentRGB) { previewLatentRGB = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .previewTAESD) { previewTAESD = v }
     }
 }
 

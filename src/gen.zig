@@ -20,6 +20,9 @@ const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const lora_mod = @import("lora.zig");
 const nsfw = @import("nsfw.zig");
+const taesd = @import("taesd.zig");
+const taew = @import("taew.zig");
+const latent_preview = @import("latent_preview.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const kokoro = @import("kokoro.zig");
@@ -708,6 +711,110 @@ fn ensureNsfwClassifier(io: std.Io, allocator: std.mem.Allocator) ?*nsfw.Classif
     };
     log.info("[image] NSFW content filter ready (Falconsai ViT)\n", .{});
     return if (g_nsfw) |*c| c else null;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// TAESD-family live-preview decoders (see src/taesd.zig, latent_preview.zig).
+// Shared, lazily loaded once per process, keyed by which image architecture
+// is active — mirrors the NSFW classifier above exactly (auto-downloaded
+// into ~/.mlx-serve/models, missing → fall back rather than fail). Unlike
+// the classifier, "missing" here just means the cheaper linear-projection
+// preview is used instead of a real decode — never blocks generation.
+// ════════════════════════════════════════════════════════════════════════
+
+const TAEF2_REPO_DIR = "madebyollin/taef2"; // FLUX.2 32ch — used for klein 4B/9B
+var g_taef2: ?taesd.Decoder = null;
+var g_taef2_tried: bool = false;
+// Krea 2's own VAE is the Qwen-Image 3D causal VAE (see krea.zig's module
+// doc) — NOT FLUX.1's — so taef1 (trained specifically to reproduce
+// FLUX.1's VAE) is the wrong decoder family for it regardless of how
+// correctly it loads. The right one, per madebyollin/taehv's own README,
+// is taew2_1: "taew2_1.pth serves three models: Wan 2.1, Wan 2.2 14B
+// (which retained the older VAE), and Qwen Image." See taew.zig. Nothing
+// else in this codebase currently needs taef1 (FLUX.1/HiDream/Z-Image, per
+// its own README, none of which are supported backends here), so it isn't
+// kept around unused.
+const TAEW21_REPO_DIR = "madebyollin/taehv"; // Wan2.1/Qwen-Image 16ch — used for Krea
+var g_taew21: ?taew.Decoder = null;
+var g_taew21_tried: bool = false;
+
+/// Locate an auto-downloaded taesd-family repo dir under ~/.mlx-serve/models
+/// (must contain `marker_filename`), or null. taef1 ships as a proper
+/// diffusers `AutoencoderTiny` (`diffusion_pytorch_model.safetensors`);
+/// taef2 doesn't — its HF card says its architecture "isn't properly
+/// integrated into Diffusers yet", so its repo is just a bare
+/// `taef2.safetensors` (and, notably, no `config.json` either — see
+/// `DownloadManager.previewDecoderReady` on the Swift side for the same
+/// fix). Passing the wrong marker here means this always reports "not
+/// found" even after a fully successful download — which is exactly what
+/// was happening for taef2 before this took a `marker_filename` param.
+fn resolveTaesdDir(allocator: std.mem.Allocator, io: std.Io, repo_dir: []const u8, marker_filename: []const u8) ?[]u8 {
+    const home = std.mem.span(std.c.getenv("HOME") orelse return null);
+    const dir = std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models/{s}", .{ home, repo_dir }) catch return null;
+    const marker = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, marker_filename }) catch {
+        allocator.free(dir);
+        return null;
+    };
+    defer allocator.free(marker);
+    if (std.Io.Dir.openFileAbsolute(io, marker, .{})) |f| {
+        f.close(io);
+        return dir; // caller owns
+    } else |_| {
+        allocator.free(dir);
+        return null;
+    }
+}
+
+/// Same as `ensureTaef2` below, for Krea's taew2_1 decoder (see taew.zig
+/// and the module-level note above). Note this repo isn't on Hugging Face
+/// as a browsable tree — it's a single raw file off `madebyollin/taehv`'s
+/// GitHub — see `DownloadManager.downloadTaew21IfNeeded` on the Swift side
+/// for how it actually lands at this path.
+fn ensureTaew21(io: std.Io, allocator: std.mem.Allocator) ?latent_preview.PreviewDecoder {
+    if (g_taew21_tried) return if (g_taew21) |*d| .{ .taew = d } else null;
+    g_taew21_tried = true;
+    const dir = resolveTaesdDir(allocator, io, TAEW21_REPO_DIR, "taew2_1.safetensors") orelse {
+        log.info("[image] taew2_1 preview decoder not found at ~/.mlx-serve/models/{s} — using the linear preview instead\n", .{TAEW21_REPO_DIR});
+        return null;
+    };
+    defer allocator.free(dir);
+    const s = mlx.mlx_default_gpu_stream_new();
+    g_taew21 = taew.loadDecoder(allocator, dir, s) catch |err| {
+        log.warn("[image] taew2_1 decoder load failed ({s}) — using the linear preview instead\n", .{@errorName(err)});
+        g_taew21 = null;
+        return null;
+    };
+    return if (g_taew21) |*d| .{ .taew = d } else null;
+}
+
+/// Same as `ensureTaew21` above, for the FLUX.2-space (taef2, klein)
+/// decoder. Note the different marker filename — see `resolveTaesdDir`'s
+/// doc.
+fn ensureTaef2(io: std.Io, allocator: std.mem.Allocator) ?latent_preview.PreviewDecoder {
+    if (g_taef2_tried) return if (g_taef2) |*d| .{ .taesd = d } else null;
+    g_taef2_tried = true;
+    const dir = resolveTaesdDir(allocator, io, TAEF2_REPO_DIR, "taef2.safetensors") orelse {
+        log.info("[image] taef2 preview decoder not found at ~/.mlx-serve/models/{s} — using the linear preview instead\n", .{TAEF2_REPO_DIR});
+        return null;
+    };
+    defer allocator.free(dir);
+    const s = mlx.mlx_default_gpu_stream_new();
+    g_taef2 = taesd.loadDecoder(allocator, dir, .taef2, s) catch |err| {
+        log.warn("[image] taef2 decoder load failed ({s}) — using the linear preview instead\n", .{@errorName(err)});
+        g_taef2 = null;
+        return null;
+    };
+    return if (g_taef2) |*d| .{ .taesd = d } else null;
+}
+
+/// Which taesd-family decoder (if any) applies to the engine's active
+/// backend. MageFlow has none yet (falls back to the linear preview).
+fn taesdDecoderFor(io: std.Io, allocator: std.mem.Allocator, engine: *ImageEngine) ?latent_preview.PreviewDecoder {
+    return switch (engine.backend) {
+        .flux => ensureTaef2(io, allocator),
+        .krea => ensureTaew21(io, allocator),
+        .mage_flow => null,
+    };
 }
 
 /// P(nsfw) threshold above which a generated image is blocked. Default 0.5;
@@ -1830,8 +1937,24 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     }
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[image] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
-    var sctx = sse.StreamCtx{ .conn = conn };
+    // Live per-step "ghost image" previews (see latent_preview.zig): a cheap
+    // linear latent→RGB projection, not a real decode. Opt-in and only
+    // meaningful with streaming — `preview` without `stream` is a no-op.
+    const want_preview = want_stream and sse.bodyWantsTrue(body, "preview");
+    // Testing knobs for the Image gen window's "Latent RGB" / "TAESD"
+    // checkboxes — independently disable either preview mechanism so the
+    // two can be exercised (and compared/debugged) in isolation. Both
+    // default true (normal operation: prefer taesd, fall back to linear).
+    const preview_taesd = sse.bodyBool(body, "preview_taesd") orelse true;
+    const preview_latent_rgb = sse.bodyBool(body, "preview_latent_rgb") orelse true;
+    log.info("[image] generating {d}x{d} steps={d} stream={} preview={} (taesd={} latent_rgb={}): {d} chars\n", .{ width, height, steps, want_stream, want_preview, preview_taesd, preview_latent_rgb, prompt.len });
+    var sctx = sse.StreamCtx{
+        .conn = conn,
+        .preview_wanted = want_preview,
+        .taesd = if (want_preview and preview_taesd) taesdDecoderFor(io, allocator, engine) else null,
+        .allow_linear_fallback = preview_latent_rgb,
+        .allocator = allocator,
+    };
     const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
     if (want_stream) try conn.writeAll(sse.headers);
 
