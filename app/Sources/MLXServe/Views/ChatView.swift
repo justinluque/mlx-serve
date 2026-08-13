@@ -1560,6 +1560,14 @@ struct ChatDetailView: View {
                     }
                 }
 
+                // Messages typed while this chat is answering. They are not in
+                // the transcript yet — this row is the only place they exist,
+                // which is what makes each one deletable right up until it is
+                // delivered.
+                QueuedMessagesStrip(messages: queuedMessages) { id in
+                    chatEngine.removeQueued(id, from: sessionId)
+                }
+
                 // Voice mode lives INLINE: a talking orb just above the input,
                 // not a sheet over the transcript (the sheet hid the
                 // conversation and duplicated the composer's own toggles).
@@ -1772,7 +1780,6 @@ struct ChatDetailView: View {
         GrowingTextEditor(text: $inputText,
                           isFocused: $inputFocused,
                           measuredHeight: $composerHeight,
-                          isIdle: composerState == .idle,
                           onSend: { sendMessage() })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
             .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
@@ -1862,10 +1869,13 @@ struct ChatDetailView: View {
         // Stop is always tappable for the owning chat. Otherwise: Send,
         // disabled when the server is down or when this chat has nothing to
         // send. Another chat's turn blocks nothing — the engine is multi-turn.
+        // Messages parked by a turn the user STOPPED count as something to
+        // send: they are the only way that queue goes out.
         .disabled(server.status != .running
                   || (composerState == .idle
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty))
+                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty
+                      && queuedMessages.isEmpty))
         }
     }
 
@@ -2318,16 +2328,49 @@ struct ChatDetailView: View {
         // this is belt-and-suspenders for any other trigger path).
         if session?.isExternalBridge == true { return }
 
-        // Pre-send nudge: if the message looks like it needs a mode that's off,
-        // confirm first (unless this chat already declined that suggestion). The
-        // dialog's buttons call proceedSend(); nothing is consumed until then.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
-           let prompt = detectIntentPrompt(for: trimmed) {
-            pendingIntentPrompt = prompt
+        let hasContent = !trimmed.isEmpty || !pendingImages.isEmpty
+            || !pendingPDFs.isEmpty || !pendingAudio.isEmpty || !queuedMessages.isEmpty
+        switch ComposerSubmitAction.resolve(generating: composerState == .generatingHere,
+                                            serverRunning: server.status == .running,
+                                            hasContent: hasContent) {
+        case .ignore:
             return
+        case .queue:
+            queueMessage()
+        case .send:
+            // Pre-send nudge: if the message looks like it needs a mode that's
+            // off, confirm first (unless this chat already declined that
+            // suggestion). The dialog's buttons call proceedSend(); nothing is
+            // consumed until then.
+            if !trimmed.isEmpty, let prompt = detectIntentPrompt(for: trimmed) {
+                pendingIntentPrompt = prompt
+                return
+            }
+            proceedSend()
         }
-        proceedSend()
+    }
+
+    /// The messages parked for this chat, newest last.
+    private var queuedMessages: [QueuedMessage] {
+        chatEngine.queuedMessages(for: sessionId)
+    }
+
+    /// Park what's in the composer for delivery at the running turn's next
+    /// boundary. The composer is cleared exactly as a send clears it — the
+    /// message is somewhere the user can see (and delete) it, and leaving the
+    /// text behind would make a second Return queue it twice.
+    private func queueMessage() {
+        var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachedImages = consumePendingImages()
+        let attachedAudio = consumePendingAudio()
+        let pdfText = consumePendingPDFsAsText()
+        if !pdfText.isEmpty {
+            text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
+        }
+        let queued = QueuedMessage(text: text, images: attachedImages, audio: attachedAudio)
+        guard chatEngine.enqueue(queued, for: sessionId) else { return }
+        inputText = ""
     }
 
     /// Names of MCP servers the user currently has enabled (disabled != true).
@@ -2373,11 +2416,21 @@ struct ChatDetailView: View {
         let attachedImages = consumePendingImages()
         let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
-        guard !text.isEmpty || attachedImages != nil || attachedAudio != nil || !pdfText.isEmpty,
+        let hasQueue = !queuedMessages.isEmpty
+        guard !text.isEmpty || attachedImages != nil || attachedAudio != nil || !pdfText.isEmpty || hasQueue,
               composerState != .generatingHere, server.status == .running else { return }
         inputText = ""
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
+        }
+        // Parked messages ride out WITH this one, oldest first. This is the
+        // manual half of delivery — the queue outlives a turn the user stopped,
+        // and the Send button is how it goes — through the SAME combining rule
+        // the engine's automatic drain uses.
+        var outgoing = QueuedMessage(text: text, images: attachedImages, audio: attachedAudio)
+        if let queued = chatEngine.takeQueue(for: sessionId),
+           let merged = MessageQueue.combined([queued, outgoing]) {
+            outgoing = merged
         }
 
         // The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
@@ -2394,8 +2447,8 @@ struct ChatDetailView: View {
             reasoningEffort: reasoningEffort)
         let config = ChatTurnEngine.TurnConfig.from(
             resolved, documentIndex: appState.documentIndexes[sessionId])
-        chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
+        chatEngine.runTurn(sessionId: sessionId, userText: outgoing.text,
+                           images: outgoing.images, audio: outgoing.audio,
                            config: config,
                            approval: { await requestToolApproval($0) })
         // Your own message always wins: sending from halfway up the history used
@@ -3757,15 +3810,79 @@ enum ComposerLayout {
     }
 }
 
-/// What a Return keypress does in the composer. Mirrors the prior `.onKeyPress`
-/// contract: Shift+Return is always a newline; a bare Return sends only when
-/// idle, and is otherwise swallowed (never a stray newline mid-generation).
-enum ComposerReturnAction: Equatable { case send, newline, ignore }
+/// The messages parked for delivery, above the composer. Renders nothing when
+/// the queue is empty — this is a strip that exists only while something is
+/// waiting, like the attachment row it sits beside.
+///
+/// Each row is a real Button, never a tap gesture wrapped around one (the
+/// swallowed-click class), and the ✕ is the ONLY way back: nothing about a
+/// queued message is in the transcript yet, so there is nothing else to delete.
+struct QueuedMessagesStrip: View {
+    let messages: [QueuedMessage]
+    let onRemove: (UUID) -> Void
+
+    var body: some View {
+        if !messages.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(messages) { message in
+                    HStack(spacing: 6) {
+                        Image(systemName: "clock")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(Self.preview(message))
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 4)
+                        Button {
+                            onRemove(message.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Remove this queued message")
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.secondary.opacity(0.10))
+                    .clipShape(Capsule())
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+        }
+    }
+
+    /// One line naming what is waiting. An attachment with no caption has no
+    /// text to show, so it says what it IS rather than rendering an empty chip.
+    static func preview(_ message: QueuedMessage) -> String {
+        let text = message.text
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty { return text }
+        let images = (message.images ?? []).count
+        let clips = (message.audio ?? []).count
+        if images > 0 { return images == 1 ? "Image" : "\(images) images" }
+        if clips > 0 { return clips == 1 ? "Audio clip" : "\(clips) audio clips" }
+        return "Queued message"
+    }
+}
+
+/// What a Return keypress does in the composer. Shift+Return is always a
+/// newline; a bare Return SUBMITS — it never inserts a stray newline, and it no
+/// longer decides whether a submission is possible. That question moved to
+/// `ComposerSubmitAction`, because the keypress used to answer it by swallowing
+/// the Return outright: mid-generation there was no way to hand the composer's
+/// contents anywhere, and now there is (the queue).
+enum ComposerReturnAction: Equatable { case submit, newline }
 
 enum ComposerKey {
-    static func onReturn(shift: Bool, isIdle: Bool) -> ComposerReturnAction {
-        if shift { return .newline }
-        return isIdle ? .send : .ignore
+    static func onReturn(shift: Bool) -> ComposerReturnAction {
+        shift ? .newline : .submit
     }
 }
 
@@ -3781,7 +3898,6 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var font: NSFont = .preferredFont(forTextStyle: .body)
     var minLines: Int = 1
     var maxLines: Int = 15
-    var isIdle: Bool
     var onSend: () -> Void
 
     /// Read from the SAME constants the placeholder overlay reads — the two
@@ -3857,14 +3973,12 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
             let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
-            switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle) {
+            switch ComposerKey.onReturn(shift: shift) {
             case .newline:
                 textView.insertNewlineIgnoringFieldEditor(self)
                 return true
-            case .send:
+            case .submit:
                 parent.onSend()
-                return true
-            case .ignore:
                 return true
             }
         }

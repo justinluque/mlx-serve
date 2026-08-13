@@ -137,6 +137,22 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private var ledger = TurnLedger()
     private var tasks: [UUID: Task<Void, Never>] = [:]
 
+    /// Messages typed while a turn was running, waiting for a delivery point.
+    /// Owned here rather than in the chat view because a background tab has no
+    /// rendered view: `ChatDetailView` is reused across tabs, so a view-owned
+    /// queue could only ever drain for the conversation the user is looking at.
+    private var queue = MessageQueue()
+
+    /// The published mirror the composer renders (chips + their delete buttons).
+    @Published private(set) var queuedBySession: [UUID: [QueuedMessage]] = [:]
+
+    /// How the turn currently running in each session was configured, kept so a
+    /// queue drained at the END of a turn starts its successor the same way the
+    /// conversation was already running. The alternative — rebuilding the config
+    /// at the drain site — is the per-surface read `TurnConfig.from` exists to
+    /// prevent, and there is no surface to read from for a background tab.
+    private var turnContinuation: [UUID: (config: TurnConfig, approval: (APIClient.ToolCall) async -> Bool)] = [:]
+
     /// The in-flight media generation, or nil. ONE value is still right — the
     /// inference thread serializes media gen, so two never RUN at once — but
     /// with concurrent turns it needs an owner, so only the chat that asked
@@ -194,6 +210,14 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         for sid in ledger.orphaned(existingSessions: existing) {
             stop(sessionId: sid)
         }
+        // A deleted chat's parked messages go with it — there is no
+        // conversation left to deliver them into, and nothing would ever clear
+        // them (the ghost-turn class, one layer up).
+        for sid in queue.snapshot.keys where !existing.contains(sid) {
+            queue.clear(sid)
+            turnContinuation.removeValue(forKey: sid)
+        }
+        publishQueue()
     }
 
     init(appState: AppState) {
@@ -395,6 +419,92 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         liveTokensBySession[sessionId] = n
     }
 
+    // MARK: - Message queue
+
+    /// Park a message typed while this chat was generating. Returns false when
+    /// there was nothing to park (the composer stays as the user left it).
+    ///
+    /// Only ever called while a turn is in flight — `ComposerSubmitAction` sends
+    /// outright otherwise — but it does not ASSERT that: a queue entry with no
+    /// turn running is still delivered, by the Send button, which is enabled for
+    /// a non-empty queue even with an empty field.
+    @discardableResult
+    func enqueue(_ message: QueuedMessage, for sessionId: UUID) -> Bool {
+        guard queue.enqueue(message, for: sessionId) else { return false }
+        publishQueue()
+        return true
+    }
+
+    func queuedMessages(for sessionId: UUID) -> [QueuedMessage] {
+        queuedBySession[sessionId] ?? []
+    }
+
+    /// Delete one parked message (its chip's ✕) — the only way to take back
+    /// something queued, since nothing about it is in the transcript yet.
+    func removeQueued(_ id: UUID, from sessionId: UUID) {
+        queue.remove(id, from: sessionId)
+        publishQueue()
+    }
+
+    func clearQueue(for sessionId: UUID) {
+        queue.clear(sessionId)
+        publishQueue()
+    }
+
+    /// Take the queue for a send the USER is driving — the composer's Send
+    /// button with parked messages showing, which is how a queue left behind by
+    /// a stopped turn goes out. Same drain the engine's own delivery uses, so a
+    /// manual send and an automatic one deliver the same message.
+    func takeQueue(for sessionId: UUID) -> QueuedMessage? {
+        defer { publishQueue() }
+        return queue.drain(sessionId)
+    }
+
+    private func publishQueue() {
+        let mirror = queue.snapshot
+        if queuedBySession != mirror { queuedBySession = mirror }
+    }
+
+    /// Take the queue as the user message to inject at an agent-loop ROUND
+    /// boundary. Delivering here — rather than after the loop finishes — is the
+    /// point of the feature: a 150-round turn can run for minutes, and a steer
+    /// that lands after it is a steer that arrived too late to steer anything.
+    /// Safe at the top of an iteration and nowhere else: the previous round's
+    /// tool results are already appended, and the history for the next request
+    /// is rebuilt from the session, so the injected message just rides along.
+    private func injectQueuedMessage(into sessionId: UUID) -> Bool {
+        guard let queued = queue.drain(sessionId) else { return false }
+        publishQueue()
+        var msg = ChatMessage(role: .user, content: queued.text)
+        msg.images = queued.images
+        msg.audio = queued.audio
+        appState.appendMessage(to: sessionId, message: msg)
+        return true
+    }
+
+    /// Deliver anything still queued after a turn ENDED, as its own new turn.
+    /// Runs only after a turn the user did not interrupt: a cancelled turn (Stop,
+    /// or a supersede) leaves the queue visible and unsent, because firing a
+    /// fresh generation off the back of a deliberate interruption is the last
+    /// thing the Stop button should do. A failed turn leaves it too — the error
+    /// card is on screen and auto-retrying into a broken server just repeats it.
+    private func drainQueueAsNewTurn(sessionId: UUID) {
+        guard !queue.isEmpty(for: sessionId), let cont = turnContinuation[sessionId] else {
+            turnContinuation.removeValue(forKey: sessionId)
+            return
+        }
+        // `runTurn` silently returns with the server down, and the drain has
+        // already emptied the queue by then — the message would be gone with
+        // nothing on screen to show it ever existed. Check first and leave it
+        // parked: the composer still shows it, and Send still delivers it.
+        guard server.status == .running else { return }
+        guard let queued = queue.drain(sessionId) else { return }
+        publishQueue()
+        runTurn(sessionId: sessionId, userText: queued.text,
+                images: queued.images, audio: queued.audio,
+                config: cont.config, approval: cont.approval)
+    }
+
     // MARK: - Public API (TurnRunning)
 
     /// The app-wide stop: every session's turn. Kept for callers that mean
@@ -408,6 +518,11 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         guard ledger.activeSessionIds.contains(sessionId) else { return }
         tasks[sessionId]?.cancel()
         tasks[sessionId] = nil
+        // An interrupted turn hands nothing on: whatever is queued stays queued
+        // and visible, and the user decides when it goes. Dropping the
+        // continuation is what makes that structural rather than a flag some
+        // later unwind path could forget to check.
+        turnContinuation.removeValue(forKey: sessionId)
         ledger.endAll(session: sessionId)
         liveTokensBySession.removeValue(forKey: sessionId)
         // Belt and braces on the meter: the cancelled generation's own `defer`
@@ -449,6 +564,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // Other sessions' turns are untouched — the engine is multi-turn.
         stop(sessionId: sessionId)
         let token = ledger.begin(session: sessionId)
+        // How this turn is configured, so anything queued during it can be
+        // delivered as a successor turn on the same footing (see
+        // `drainQueueAsNewTurn`). Set AFTER `stop`, which clears it.
+        turnContinuation[sessionId] = (config, approval)
         publishTurnState()
 
         // Publish the answering agent's voice for THIS turn — but only when the
@@ -596,10 +715,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             print("[ChatTurnEngine] Chat error: \(error)")
             try? "Chat error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
             appendErrorNotice(error, to: sessionId)
+            appState.updateLastMessage(in: sessionId, streaming: false)
+            appState.saveChatHistory()
+            endTurn(sessionId: sessionId, token: token)
+            return
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
         appState.saveChatHistory()
         endTurn(sessionId: sessionId, token: token)
+        // Plain chat has no round boundary to inject at — its history is built
+        // once — so a message queued during it is delivered here, as the next
+        // turn in the conversation.
+        drainQueueAsNewTurn(sessionId: sessionId)
     }
 
     // MARK: - Agent mode (native tool calling)
@@ -664,9 +791,15 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 print("[ChatTurnEngine] Agent error: \(error)")
                 try? "Agent error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
                 self.appendErrorNotice(error, to: sessionId)
+                self.appState.saveChatHistory()
+                self.endTurn(sessionId: sessionId, token: token)
+                return
             }
             self.appState.saveChatHistory()
             self.endTurn(sessionId: sessionId, token: token)
+            // Anything queued during the final round (after the last boundary
+            // the loop could inject at) runs now, as its own turn.
+            self.drainQueueAsNewTurn(sessionId: sessionId)
         }
     }
 
@@ -678,8 +811,11 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var workingDirectory = initialWorkDir
         // One media generation per USER TURN, not per round — a round cap can't
         // bound a model that just calls again next round. This token identifies
-        // the turn for every round below.
-        let mediaTurn = UUID()
+        // the turn for every round below. It is re-minted when a queued message
+        // is injected: that IS a new user turn, and a user who asks for an image
+        // mid-loop must not be refused against a budget their earlier message
+        // spent.
+        var mediaTurn = UUID()
         if mediaProgressSessionId == sessionId {
             mediaProgress = nil
             mediaProgressSessionId = nil
@@ -710,6 +846,23 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // no-ops and the pad-retry path would burn full generations
             // against an empty history (see `stopIfOrphaned`).
             guard session(sessionId) != nil else { return }
+
+            // Anything the user typed while this turn was running lands HERE,
+            // at the round boundary — the last thing in the conversation is the
+            // previous round's tool results, and the history below is rebuilt
+            // from the session, so the injected message is simply the newest
+            // thing the model reads. A steer that had to wait for the loop to
+            // finish would arrive too late to steer it.
+            if injectQueuedMessage(into: sessionId) {
+                // A new user turn: it gets its own media budget, and the two
+                // give-up counters are about the MODEL spinning its wheels, not
+                // about the user, who has just changed the task under it. The
+                // repetition tracker deliberately survives — identical tool
+                // calls are a loop whoever asked for them.
+                mediaTurn = UUID()
+                stuck = AgentEngine.StuckDetector()
+                retry.recordProgress()
+            }
 
             // Build message history for API
             let turnMax = turnMaxTokens(config)

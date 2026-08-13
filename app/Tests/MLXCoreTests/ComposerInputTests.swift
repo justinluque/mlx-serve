@@ -41,21 +41,18 @@ final class ComposerInputTests: XCTestCase {
         XCTAssertFalse(r.scrolls)
     }
 
-    // MARK: - ComposerKey.onReturn (send vs newline vs swallow)
+    // MARK: - ComposerKey.onReturn (submit vs newline)
 
     func testShiftReturnAlwaysInsertsNewline() {
-        XCTAssertEqual(ComposerKey.onReturn(shift: true, isIdle: true), .newline)
-        XCTAssertEqual(ComposerKey.onReturn(shift: true, isIdle: false), .newline)
+        XCTAssertEqual(ComposerKey.onReturn(shift: true), .newline)
     }
 
-    func testBareReturnSendsWhenIdle() {
-        XCTAssertEqual(ComposerKey.onReturn(shift: false, isIdle: true), .send)
-    }
-
-    func testBareReturnSwallowedWhileGenerating() {
-        // While a turn is generating a bare Return must NOT insert a stray
-        // newline and must NOT start a second send — it is swallowed.
-        XCTAssertEqual(ComposerKey.onReturn(shift: false, isIdle: false), .ignore)
+    func testBareReturnSubmits() {
+        // A bare Return never inserts a stray newline. What a submit MEANS
+        // while a turn is running — queue, not send — is `ComposerSubmitAction`
+        // (see MessageQueueTests); the keypress no longer decides it, because
+        // deciding it here is what swallowed the Return outright.
+        XCTAssertEqual(ComposerKey.onReturn(shift: false), .submit)
     }
 
     // MARK: - ComposerIntent.wantsAgent (system/file/web action detection)
