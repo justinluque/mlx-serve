@@ -1375,8 +1375,14 @@ struct ChatDetailView: View {
     /// A conversation with nothing in it yet. Rendered instead of an empty
     /// scroll view so the composer sits under a greeting in the middle of the
     /// window rather than pinned to the bottom of a blank page.
+    ///
+    /// A parked message counts as something in it: the queue now draws in the
+    /// transcript, and the empty state draws no transcript at all — so a queue
+    /// outliving a stopped turn whose messages were then deleted would keep the
+    /// Send button enabled with nothing on screen to explain why.
     private var isEmptyConversation: Bool {
         (session?.messages.isEmpty ?? true) && composerState != .generatingHere
+            && queuedMessages.isEmpty
     }
 
     /// Greeting + discovery chips, one fixed-height block. The vertical slack
@@ -1464,6 +1470,17 @@ struct ChatDetailView: View {
                            let progress = chatEngine.mediaProgress {
                             MediaProgressCard(progress: progress)
                                 .id("mediaProgress")
+                        }
+                        // Messages typed while this chat is answering, last —
+                        // below everything belonging to the running turn. They
+                        // are not in the transcript proper yet, so these rows
+                        // are the only place they exist, which is what makes
+                        // each one deletable right up until it is delivered.
+                        ForEach(queuedMessages) { queued in
+                            QueuedMessageBubble(message: queued) {
+                                chatEngine.removeQueued(queued.id, from: sessionId)
+                            }
+                            .id(queued.id)
                         }
                     }
                     // The reading measure. The window is free to be as wide as
@@ -1558,14 +1575,6 @@ struct ChatDetailView: View {
                         SecurityScopedBookmark.clear(
                             name: SecurityScopedBookmark.attachedFolderName(sessionId))
                     }
-                }
-
-                // Messages typed while this chat is answering. They are not in
-                // the transcript yet — this row is the only place they exist,
-                // which is what makes each one deletable right up until it is
-                // delivered.
-                QueuedMessagesStrip(messages: queuedMessages) { id in
-                    chatEngine.removeQueued(id, from: sessionId)
                 }
 
                 // Voice mode lives INLINE: a talking orb just above the input,
@@ -2371,6 +2380,10 @@ struct ChatDetailView: View {
         let queued = QueuedMessage(text: text, images: attachedImages, audio: attachedAudio)
         guard chatEngine.enqueue(queued, for: sessionId) else { return }
         inputText = ""
+        // The parked message appears at the BOTTOM of the transcript, so a
+        // submit made from halfway up the history has to bring the view with
+        // it — same reason a send does (`proceedSend`).
+        applyScroll(.userSentMessage)
     }
 
     /// Names of MCP servers the user currently has enabled (disabled != true).
@@ -3810,59 +3823,84 @@ enum ComposerLayout {
     }
 }
 
-/// The messages parked for delivery, above the composer. Renders nothing when
-/// the queue is empty — this is a strip that exists only while something is
-/// waiting, like the attachment row it sits beside.
+/// A message parked for delivery, drawn as the LAST row of the transcript.
 ///
-/// Each row is a real Button, never a tap gesture wrapped around one (the
-/// swallowed-click class), and the ✕ is the ONLY way back: nothing about a
-/// queued message is in the transcript yet, so there is nothing else to delete.
-struct QueuedMessagesStrip: View {
-    let messages: [QueuedMessage]
-    let onRemove: (UUID) -> Void
+/// It is the user's next turn, so it renders where a user turn renders — same
+/// side, same shape, same measure — and only its treatment says it hasn't gone
+/// yet: a lighter fill and a "Queued" footnote. Above the composer it read as
+/// composer state, like the attachment row beside it, rather than as something
+/// about to be said. Sitting at the bottom of the conversation also settles the
+/// ordering for nothing: a message the engine delivers becomes a real
+/// `ChatMessage` in `session.messages`, which draws ABOVE these rows, so the
+/// reply to it — and anything queued after it — lands underneath.
+///
+/// The ✕ is a real Button beside the bubble, never a tap gesture wrapped around
+/// one (the swallowed-click class), and it is the ONLY way back: nothing about
+/// a queued message is in the transcript proper yet, so there is nothing else
+/// to delete. Always visible, like the message footer's own actions — a
+/// hover-reveal control under a transcript that is re-rendering mid-stream is
+/// awkward to hit.
+struct QueuedMessageBubble: View {
+    let message: QueuedMessage
+    let onRemove: () -> Void
 
     var body: some View {
-        if !messages.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(messages) { message in
-                    HStack(spacing: 6) {
-                        Image(systemName: "clock")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Text(Self.preview(message))
-                            .font(.caption)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .foregroundStyle(.secondary)
-                        Spacer(minLength: 4)
-                        Button {
-                            onRemove(message.id)
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .contentShape(Rectangle())
+        HStack(alignment: .top, spacing: 10) {
+            Spacer(minLength: 60)
+
+            VStack(alignment: .trailing, spacing: 4) {
+                // Attached images ride along exactly as they do on a sent turn
+                // — the point of showing the message here is that you can see
+                // what is about to go.
+                if let images = message.images, !images.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(images) { img in
+                            if let nsImage = NSImage(data: img.data) {
+                                Image(nsImage: nsImage)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(maxWidth: 260, maxHeight: 200)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                                    .opacity(0.75)
+                            }
                         }
-                        .buttonStyle(.plain)
-                        .help("Remove this queued message")
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.secondary.opacity(0.10))
-                    .clipShape(Capsule())
                 }
+
+                Text(Self.preview(message))
+                    .font(.system(size: ChatMetrics.transcriptFontSize))
+                    .textSelection(.enabled)
+                    .padding(.horizontal, ChatMetrics.bubblePaddingH)
+                    .padding(.vertical, ChatMetrics.bubblePaddingV)
+                    .background(Color.accentColor.opacity(0.30))
+                    .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius))
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+
+                HStack(spacing: 6) {
+                    Label("Queued", systemImage: "clock")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Button(action: onRemove) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 20, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Remove this queued message")
+                }
+                .padding(.top, 2)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 4)
         }
     }
 
-    /// One line naming what is waiting. An attachment with no caption has no
-    /// text to show, so it says what it IS rather than rendering an empty chip.
+    /// What the row says. An attachment with no caption has no text to show, so
+    /// it says what it IS rather than drawing an empty bubble. Text is verbatim
+    /// — in the transcript there is room for the whole message; the one-line
+    /// elision was a property of sitting in the composer row.
     static func preview(_ message: QueuedMessage) -> String {
-        let text = message.text
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.isEmpty { return text }
         let images = (message.images ?? []).count
         let clips = (message.audio ?? []).count
