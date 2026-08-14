@@ -253,6 +253,11 @@ struct ChatMessage: Identifiable, Codable {
     // back to the model as history, and the old in-content banner taught it
     // the warning text. Absent forever on messages saved before the field.
     var truncationNotice: TruncationNotice.Notice? = nil
+    // Set when the app chose the model for this turn itself, because the
+    // message was sent with nothing loaded (`AutoModelPicker`). Rendered as its
+    // own row — the pick is a fact about the app, not something the model said,
+    // so it never touches `content` (see the truncation-notice rule).
+    var modelNotice: AutoModelNotice? = nil
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -275,7 +280,7 @@ struct ChatMessage: Identifiable, Codable {
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
         case toolCallId, toolName, toolCalls, images, audio, failedRetry, processHandles
-        case errorNotice, media, truncationNotice
+        case errorNotice, media, truncationNotice, modelNotice
     }
 
     init(from decoder: Decoder) throws {
@@ -303,6 +308,9 @@ struct ChatMessage: Identifiable, Codable {
         errorNotice = try c.decodeIfPresent(ChatErrorNotice.self, forKey: .errorNotice)
         // Tolerant: a cause this build doesn't know must not fail the message.
         truncationNotice = (try? c.decodeIfPresent(TruncationNotice.Notice.self, forKey: .truncationNotice)) ?? nil
+        // Tolerant for the same reason: a kind or reason this build doesn't
+        // know must not take the whole transcript down with it.
+        modelNotice = (try? c.decodeIfPresent(AutoModelNotice.self, forKey: .modelNotice)) ?? nil
     }
 }
 
@@ -622,6 +630,16 @@ enum ServerStatus: Equatable {
         }
     }
 
+    /// What the server said went wrong, for a surface that wants to QUOTE it
+    /// rather than diagnose. nil in every state that isn't a failure — and nil
+    /// is also the honest answer for a load that simply timed out, which
+    /// leaves nothing to quote.
+    var failureText: String? {
+        guard case let .error(msg) = self else { return nil }
+        let trimmed = msg.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     var color: String {
         switch self {
         case .stopped: "red"
@@ -734,6 +752,11 @@ struct LocalModel: Identifiable, Hashable {
     /// the only place that can see the SIBLINGS, and so the only place that can
     /// tell two builds of one scheme apart. nil ⇒ derive it from the filename.
     var quantLabel: String? = nil
+    /// On-disk weight bytes — the same number `sizeFormatted` renders, kept as
+    /// a number so `AutoModelPicker` can compare a checkpoint against this
+    /// Mac's memory. 0 means discovery couldn't sum it (never "empty"), and
+    /// every consumer must treat it as unknown rather than as zero.
+    var sizeBytes: Int64 = 0
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType) || isMediaModelType(modelType)

@@ -982,6 +982,11 @@ struct ChatDetailView: View {
     // id — the view is reused across tabs).
     @State private var pendingIntentPrompt: IntentPrompt?
     @State private var intentSuppress = SessionIntentSuppression()
+    // Messages accepted while no model was loaded, waiting on the one the app
+    // picked for them. Keyed by session id for the same reason the suppression
+    // above is: this view is REUSED across tabs, so a plain optional would let
+    // one chat's queued message land in another.
+    @State private var pendingAutoSends: [UUID: PendingAutoSend] = [:]
 
 
     private var session: ChatSession? {
@@ -1447,7 +1452,10 @@ struct ChatDetailView: View {
                                     },
                                     onDelete: {
                                         appState.deleteMessage(in: sessionId, messageId: m.id)
-                                    })
+                                    },
+                                    autoModelDownloadProgress: autoModelDownloadProgress(for: m),
+                                    onDownloadAutoModel: { downloadPendingAutoModel() },
+                                    onCancelAutoModelDownload: { cancelPendingAutoModel() })
                                 .id(m.id)
                             case .toolCall(let call, let results):
                                 ToolCallRow(call: call, results: results).id(call.id)
@@ -1859,13 +1867,12 @@ struct ChatDetailView: View {
                 .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
         }
         .buttonStyle(.plain)
-        // Stop is always tappable for the owning chat. Otherwise: Send,
-        // disabled when the server is down or when this chat has nothing to
-        // send. Another chat's turn blocks nothing — the engine is multi-turn.
-        .disabled(server.status != .running
-                  || (composerState == .idle
-                      && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty))
+        // Stop is always tappable for the owning chat. Otherwise Send, live
+        // whenever the message has somewhere to go — including with the server
+        // down, which is what `ChatSendGate` turned from a dead control into a
+        // model pick. Another chat's turn blocks nothing — the engine is
+        // multi-turn.
+        .disabled(composerState == .idle && sendGate == .disabled)
         }
     }
 
@@ -2029,13 +2036,6 @@ struct ChatDetailView: View {
     }
 
     /// Convert pending audio clips to a ChatAudio array, clearing the list.
-    private func consumePendingAudio() -> [ChatAudio]? {
-        guard !pendingAudio.isEmpty else { return nil }
-        let clips = pendingAudio
-        pendingAudio = []
-        return clips
-    }
-
     /// Whether the active model understands audio (Gemma 4 12B unified). Gates
     /// the mic button and audio-file attachment so they only appear where audio
     /// actually does something.
@@ -2091,13 +2091,6 @@ struct ChatDetailView: View {
 
     /// Build a preamble string that joins all pending PDFs and clears the list.
     /// Returns "" when nothing is pending.
-    private func consumePendingPDFsAsText() -> String {
-        guard !pendingPDFs.isEmpty else { return "" }
-        let combined = pendingPDFs.map { "[PDF: \($0.name)]\n\($0.text)" }.joined(separator: "\n\n")
-        pendingPDFs = []
-        return combined
-    }
-
     /// Convert NSImage to JPEG data suitable for API transport.
     private static func nsImageToJPEG(_ image: NSImage) -> Data? {
         guard let tiff = image.tiffRepresentation,
@@ -2109,16 +2102,6 @@ struct ChatDetailView: View {
     }
 
     /// Convert pending NSImages to ChatImage array, clearing the pending list.
-    private func consumePendingImages() -> [ChatImage]? {
-        guard !pendingImages.isEmpty else { return nil }
-        let chatImages = pendingImages.compactMap { img -> ChatImage? in
-            guard let data = Self.nsImageToJPEG(img) else { return nil }
-            return ChatImage(data: data)
-        }
-        pendingImages = []
-        return chatImages.isEmpty ? nil : chatImages
-    }
-
     // MARK: - Helpers
 
     /// Route one event through the decision core and carry out whatever it asks
@@ -2321,6 +2304,9 @@ struct ChatDetailView: View {
         // Pre-send nudge: if the message looks like it needs a mode that's off,
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
+        // Only while a model is already answering: on a cold start the message
+        // is about to pick and load one, and stacking a second dialog in front
+        // of that is two decisions before a single word is sent.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
@@ -2369,15 +2355,58 @@ struct ChatDetailView: View {
     }
 
     private func proceedSend() {
-        var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachedImages = consumePendingImages()
-        let attachedAudio = consumePendingAudio()
-        let pdfText = consumePendingPDFsAsText()
-        guard !text.isEmpty || attachedImages != nil || attachedAudio != nil || !pdfText.isEmpty,
-              composerState != .generatingHere, server.status == .running else { return }
+        guard composerState != .generatingHere else { return }
+        // The gate is read BEFORE the composer is emptied: a branch that
+        // declines must leave the message where the user can still see it.
+        switch sendGate {
+        case .disabled:
+            return
+        case .send:
+            runTurn(from: takeComposerSnapshot())
+        case .autoPick:
+            beginAutoModelSend(takeComposerSnapshot())
+        }
+    }
+
+    /// What Send does right now. `hasAutoPick` asks only whether there is
+    /// anything to pick FROM — the pick itself needs the message, which doesn't
+    /// exist yet at draw time.
+    private var sendGate: ChatSendGate {
+        ChatSendGate.resolve(
+            status: server.status,
+            hasContent: !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !pendingImages.isEmpty || !pendingPDFs.isEmpty || !pendingAudio.isEmpty,
+            hasAutoPick: appState.localModels.contains(where: \.isChatPickable),
+            isAwaitingAutoModel: pendingAutoSends[sessionId] != nil)
+    }
+
+    /// Empty the composer into one value. Every field goes at once — a partial
+    /// take is how an attachment survives into the NEXT message.
+    private func takeComposerSnapshot() -> ComposerSnapshot {
+        let snapshot = ComposerSnapshot(
+            text: inputText.trimmingCharacters(in: .whitespacesAndNewlines),
+            images: pendingImages, pdfs: pendingPDFs, audio: pendingAudio)
         inputText = ""
-        if !pdfText.isEmpty {
-            text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
+        pendingImages = []
+        pendingPDFs = []
+        pendingAudio = []
+        return snapshot
+    }
+
+    /// Hand the whole message back, unchanged. Used when a model the app chose
+    /// itself never came up: the send didn't happen, so the composer is where
+    /// the message belongs.
+    private func restoreComposer(_ snapshot: ComposerSnapshot) {
+        inputText = snapshot.text
+        pendingImages = snapshot.images
+        pendingPDFs = snapshot.pdfs
+        pendingAudio = snapshot.audio
+    }
+
+    private func runTurn(from snapshot: ComposerSnapshot) {
+        guard !snapshot.isEmpty else { return }
+        let images = snapshot.images.compactMap { img -> ChatImage? in
+            Self.nsImageToJPEG(img).map { ChatImage(data: $0) }
         }
 
         // The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
@@ -2394,14 +2423,156 @@ struct ChatDetailView: View {
             reasoningEffort: reasoningEffort)
         let config = ChatTurnEngine.TurnConfig.from(
             resolved, documentIndex: appState.documentIndexes[sessionId])
-        chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
+        chatEngine.runTurn(sessionId: sessionId, userText: snapshot.promptText,
+                           images: images.isEmpty ? nil : images,
+                           audio: snapshot.audio.isEmpty ? nil : snapshot.audio,
                            config: config,
                            approval: { await requestToolApproval($0) })
         // Your own message always wins: sending from halfway up the history used
         // to leave you exactly there, because auto-follow was off and nothing
         // else scrolled.
         applyScroll(.userSentMessage)
+    }
+
+    // MARK: - Auto model pick (cold start)
+
+    /// A message accepted while nothing was loaded. It holds the composer's
+    /// whole content so a failed load can hand it back, and the id of the
+    /// transcript row that is reporting on it.
+    struct PendingAutoSend {
+        var snapshot: ComposerSnapshot
+        var noticeId: UUID
+        /// Set while the message is waiting on a download rather than a load.
+        var repoId: String?
+    }
+
+    /// The message was accepted with no model running: choose one from what the
+    /// message needs, say so in the transcript, and send once it's up.
+    private func beginAutoModelSend(_ snapshot: ComposerSnapshot) {
+        guard !snapshot.isEmpty else { return }
+        let need = AutoModelNeed.from(text: snapshot.promptText,
+                                      imageCount: snapshot.images.count,
+                                      pdfCharacters: 0,   // already inside promptText
+                                      toolsEnabled: isAgentMode)
+        switch AutoModelPicker.pick(need: need,
+                                    candidates: appState.localModels,
+                                    physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+                                    lastUsedPath: appState.selectedModelPath) {
+        case .noneAvailable:
+            // Nothing to load and nothing to offer — the blocking gate sheet is
+            // the screen for that. Put the message back rather than eat it.
+            restoreComposer(snapshot)
+
+        case let .use(path, name, reason):
+            let noticeId = appendNotice(AutoModelNotice(kind: .loading, modelName: name, reason: reason))
+            pendingAutoSends[sessionId] = PendingAutoSend(snapshot: snapshot, noticeId: noticeId, repoId: nil)
+            applyScroll(.userSentMessage)
+            let id = sessionId
+            Task { await loadThenSend(path: path, sessionId: id, noticeId: noticeId) }
+
+        case let .download(repoId, name, reason):
+            // Never started for you: a multi-GB transfer is the one outcome
+            // that must not happen silently (the rule `AgentModelSwitch`
+            // already follows for a pinned model that isn't on disk).
+            let notice = AutoModelNotice(kind: .needsDownload, modelName: name, reason: reason,
+                                         repoId: repoId, queuedPreview: snapshot.preview)
+            let noticeId = appendNotice(notice)
+            pendingAutoSends[sessionId] = PendingAutoSend(snapshot: snapshot, noticeId: noticeId, repoId: repoId)
+            applyScroll(.userSentMessage)
+        }
+    }
+
+    /// Load the chosen checkpoint, then run the turn that was waiting on it.
+    @MainActor
+    private func loadThenSend(path: String, sessionId: UUID, noticeId: UUID) async {
+        let ready = await appState.useModelAndAwaitReady(atPath: path)
+        // The chat may have moved on (deleted, or a newer pick superseded this
+        // one) — a stale completion must never fire someone else's message.
+        guard let pending = pendingAutoSends[sessionId], pending.noticeId == noticeId else { return }
+        pendingAutoSends[sessionId] = nil
+        guard ready else {
+            updateNotice(noticeId, in: sessionId) {
+                $0.kind = .failed
+                $0.failureMessage = server.status.failureText
+            }
+            restoreComposer(pending.snapshot)
+            return
+        }
+        updateNotice(noticeId, in: sessionId) { $0.kind = .loaded }
+        runTurn(from: pending.snapshot)
+    }
+
+    /// Start the transfer the card offers, and send the waiting message once
+    /// the model is on disk and up.
+    private func downloadPendingAutoModel() {
+        guard let pending = pendingAutoSends[sessionId], let repoId = pending.repoId else { return }
+        let id = sessionId
+        downloads.start(repoId: repoId) {
+            // `onFinish` also fires for a CANCELLED transfer, and Cancel has
+            // already put the message back in the composer — a completion that
+            // didn't check would then send it anyway, on a model that never
+            // arrived.
+            guard pendingAutoSends[id]?.noticeId == pending.noticeId else { return }
+            appState.refreshModels()
+            guard let dir = downloads.existingModelDir(for: repoId) else {
+                // The transfer ended without leaving a model behind (a failure,
+                // or a partial that was cleaned up). Quote what we know and
+                // hand the message back.
+                updateNotice(pending.noticeId, in: id) {
+                    $0.kind = .failed
+                    $0.queuedPreview = nil
+                    $0.failureMessage = downloads.downloads[repoId]?.error ?? "The download didn't complete."
+                }
+                pendingAutoSends[id] = nil
+                restoreComposer(pending.snapshot)
+                return
+            }
+            updateNotice(pending.noticeId, in: id) { $0.kind = .loading; $0.queuedPreview = nil }
+            Task { await loadThenSend(path: dir, sessionId: id, noticeId: pending.noticeId) }
+        }
+    }
+
+    /// Live progress for the transfer a waiting row is showing, or nil when the
+    /// row isn't the one waiting (an older notice from a previous cold start
+    /// stays in the transcript as a record and must not sprout a live bar).
+    private func autoModelDownloadProgress(for message: ChatMessage) -> Double? {
+        guard let pending = pendingAutoSends[sessionId], pending.noticeId == message.id,
+              let repoId = pending.repoId,
+              let state = downloads.downloads[repoId], state.status == .downloading else { return nil }
+        return state.fileProgress
+    }
+
+    private func cancelPendingAutoModel() {
+        guard let pending = pendingAutoSends[sessionId] else { return }
+        if let repoId = pending.repoId {
+            downloads.cancel(repoId)
+            appState.refreshModels()
+        }
+        pendingAutoSends[sessionId] = nil
+        updateNotice(pending.noticeId, in: sessionId) {
+            $0.kind = .failed
+            $0.failureMessage = "Download cancelled."
+        }
+        restoreComposer(pending.snapshot)
+    }
+
+    /// The auto-model row, as its own message. `failedRetry` keeps it out of the
+    /// history sent to the model — it is a note about the app, and an assistant
+    /// turn describing our own machinery is how a model starts explaining it.
+    private func appendNotice(_ notice: AutoModelNotice) -> UUID {
+        var msg = ChatMessage(role: .assistant, content: "")
+        msg.modelNotice = notice
+        msg.failedRetry = true
+        appState.appendMessage(to: sessionId, message: msg)
+        return msg.id
+    }
+
+    private func updateNotice(_ id: UUID, in sessionId: UUID, _ edit: (inout AutoModelNotice) -> Void) {
+        guard let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = appState.chatSessions[sIdx].messages.firstIndex(where: { $0.id == id }),
+              var notice = appState.chatSessions[sIdx].messages[mIdx].modelNotice else { return }
+        edit(&notice)
+        appState.chatSessions[sIdx].messages[mIdx].modelNotice = notice
     }
 
     /// Ask the user to approve a single tool call. Returns true on Allow /
@@ -2586,13 +2757,24 @@ struct MessageBubble: View {
     /// a task run's transcript is a record, so it has no delete affordance
     /// rather than one that silently does nothing.
     var onDelete: (() -> Void)?
+    /// Live progress for an auto-picked model's download, when one is running.
+    var autoModelDownloadProgress: Double? = nil
+    /// Starts the download the auto-model card offers. nil on read-only
+    /// surfaces (the task-run viewer), which render the row as a record.
+    var onDownloadAutoModel: (() -> Void)? = nil
+    var onCancelAutoModelDownload: (() -> Void)? = nil
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
 
     var body: some View {
-        // A failure notice is not model output: it renders as its own card
-        // across the column, never inside an assistant bubble.
-        if let notice = message.errorNotice {
+        // Neither notice is model output: both render as their own card across
+        // the column, never inside an assistant bubble.
+        if let notice = message.modelNotice {
+            AutoModelCard(notice: notice,
+                          downloadProgress: autoModelDownloadProgress,
+                          onDownload: onDownloadAutoModel,
+                          onCancel: onCancelAutoModelDownload)
+        } else if let notice = message.errorNotice {
             ChatErrorCard(notice: notice, onIncreaseContext: onIncreaseContext)
         } else {
             messageBody

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 /// Which pre-send nudge to show when the user's message looks like it needs a
 /// mode that's currently off. Drives the confirmation dialog in ChatView.
@@ -68,6 +69,44 @@ enum ComposerIntent {
             let n = name.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
             return !n.isEmpty && t.contains(n)
         }
+    }
+}
+
+/// Everything the composer was holding when a message was accepted, taken in
+/// one piece.
+///
+/// It exists because a message can now be accepted BEFORE there is a model to
+/// answer it (`AutoModelPicker`): the composer is cleared at the moment you
+/// press Send, and if the load then fails the whole thing — text, images, PDFs,
+/// audio — has to go back exactly as it was. Kept RAW (NSImages, not encoded
+/// `ChatImage`s) for that reason; the send payload is derived at send time.
+struct ComposerSnapshot {
+    var text: String = ""
+    var images: [NSImage] = []
+    var pdfs: [(name: String, text: String)] = []
+    var audio: [ChatAudio] = []
+
+    var isEmpty: Bool {
+        text.isEmpty && images.isEmpty && pdfs.isEmpty && audio.isEmpty
+    }
+
+    /// What the model is actually sent: attached PDF text FIRST, then what the
+    /// user typed. That order is what makes "summarise this" read as an
+    /// instruction about the document above it rather than a preamble the
+    /// model has to hold in mind while a hundred pages scroll past.
+    var promptText: String {
+        let pdfText = pdfs.map { "[PDF: \($0.name)]\n\($0.text)" }.joined(separator: "\n\n")
+        if pdfText.isEmpty { return text }
+        return text.isEmpty ? pdfText : pdfText + "\n\n" + text
+    }
+
+    /// A one-line echo of the typed message, for the card that shows what is
+    /// waiting on a download. The PDF body is deliberately not in it.
+    var preview: String {
+        if !text.isEmpty { return text }
+        if !images.isEmpty { return images.count == 1 ? "1 image" : "\(images.count) images" }
+        if !pdfs.isEmpty { return pdfs.map(\.name).joined(separator: ", ") }
+        return audio.isEmpty ? "" : "audio clip"
     }
 }
 

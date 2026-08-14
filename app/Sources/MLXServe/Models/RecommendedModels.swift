@@ -471,6 +471,22 @@ extension RecommendedModelPick {
         if gib <= 32 { return .gemma12B }
         return .qwen36_27bMtp
     }
+
+    /// The pick to offer when the message needs a model that can SEE and none
+    /// of the downloaded ones can (`AutoModelPicker`).
+    ///
+    /// Same RAM bands as `starterPick`, but the 32 GB+ tier can't be its Qwen:
+    /// the starter list's top pick is text-only, and the whole point of this
+    /// offer is the image. Every Gemma 4 checkpoint carries SigLIP vision, so
+    /// the family IS the constraint — which is what the picker's test asserts
+    /// rather than a repo id it would have to be kept in sync with by hand.
+    static func visionPick(physicalMemoryBytes: UInt64) -> RecommendedModelPick {
+        let gib = Double(physicalMemoryBytes) / bytesPerGiB
+        if gib <= 8 { return .gemmaE2B }
+        if gib <= 16 { return .gemmaE4B }
+        if gib <= 32 { return .gemma12B }
+        return .gemma26bA4b
+    }
 }
 
 extension Array where Element == RecommendedModelPick {
