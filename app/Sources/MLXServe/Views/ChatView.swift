@@ -1078,15 +1078,14 @@ struct ChatDetailView: View {
     /// switches are: the detail view is REUSED across tabs, so an app-wide
     /// value here would leak one conversation's leash into every other.
     private func setSessionPermissionMode(_ mode: PermissionMode) {
-        guard let id = sessionId,
-              let idx = appState.chatSessions.firstIndex(where: { $0.id == id }) else { return }
+        guard let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
         appState.chatSessions[idx].permissionMode = mode.rawValue
         appState.saveChatHistory()
         // Tightening back to Ask has to re-arm the in-session "Allow all this
         // session" grant, or that old blanket approval keeps waving calls
         // through underneath the stricter mode the user just picked — the same
         // reason toggling Agent off re-arms it.
-        if mode == .ask { toolAllowList.rearm(id) }
+        if mode == .ask { toolAllowList.rearm(sessionId) }
     }
 
     /// The agent's name when it decided tool approval for itself, else nil.

@@ -2285,7 +2285,10 @@ private struct SystemPromptSectionContent: View {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.message = "Choose the file to read the agent's system prompt from."
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        // Through AppActivation, never `panel.runModal()` directly: from an
+        // inactive accessory app a raw panel opens unfocused and won't take
+        // clicks (`AppActivationTests.testNoRawPanelPresentation`).
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
         storedPath = url.path
         reload()
     }
