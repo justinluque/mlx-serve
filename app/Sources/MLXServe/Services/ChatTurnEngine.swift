@@ -232,7 +232,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         /// everything — full access is what every surface had before agents.
         var tools: Set<AgentToolKind> = Set(AgentToolKind.allCases)
         /// Skip the approval gate for this turn (an agent that declared it).
+        ///
+        /// Retained beside `permissionMode` rather than folded into it: the
+        /// headless callers (`TaskScheduler`, `TelegramBridge`) and voice mode
+        /// set this directly and bring their OWN approval closure, so it stays
+        /// the short-circuit inside the `.ask` arm. That is what makes the
+        /// default `.ask` byte-identical to the pre-modes behaviour everywhere
+        /// except the chat window, which is the only surface that sets a mode.
         var autoApprove: Bool = false
+        /// How far this turn may go before it stops and asks. `.ask` (the
+        /// default) reproduces the old chat exactly — a prompt per call.
+        var permissionMode: PermissionMode = .default
         /// Sampling overrides; nil = the path's own default (the tool loop and
         /// plain chat do NOT share one).
         var temperature: Double? = nil
@@ -270,6 +280,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 systemPromptPrefix: r.systemPromptPrefix,
                 tools: r.tools,
                 autoApprove: r.autoApprove,
+                permissionMode: r.permissionMode,
                 temperature: r.temperatureOverride,
                 maxTokens: r.maxTokensOverride,
                 topP: r.topPOverride,
@@ -509,6 +520,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var plainSystemBits: [String] = []
         let persona = config.systemPromptPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
         if !persona.isEmpty { plainSystemBits.append(persona) }
+        // Fourth explicit ask, and OFF by default: the base system-prompt file
+        // on plain turns too. ONE pure decision owns every gate (the setting,
+        // and the persona-wins rule) so the call site can be unconditional —
+        // a second copy of "persona replaces everything" here is how the two
+        // would drift. The prompt is an autoclosure: with the setting off this
+        // does no file I/O at all, on every plain turn.
+        if let base = Self.plainChatBasePrompt(
+            enabled: appState.serverOptions.applyBasePromptToPlainChat,
+            persona: persona,
+            prompt: AgentPrompt.systemPrompt) {
+            plainSystemBits.append(base)
+        }
         if config.voiceStyle {
             // `hasPersona`: with an agent above it, the voice guidance must not
             // name the assistant after the app's wake phrase — it's appended last,
@@ -1097,16 +1120,41 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // An agent that declared auto-approve skips the gate entirely —
                 // one decision, made when the agent was configured, instead of a
                 // dialog per call.
-                let approved = config.autoApprove ? true : await approval(tc)
+                // The permission gate. `.ask` (the default) routes to the
+                // caller's own approval closure exactly as before, so every
+                // non-chat surface — TaskScheduler's autonomy matrix, voice
+                // mode's hands-free flag, QuickLauncher's blanket refusal — is
+                // unchanged. Only the chat window sets a different mode, and a
+                // permissive one answers here without ever suspending the loop.
+                let decision = config.permissionMode.decide(
+                    tool: tc.name, arguments: tc.arguments,
+                    rawArguments: tc.rawArguments, workingDirectory: workingDirectory)
+                let approved: Bool
+                // The refusal the model reads. A mode that denies explains
+                // itself in its own words (plan mode has to say what to do
+                // instead, or the model just retries); a user denial keeps the
+                // wording it has always had.
+                var refusal = "Error: user denied this tool call. Do not retry this command; ask the user how to proceed or try a different approach."
+                var refusedBy = "denied by user"
+                switch decision {
+                case .allow:
+                    approved = true
+                case .deny(let reason):
+                    approved = false
+                    refusal = reason
+                    refusedBy = "blocked by \(config.permissionMode.title) mode"
+                case .ask:
+                    approved = config.autoApprove ? true : await approval(tc)
+                }
                 guard approved else {
                     let denied = AgentEngine.ToolResult(
                         id: tc.id,
                         name: tc.name,
-                        output: "Error: user denied this tool call. Do not retry this command; ask the user how to proceed or try a different approach."
+                        output: refusal
                     )
                     // A user denial is a deliberate stop, not a stuck loop — don't
                     // count it toward the no-progress tally.
-                    var deniedMsg = ChatMessage(role: .assistant, content: "**\(tc.name)** → denied by user")
+                    var deniedMsg = ChatMessage(role: .assistant, content: "**\(tc.name)** → \(refusedBy)")
                     deniedMsg.isAgentSummary = true
                     appState.appendMessage(to: sessionId, message: deniedMsg)
                     var toolMsg = ChatMessage(role: .system, content: denied.output)
@@ -1451,6 +1499,34 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// already the whole system message). Persona is "" when there's no agent,
     /// and the result is then byte-identical to what this produced before
     /// agents existed.
+    /// Whether a PLAIN chat turn (Tools and MCP both off) carries the base
+    /// system-prompt file, and what it carries.
+    ///
+    /// Three gates, all here so the turn site can call unconditionally:
+    ///
+    /// - **The setting is off by default.** Plain chat deliberately sends no
+    ///   system message — a synthesized one is routinely read by models AS the
+    ///   user's input (the `formatNudge` class). Returning nil then is what
+    ///   makes the shipped default byte-identical to the behaviour that
+    ///   predates this function.
+    /// - **A persona wins outright.** An agent's prompt is the whole system
+    ///   message, here exactly as in `composeSystemPrompt` — two identity
+    ///   claims in one turn is the "I'm poolside Malibu under an Elon Musk
+    ///   persona" bug.
+    /// - **An empty prompt is nil, not an empty system message.** A `{"role":
+    ///   "system", "content": ""}` is not the same request as no system message
+    ///   at all, and some templates render it as a stray marker.
+    ///
+    /// Pure → `ChatTurnEngine` tests.
+    nonisolated static func plainChatBasePrompt(enabled: Bool,
+                                                persona: String,
+                                                prompt: @autoclosure () -> String) -> String? {
+        guard enabled else { return nil }
+        guard persona.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let text = prompt().trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+
     nonisolated static func composeSystemPrompt(persona: String = "",
                                                 stable: String,
                                                 volatileTail: String,

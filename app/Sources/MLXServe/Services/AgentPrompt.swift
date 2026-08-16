@@ -62,8 +62,44 @@ enum AgentPrompt {
     }
 
     private static let mlxServeDir = NSString(string: "~/.mlx-serve").expandingTildeInPath
-    private static let promptPath = (mlxServeDir as NSString).appendingPathComponent("system-prompt.md")
+    /// The built-in location, used unless the user points somewhere else.
+    static let builtinPromptPath = (mlxServeDir as NSString).appendingPathComponent("system-prompt.md")
     private static let memoryPath = (mlxServeDir as NSString).appendingPathComponent("memory.md")
+
+    /// UserDefaults key for a user-supplied prompt file. Empty/absent = the
+    /// built-in location. Defaults-backed (not `ServerOptions`) so the model
+    /// layer can read it without an `AppState`, the same idiom
+    /// `ChatSession.defaultWorkspaceDefaultsKey` uses for the workspace.
+    static let promptPathDefaultsKey = "systemPromptFilePath"
+
+    /// The user's configured prompt file, or nil when they haven't set one.
+    /// Tilde-expanded; whitespace-only counts as unset.
+    static var customPromptPath: String? {
+        let raw = (UserDefaults.standard.string(forKey: promptPathDefaultsKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        return (raw as NSString).expandingTildeInPath
+    }
+
+    /// The file the prompt is read from and written to.
+    ///
+    /// A configured path is returned **even when the file is missing**, rather
+    /// than silently falling through to the built-in one: the point of the
+    /// setting is that the prompt lives elsewhere, and a quiet fall-through is
+    /// how someone edits a file for an hour that nothing is reading (the
+    /// `huggingFaceRoot` rule, applied here). The missing file surfaces as
+    /// `customPromptIsMissing` so Settings can say so, and the READ still
+    /// resolves to the built-in default text, because a serving path cannot be
+    /// left with no prompt at all.
+    static var resolvedPromptPath: String { customPromptPath ?? builtinPromptPath }
+
+    /// True when the user pointed at a file that isn't there — a misconfiguration
+    /// Settings must show, since the agent is silently running the built-in
+    /// default in the meantime.
+    static var customPromptIsMissing: Bool {
+        guard let customPromptPath else { return false }
+        return !FileManager.default.fileExists(atPath: customPromptPath)
+    }
 
     static let defaultPromptFile = """
         You are an autonomous agent. Finish the task yourself — don't ask for confirmation between steps. Reply to the user only when the task is done, or when you hit an ambiguity no tool can resolve.
@@ -125,14 +161,47 @@ enum AgentPrompt {
     /// still holding the pre-v26.6.11 additive "Custom Instructions" stub —
     /// migrating that stub in place so the editor and the agent stay in sync.
     static var systemPrompt: String {
-        ensureFile(at: promptPath, defaultContent: defaultPromptFile)
-        let raw = (try? String(contentsOfFile: promptPath, encoding: .utf8)) ?? ""
+        let path = resolvedPromptPath
+        // Only the BUILT-IN location is auto-seeded. Creating a file at a
+        // user-typed path would turn a typo into a stray prompt file that
+        // looks like it's working; a missing custom file stays missing and is
+        // reported by `customPromptIsMissing`.
+        if path == builtinPromptPath {
+            ensureFile(at: path, defaultContent: defaultPromptFile)
+        }
+        let raw = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
         let resolved = resolvePrompt(fileContent: raw)
-        if resolved == defaultPromptFile,
+        // The legacy-stub migration writes back only to our own file — never to
+        // a file the user pointed us at.
+        if path == builtinPromptPath,
+           resolved == defaultPromptFile,
            raw.trimmingCharacters(in: .whitespacesAndNewlines) != defaultPromptFile {
-            try? defaultPromptFile.write(toFile: promptPath, atomically: true, encoding: .utf8)
+            try? defaultPromptFile.write(toFile: path, atomically: true, encoding: .utf8)
         }
         return resolved
+    }
+
+    /// The prompt file's current text for the in-app editor — the raw bytes,
+    /// NOT `resolvePrompt`'s output, so editing shows what is actually on disk
+    /// (an empty file must read as empty, not as the default silently poured
+    /// into the editor and saved back as the user's own).
+    static func promptFileContents() -> String {
+        (try? String(contentsOfFile: resolvedPromptPath, encoding: .utf8)) ?? ""
+    }
+
+    /// Save edited text back to the active prompt file. Creates the parent
+    /// directory so saving to a fresh custom path works.
+    @discardableResult
+    static func savePromptFile(_ text: String) -> Bool {
+        let path = resolvedPromptPath
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        do {
+            try text.write(toFile: path, atomically: true, encoding: .utf8)
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Pure resolution of the on-disk prompt file to the effective prompt: an
@@ -177,8 +246,11 @@ enum AgentPrompt {
 
     /// Open `system-prompt.md` in the user's default editor.
     static func openSystemPromptInEditor() {
-        ensureFile(at: promptPath, defaultContent: defaultPromptFile)
-        NSWorkspace.shared.open(URL(fileURLWithPath: promptPath))
+        let path = resolvedPromptPath
+        if path == builtinPromptPath {
+            ensureFile(at: path, defaultContent: defaultPromptFile)
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
     // MARK: - Update to latest built-in default
@@ -188,7 +260,7 @@ enum AgentPrompt {
     /// (or they have a customized prompt). Drives the "Update System Prompt" menu
     /// item's enabled state.
     static func isSystemPromptOutdated() -> Bool {
-        isPromptOutdated(fileContent: try? String(contentsOfFile: promptPath, encoding: .utf8))
+        isPromptOutdated(fileContent: try? String(contentsOfFile: resolvedPromptPath, encoding: .utf8))
     }
 
     /// Pure decision behind `isSystemPromptOutdated`. Missing / empty / the legacy
@@ -211,17 +283,25 @@ enum AgentPrompt {
     /// up the new content automatically — no reload plumbing needed.
     @discardableResult
     static func updateSystemPromptToDefault() -> String? {
-        let existing = (try? String(contentsOfFile: promptPath, encoding: .utf8)) ?? ""
+        // Whichever file is ACTIVE — overwriting the built-in one while the
+        // agent is reading a custom file would report success and change
+        // nothing the user can see.
+        let target = resolvedPromptPath
+        let existing = (try? String(contentsOfFile: target, encoding: .utf8)) ?? ""
         var backupPath: String? = nil
         if !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let f = DateFormatter()
             f.dateFormat = "yyyyMMdd-HHmmss"
-            let path = (mlxServeDir as NSString).appendingPathComponent(promptBackupFileName(stamp: f.string(from: Date())))
+            // The backup lands beside the file it came from, so a custom prompt
+            // is recoverable from where its owner keeps it.
+            let dir = (target as NSString).deletingLastPathComponent
+            let path = (dir as NSString).appendingPathComponent(promptBackupFileName(stamp: f.string(from: Date())))
             try? existing.write(toFile: path, atomically: true, encoding: .utf8)
             backupPath = path
         }
-        try? FileManager.default.createDirectory(atPath: mlxServeDir, withIntermediateDirectories: true)
-        try? defaultPromptFile.write(toFile: promptPath, atomically: true, encoding: .utf8)
+        try? FileManager.default.createDirectory(
+            atPath: (target as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try? defaultPromptFile.write(toFile: target, atomically: true, encoding: .utf8)
         return backupPath
     }
 

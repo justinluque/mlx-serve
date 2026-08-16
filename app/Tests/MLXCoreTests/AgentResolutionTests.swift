@@ -225,4 +225,46 @@ final class AgentResolutionTests: XCTestCase {
         XCTAssertTrue(r.tools.contains(.searchDocuments))
         XCTAssertFalse(r.toolsEnabled)
     }
+
+    // MARK: - Permission mode
+
+    func testNoAgentPassesTheSurfacesPermissionModeThrough() {
+        var d = defaults()
+        d.permissionMode = .auto
+        XCTAssertEqual(AgentResolution.resolve(agent: nil, defaults: d).permissionMode, .auto)
+    }
+
+    func testTheShippedDefaultIsAskSoAnUntouchedInstallStillPrompts() {
+        // The upgrade guarantee for this feature: a surface that never sets a
+        // mode resolves to the behaviour the chat has always had.
+        XCTAssertEqual(AppDefaultsSnapshot().permissionMode, .ask)
+        XCTAssertEqual(AgentResolution.resolve(agent: nil, defaults: AppDefaultsSnapshot()).permissionMode, .ask)
+    }
+
+    func testAnAgentThatDeclaredAutoApproveKeepsNeverBeingAsked() {
+        // Before modes existed `autoApproveTools == true` meant the gate was
+        // skipped outright. Anything softer than `.bypass` here would start
+        // interrupting users who had explicitly configured it not to.
+        var d = defaults()
+        d.permissionMode = .ask
+        let a = agent { $0.autoApproveTools = true }
+        XCTAssertEqual(AgentResolution.resolve(agent: a, defaults: d).permissionMode, .bypass)
+        XCTAssertTrue(AgentResolution.resolve(agent: a, defaults: d).autoApprove)
+    }
+
+    func testAnAgentThatDeclaredNoAutoApproveInheritsTheChatsMode() {
+        var d = defaults()
+        d.permissionMode = .acceptEdits
+        let a = agent { $0.autoApproveTools = nil }
+        XCTAssertEqual(AgentResolution.resolve(agent: a, defaults: d).permissionMode, .acceptEdits)
+    }
+
+    func testAnAgentThatExplicitlyDisabledAutoApproveAlwaysAsks() {
+        // An explicit `false` is a decision, so it outranks a permissive chat
+        // mode — the same direction every other agent override runs.
+        var d = defaults()
+        d.permissionMode = .bypass
+        let a = agent { $0.autoApproveTools = false }
+        XCTAssertEqual(AgentResolution.resolve(agent: a, defaults: d).permissionMode, .ask)
+    }
 }

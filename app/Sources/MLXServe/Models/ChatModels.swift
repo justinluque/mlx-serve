@@ -50,6 +50,15 @@ struct ChatSession: Identifiable, Codable {
     var agentId: UUID?
     /// Tools this chat has switched OFF in the Tools menu, by wire name.
     var disabledTools: [String]
+    /// This chat's permission mode, by raw name; nil = follow the app-wide
+    /// default in Settings (`ServerOptions.defaultPermissionMode`).
+    ///
+    /// Stored as a RAW STRING, and nil-means-follow rather than a concrete
+    /// value copied at creation: a mode this build retired then leaves an
+    /// unknown name instead of failing the whole session's decode (the
+    /// `disabledTools` rule), and changing the Settings default still reaches
+    /// every conversation that never picked its own.
+    var permissionMode: String?
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -67,6 +76,7 @@ struct ChatSession: Identifiable, Codable {
         self.useMCP = false
         self.agentId = nil
         self.disabledTools = []
+        self.permissionMode = nil
     }
 
     /// Resolve stored names to tools, silently dropping any this build no longer
@@ -79,6 +89,17 @@ struct ChatSession: Identifiable, Codable {
         case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
         case disabledTools
         case reasoningEffort
+        case permissionMode
+    }
+
+    /// This chat's effective mode: its own pick, else the app-wide default.
+    /// Pure so the resolution is testable without a session on disk.
+    static func effectivePermissionMode(stored: String?,
+                                        appDefault: PermissionMode) -> PermissionMode {
+        guard let stored else { return appDefault }
+        // An unknown name is a mode this build retired — follow the app default
+        // rather than silently inventing one.
+        return PermissionMode(rawValue: stored) ?? appDefault
     }
 
     init(from decoder: Decoder) throws {
@@ -111,6 +132,9 @@ struct ChatSession: Identifiable, Codable {
         // Absent (every session saved before the Tools menu) → nothing disabled,
         // i.e. exactly the behaviour that build had.
         disabledTools = try c.decodeIfPresent([String].self, forKey: .disabledTools) ?? []
+        // Absent (every session saved before permission modes) → nil → follow
+        // the app default, which ships as `.ask`: exactly what that build did.
+        permissionMode = try c.decodeIfPresent(String.self, forKey: .permissionMode)
     }
 
     /// Shared default cwd for all chat sessions — a SETTING since 2026-07-20

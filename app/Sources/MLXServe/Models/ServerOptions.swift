@@ -257,6 +257,34 @@ struct ServerOptions: Codable, Equatable {
     /// server restart.
     var toolsOnlyWhenAsked: Bool = false
 
+    // MARK: Permissions (app-level — NOT a server-launch flag, NOT per-request)
+    /// How far the agent loop may go before it stops and asks, for chats that
+    /// haven't picked their own. A conversation overrides it per-tab
+    /// (`ChatSession.permissionMode`), and an agent that declared tool approval
+    /// outranks both — all three fold together in `AgentResolution`, never at a
+    /// turn site.
+    ///
+    /// `.ask` is the shipped default and reproduces the behaviour the chat has
+    /// always had (a prompt per tool call). App-side only, so like
+    /// `toolsOnlyWhenAsked` it is excluded from `serverLaunchEquals` and
+    /// `toCLIArgs`: changing it never prompts a server restart.
+    var defaultPermissionMode: PermissionMode = .default
+
+    // MARK: System prompt (app-level — NOT a server-launch flag, NOT per-request)
+    /// ON = the system-prompt file is also sent on PLAIN chat turns (Tools and
+    /// MCP both off), which otherwise carry no system message at all.
+    ///
+    /// Default OFF, and that default is load-bearing rather than cautious: a
+    /// synthesized system message on a plain turn was historically read by
+    /// models AS the user's input (the `formatNudge` class — see the note in
+    /// `ChatTurnEngine.streamPlainTurn`), which is why plain chat has none. The
+    /// opt-in exists because the opposite failure is also real: with no tools
+    /// and no prompt, a model answering an API question has nothing to do but
+    /// pattern-complete, which is where confidently invented APIs come from.
+    /// An agent persona still REPLACES this, exactly as it replaces the agent
+    /// loop's prompt — one identity claim per turn.
+    var applyBasePromptToPlainChat: Bool = false
+
     // MARK: Voice clone (app-level — NOT a server-launch flag, NOT per-request)
     /// Absolute path to the normalized voice-clone reference clip (24 kHz mono
     /// WAV) that hands-free voice mode speaks with, via Qwen3-TTS zero-shot
@@ -838,6 +866,15 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(TelegramConfig.self, forKey: .telegram) { telegram = v }
         if let v = try c.decodeIfPresent(SandboxConfig.self, forKey: .sandbox) { sandbox = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .toolsOnlyWhenAsked) { toolsOnlyWhenAsked = v }
+        // Tolerant by construction: a settings file written by a build that had
+        // a mode this one retired decodes as absent and falls back to `.ask`
+        // rather than failing the whole ServerOptions decode.
+        if let v = try? c.decodeIfPresent(PermissionMode.self, forKey: .defaultPermissionMode) {
+            defaultPermissionMode = v
+        }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .applyBasePromptToPlainChat) {
+            applyBasePromptToPlainChat = v
+        }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }

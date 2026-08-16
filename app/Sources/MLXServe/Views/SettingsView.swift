@@ -115,6 +115,13 @@ struct SettingsView: View {
                     }
 
                     SettingsSection(
+                        category: .systemPrompt,
+                        subtitle: "The instructions the agent gets before your message. Read live from the file below — edits apply to the next message, no restart needed."
+                    ) {
+                        SystemPromptSectionContent()
+                    }
+
+                    SettingsSection(
                         category: .voice,
                         subtitle: "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed."
                     ) {
@@ -2161,6 +2168,134 @@ private struct VoiceCloneSectionContent: View {
     }
 }
 
+// MARK: - System prompt section
+
+/// The agent's instructions, editable in place.
+///
+/// Before this pane the prompt was a real, user-owned file the app would only
+/// open in TextEdit — discoverable if you already knew it existed. Three things
+/// changed: it can be edited here, it can live anywhere the user wants, and it
+/// can optionally extend to plain (tool-less) chat turns.
+///
+/// The editor holds a DRAFT and saves explicitly. Live-binding a TextEditor to
+/// the file would write on every keystroke — into the file every in-flight turn
+/// reads, mid-generation.
+private struct SystemPromptSectionContent: View {
+    @EnvironmentObject var appState: AppState
+
+    /// Mirrors the stored path so the rows re-render when it changes; writes go
+    /// through `AgentPrompt.promptPathDefaultsKey`.
+    @AppStorage(AgentPrompt.promptPathDefaultsKey) private var storedPath = ""
+
+    @State private var draft: String = ""
+    @State private var saveFailed = false
+
+    private var isDirty: Bool { draft != AgentPrompt.promptFileContents() }
+
+    var body: some View {
+        SettingsRow(
+            title: "Prompt file",
+            explainer: "Where the agent's instructions are read from. Leave it at the built-in location or point at your own file — a prompt you keep in a dotfiles repo, or share between machines. Read fresh on every message, so external edits apply immediately."
+        ) {
+            HStack(spacing: 8) {
+                Text((AgentPrompt.resolvedPromptPath as NSString).abbreviatingWithTildeInPath)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .foregroundStyle(AgentPrompt.customPromptIsMissing ? .red : .secondary)
+                Button("Choose…") { chooseFile() }
+                if !storedPath.isEmpty {
+                    Button("Use Built-in") {
+                        storedPath = ""
+                        reload()
+                    }
+                }
+            }
+        }
+
+        if AgentPrompt.customPromptIsMissing {
+            // Named, not silent: the agent is running the built-in default
+            // while the user believes their file is live.
+            SearchableRow(searchText: ["prompt file missing"]) {
+                Label("That file doesn't exist. The agent is using the built-in default until it does.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+
+        SearchableRow(searchText: ["system prompt", "edit prompt", "instructions"]) {
+            VStack(alignment: .leading, spacing: 6) {
+                TextEditor(text: $draft)
+                    .font(.system(size: 12, design: .monospaced))
+                    .frame(minHeight: 220)
+                    .overlay(RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.secondary.opacity(0.25), lineWidth: 1))
+                HStack(spacing: 8) {
+                    Button("Save") {
+                        saveFailed = !AgentPrompt.savePromptFile(draft)
+                    }
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(!isDirty)
+
+                    Button("Revert") { reload() }
+                        .disabled(!isDirty)
+
+                    Button("Restore Default") {
+                        // Backs the current prompt up beside itself first, so
+                        // this is recoverable rather than destructive.
+                        AgentPrompt.updateSystemPromptToDefault()
+                        reload()
+                    }
+
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: AgentPrompt.resolvedPromptPath)])
+                    }
+
+                    Spacer()
+                    if saveFailed {
+                        Text("Couldn't write that file — check permissions.")
+                            .font(.caption).foregroundStyle(.red)
+                    } else if isDirty {
+                        Text("Unsaved changes").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            // Load the draft when the pane first appears, and re-load whenever
+            // the active file changes underneath it (choosing a custom file, or
+            // going back to the built-in one).
+            .onAppear { reload() }
+            .onChange(of: storedPath) { _, _ in reload() }
+        }
+
+        SettingsRow(
+            title: "Also use it in plain chat",
+            explainer: "OFF (default) = a chat with Tools and MCP both off sends no system prompt at all, which is how the app has always behaved. ON = the prompt above is sent on those turns too. Worth knowing before you flip it: some models read a system message as if the user wrote it, which is exactly why plain chat has none — but with no prompt and no tools a model has nothing to check its answers against either. An agent's own prompt always replaces this."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.applyBasePromptToPlainChat)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+    }
+
+    private func chooseFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose the file to read the agent's system prompt from."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        storedPath = url.path
+        reload()
+    }
+
+    private func reload() {
+        draft = AgentPrompt.promptFileContents()
+        saveFailed = false
+    }
+}
+
 // MARK: - Agent sandbox section
 
 /// Toggle + base-image field for the agent execution sandbox. This is an
@@ -2188,6 +2323,20 @@ private struct SandboxSectionContent: View {
             Toggle("", isOn: $appState.serverOptions.toolsOnlyWhenAsked)
                 .labelsHidden()
                 .toggleStyle(.switch)
+        }
+
+        SettingsRow(
+            title: "Default permission mode",
+            explainer: "How far the agent may go before it stops and asks, in chats that haven't picked their own. Ask (the default) confirms every tool call. Accept Edits runs file edits inside the working folder but still asks before commands. Auto runs edits and commands on its own and only asks when work would leave the folder. Plan refuses every change and answers with a plan instead. Bypass never asks. Each chat can override this from the mode pill in its composer, and an agent that sets tool approval for itself overrides both. File tools stay confined to the working folder in every mode."
+        ) {
+            Picker("", selection: $appState.serverOptions.defaultPermissionMode) {
+                ForEach(PermissionMode.allCases) { mode in
+                    Label(mode.title, systemImage: mode.icon).tag(mode)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 170)
         }
 
         SettingsRow(

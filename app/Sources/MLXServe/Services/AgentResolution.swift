@@ -16,6 +16,11 @@ struct AppDefaultsSnapshot: Sendable, Equatable {
     var mcpEnabled: Bool = false
     var thinkingEnabled: Bool = false
     var autoApprove: Bool = false
+    /// The surface's permission mode — the app-wide default from Settings, with
+    /// this chat's own override already applied by the caller. `.ask` is the
+    /// shipped default and reproduces the pre-modes behaviour, so a surface
+    /// that never sets it is unchanged.
+    var permissionMode: PermissionMode = .default
     /// Full access is the historical default: the whole tool literal is
     /// advertised whenever the loop runs.
     var tools: Set<AgentToolKind> = Set(AgentToolKind.allCases)
@@ -52,6 +57,10 @@ struct ResolvedAgentSettings: Sendable, Equatable {
     var mcpEnabled: Bool = false
     var thinkingEnabled: Bool = false
     var autoApprove: Bool = false
+    /// How far this turn may go before it stops and asks. An agent's legacy
+    /// `autoApproveTools` tri-state folds onto this here rather than at a turn
+    /// site — the same "one chokepoint" rule the rest of this file enforces.
+    var permissionMode: PermissionMode = .default
     var workingDirectory: String?
     var modelPath: String?
     var temperature: Double = 0.8
@@ -121,6 +130,7 @@ enum AgentResolution {
                 mcpEnabled: defaults.mcpEnabled,
                 thinkingEnabled: defaults.thinkingEnabled,
                 autoApprove: defaults.autoApprove,
+                permissionMode: defaults.permissionMode,
                 workingDirectory: defaults.workingDirectory,
                 modelPath: defaults.modelPath,
                 temperature: defaults.temperature,
@@ -153,6 +163,13 @@ enum AgentResolution {
             mcpEnabled: agent.capabilities.mcp,
             thinkingEnabled: agent.enableThinking ?? defaults.thinkingEnabled,
             autoApprove: agent.autoApproveTools ?? defaults.autoApprove,
+            // An agent that declared tool approval outranks the surface's mode:
+            // `true` meant "never ask" before modes existed, so it lands on
+            // `.bypass` and keeps behaving that way (see
+            // `PermissionMode.forAgentAutoApprove`). An agent that declared
+            // nothing inherits whatever the chat is set to.
+            permissionMode: PermissionMode.forAgentAutoApprove(
+                agent.autoApproveTools, default: defaults.permissionMode),
             workingDirectory: agent.workingDirectory ?? defaults.workingDirectory,
             modelPath: agent.modelPath ?? defaults.modelPath,
             temperature: agent.temperature ?? defaults.temperature,

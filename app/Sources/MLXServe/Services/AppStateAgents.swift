@@ -36,12 +36,17 @@ extension AppState {
                                workingDirectory: String? = nil,
                                modelPath: String? = nil,
                                disabledTools: Set<AgentToolKind> = [],
-                               reasoningEffort: ReasoningEffort = .low) -> ResolvedAgentSettings {
+                               reasoningEffort: ReasoningEffort = .low,
+                               permissionMode: PermissionMode? = nil) -> ResolvedAgentSettings {
         let defaults = AppDefaultsSnapshot(
             toolsEnabled: toolsEnabled,
             mcpEnabled: mcpEnabled,
             thinkingEnabled: thinkingEnabled,
             autoApprove: autoApprove,
+            // A surface with a per-conversation picker passes its resolved mode;
+            // everything else (tasks, Telegram, the tray) passes nothing and
+            // gets the app-wide default, which ships as `.ask`.
+            permissionMode: permissionMode ?? serverOptions.defaultPermissionMode,
             tools: Set(AgentToolKind.allCases),
             // The chat tab's own Tools menu. Surfaces without one (tasks,
             // Telegram, the tray) pass nothing and are unaffected.

@@ -120,6 +120,15 @@ enum SettingsReset {
                 f("perRequestEnableDrafter") { $0.perRequestEnableDrafter = $1.perRequestEnableDrafter },
             ]
 
+        case .systemPrompt:
+            return [
+                // The prompt FILE is not reset here: it is the user's own
+                // writing, it may live outside our folder entirely, and
+                // "Restore Default" in that pane is the control that rewrites
+                // it (backing the old one up first). Only the toggle resets.
+                f("applyBasePromptToPlainChat") { $0.applyBasePromptToPlainChat = $1.applyBasePromptToPlainChat },
+            ]
+
         case .voice:
             return [
                 f("voiceClonePath") { $0.voiceClonePath = $1.voiceClonePath },
@@ -136,6 +145,10 @@ enum SettingsReset {
                 // Agent behavior rather than sandboxing, but this is the pane
                 // that holds it — and every field needs exactly one owner.
                 f("toolsOnlyWhenAsked") { $0.toolsOnlyWhenAsked = $1.toolsOnlyWhenAsked },
+                // Same story: agent behaviour, owned by the pane that renders
+                // it. Resetting it returns the app default to `.ask`, which is
+                // the safe direction — a reset must never LOOSEN permissions.
+                f("defaultPermissionMode") { $0.defaultPermissionMode = $1.defaultPermissionMode },
             ]
 
         case .messaging:

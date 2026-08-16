@@ -23,6 +23,10 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     case ggufPerformance
     case ds4
     case requestDefaults
+    /// The agent's instructions — the one setting whose text the user is most
+    /// likely to want to REWRITE rather than toggle, so it gets a pane with a
+    /// real editor rather than a menu item that opens TextEdit.
+    case systemPrompt
     case voice
     case sandbox
     case messaging
@@ -46,6 +50,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .ggufPerformance:   return "GGUF Performance (llama.cpp)"
         case .ds4:               return "DeepSeek-V4 (ds4 engine)"
         case .requestDefaults:   return "Per-Request Defaults"
+        case .systemPrompt:      return "System Prompt"
         case .voice:             return "Voice"
         case .sandbox:           return "Agent Sandbox"
         case .messaging:         return "Messaging — Telegram bot"
@@ -77,6 +82,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .ggufPerformance:   return "shippingbox"
         case .ds4:               return "cube"
         case .requestDefaults:   return "slider.horizontal.3"
+        case .systemPrompt:      return "text.quote"
         case .voice:             return "waveform"
         case .sandbox:           return "shield.lefthalf.filled"
         case .messaging:         return "paperplane"

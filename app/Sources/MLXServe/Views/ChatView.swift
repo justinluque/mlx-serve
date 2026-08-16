@@ -1065,6 +1065,41 @@ struct ChatDetailView: View {
             agentLock: agentModeLock)
     }
 
+    /// This tab's permission mode: its own pick, else the app-wide default.
+    ///
+    /// Read at SEND time (like every other composer control) so changing it
+    /// mid-generation applies to the next turn rather than half of this one.
+    private var sessionPermissionMode: PermissionMode {
+        ChatSession.effectivePermissionMode(stored: session?.permissionMode,
+                                            appDefault: appState.serverOptions.defaultPermissionMode)
+    }
+
+    /// Record this tab's own pick. Per-session for the same reason the Tools
+    /// switches are: the detail view is REUSED across tabs, so an app-wide
+    /// value here would leak one conversation's leash into every other.
+    private func setSessionPermissionMode(_ mode: PermissionMode) {
+        guard let id = sessionId,
+              let idx = appState.chatSessions.firstIndex(where: { $0.id == id }) else { return }
+        appState.chatSessions[idx].permissionMode = mode.rawValue
+        appState.saveChatHistory()
+        // Tightening back to Ask has to re-arm the in-session "Allow all this
+        // session" grant, or that old blanket approval keeps waving calls
+        // through underneath the stricter mode the user just picked — the same
+        // reason toggling Agent off re-arms it.
+        if mode == .ask { toolAllowList.rearm(id) }
+    }
+
+    /// The agent's name when it decided tool approval for itself, else nil.
+    ///
+    /// Built from the agent's OWN field rather than from the resolved mode: an
+    /// agent that declared nothing resolves to whatever the chat picked, and
+    /// reading the resolution back would label that as the agent's decision —
+    /// the same drift the Think/Tools/MCP lock is built to avoid.
+    private var permissionModeLock: String? {
+        guard let agent = activeAgent, agent.autoApproveTools != nil else { return nil }
+        return agent.name
+    }
+
     /// What this tab's agent decided about Think / Tools / MCP, nil with no agent.
     private var agentModeLock: AgentModeLock? {
         guard let agent = activeAgent else { return nil }
@@ -1877,6 +1912,16 @@ struct ChatDetailView: View {
         agentToggle
         mcpToggle
 
+        // How far those tools may go before the loop stops and asks. Directly
+        // right of the discs that turn them on, and only while one of them is:
+        // a permission mode on a plain-chat turn governs nothing, and this row
+        // is already at its width budget.
+        if isAgentMode || mcpMode {
+            PermissionModePill(mode: sessionPermissionMode,
+                               lockedBy: permissionModeLock,
+                               onSelect: setSessionPermissionMode)
+        }
+
         // The model answering, right of the discs and left of the gauge. It
         // belongs to the MESSAGE — which model writes the reply — the same
         // reason Think/Tools/MCP moved down here, and it has room for the
@@ -2449,7 +2494,8 @@ struct ChatDetailView: View {
             autoApprove: false,
             workingDirectory: session?.workingDirectory,
             disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []),
-            reasoningEffort: reasoningEffort)
+            reasoningEffort: reasoningEffort,
+            permissionMode: sessionPermissionMode)
         let config = ChatTurnEngine.TurnConfig.from(
             resolved, documentIndex: appState.documentIndexes[sessionId])
         chatEngine.runTurn(sessionId: sessionId, userText: text,
