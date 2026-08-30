@@ -53,6 +53,8 @@ test {
     _ = @import("wav.zig");
     _ = @import("tts.zig");
     _ = @import("flux.zig");
+    _ = @import("ideogram4.zig");
+    _ = @import("ideogram4_prompt.zig");
     _ = @import("krea.zig");
     _ = @import("mage_flow.zig");
     _ = @import("lora.zig");

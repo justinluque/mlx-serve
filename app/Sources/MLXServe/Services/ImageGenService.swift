@@ -216,6 +216,16 @@ final class ImageGenService: ObservableObject {
                 json["strength"] = request.strength
             }
         }
+        // Ideogram 4's magic prompt. Sent ONLY where the backend honours it, and
+        // always explicitly: the server's own default is `auto`, which would
+        // rewrite even when the user deliberately turned it off.
+        if request.model.supportsMagicPrompt {
+            json["magic_prompt"] = request.magicPrompt
+            let rewriter = request.magicPromptModel.trimmingCharacters(in: .whitespaces)
+            if request.magicPrompt && !rewriter.isEmpty {
+                json["magic_prompt_model"] = rewriter
+            }
+        }
         if request.condGain != 1.0 { json["cond_gain"] = request.condGain }
         if !request.condWeightsText.trimmingCharacters(in: .whitespaces).isEmpty,
            let weights = ImageGenRequest.parseCondWeights(request.condWeightsText),

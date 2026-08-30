@@ -122,7 +122,7 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
 // comment above for the taxonomy of naming schemes this covers.
 // ════════════════════════════════════════════════════════════════════════
 
-pub const Arch = enum { flux2, krea2, minimax_h3, generic };
+pub const Arch = enum { flux2, krea2, minimax_h3, ideogram4, generic };
 
 /// Which third of a fused up-projection a canonical target draws from, when
 /// the source tensor packs several linears together (BFL's fused QKV).
@@ -284,11 +284,35 @@ const minimax_h3_table = [_]AliasRow{
     t("final_layer.adaln_proj.linear", "final_layer.adaln_proj.linear"),
 };
 
+/// Ideogram 4. The self rows are what a fine-tune trained against the
+/// reference implementation already spells, and they are ALSO what makes the
+/// flattened (Kohya) scheme resolve — `canonicalize` only ever matches
+/// aliases. The `transformer.`-prefixed rows cover diffusers/PEFT exports,
+/// which wrap the whole DiT in the pipeline component's name.
+///
+/// `attention.qkv` is FUSED in the checkpoint and fused in our loader, so it
+/// stays 1:1: there is no third-splitting here the way BFL's packed QKV needs.
+const ideogram4_table = [_]AliasRow{
+    t("layers.{}.attention.qkv", "layers.{}.attention.qkv"),
+    t("layers.{}.attention.qkv", "transformer.layers.{}.attention.qkv"),
+    t("layers.{}.attention.o", "layers.{}.attention.o"),
+    t("layers.{}.attention.o", "transformer.layers.{}.attention.o"),
+    t("layers.{}.feed_forward.w1", "layers.{}.feed_forward.w1"),
+    t("layers.{}.feed_forward.w1", "transformer.layers.{}.feed_forward.w1"),
+    t("layers.{}.feed_forward.w2", "layers.{}.feed_forward.w2"),
+    t("layers.{}.feed_forward.w2", "transformer.layers.{}.feed_forward.w2"),
+    t("layers.{}.feed_forward.w3", "layers.{}.feed_forward.w3"),
+    t("layers.{}.feed_forward.w3", "transformer.layers.{}.feed_forward.w3"),
+    t("layers.{}.adaln_modulation", "layers.{}.adaln_modulation"),
+    t("layers.{}.adaln_modulation", "transformer.layers.{}.adaln_modulation"),
+};
+
 fn archTable(arch: Arch) []const AliasRow {
     return switch (arch) {
         .flux2 => &flux2_table,
         .krea2 => &krea2_table,
         .minimax_h3 => &minimax_h3_table,
+        .ideogram4 => &ideogram4_table,
         .generic => &.{},
     };
 }

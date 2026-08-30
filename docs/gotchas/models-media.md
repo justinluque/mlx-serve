@@ -2,6 +2,49 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+## Ideogram 4: two transformers, an interleave that skips a section, and a prompt format
+
+**The negative branch is a second checkpoint.** `Ideogram4Pipeline` builds
+`conditional_transformer` and `unconditional_transformer` from two separate
+9.3 GB files and runs both every step. Reading "asymmetric CFG" as "the usual
+CFG, on one model, with an empty prompt" gets you a pipeline that loads, runs,
+and produces images — with a negative branch that is the positive one. The
+completeness marker is `unconditional_transformer/config.json`, so an
+incomplete pull is refused rather than producing a plausible but wrong image.
+
+**The MRoPE interleave leaves `mrope_section[0]` unread.** The reference fills
+all 128 frequency slots from the t axis, then overwrites indices
+`1, 4, … < 3·section[1]` with H and `2, 5, … < 3·section[2]` with W. With
+sections `(24, 20, 20)` that is 20 H slots, 20 W slots, and 88 t slots — the
+first section's 24 never appears in the code. A table partitioned by all three
+sections is a different model, so fixtures compare `rope_cos`/`rope_sin`
+before comparing a velocity.
+
+**Two models, one VAE, two packings.** Ideogram's autoencoder is FLUX.2's KL
+autoencoder, and `flux.Vae` loads it unchanged. What is not shared is the
+patch packing: Ideogram's `_decode` reshapes to
+`(B, gh, gw, 2, 2, ae_ch)`, so the last dimension runs
+`[ph, pw, channel]`, while `flux.unpatchify` assumes `[channel, ph, pw]`.
+Both produce a correctly-shaped image, but one is scrambled in 2x2 blocks.
+
+**The tap flattening is not the same as FLUX's either.** Ideogram permutes
+`(T,B,L,H) -> (B,L,H,T)`, i.e. tap-innermost, while FLUX uses tap-major
+conditioning. The layouts have identical shapes and no runtime error, so the
+distinction is explicit in `te_tap_inner`.
+
+**A plain sentence is out of distribution.** The model saw only structured JSON
+captions in training, so the rewriter is part of the model interface. The
+system prompt and caption verifier are vendored rather than approximated,
+including key-order checks because the model reads serialized JSON. Rewriting
+is non-fatal: if no text model is loaded or its output is not JSON, generation
+continues with the caller's caption.
+
+**2-bit on the DiT bulk does not render.** A `mixed_2_8` pack produced a woven
+grid texture at every prompt, seed, resolution and step count, while the same
+converter's `mixed_3_8` pack rendered correctly. Three bits is therefore the
+bulk floor (`MIN_BULK_BITS` in `tests/convert_ideogram4.py`), and
+`--bulk-bits 2` is refused rather than documented as a quality tier.
+
 ### The `--no-vision` prefix filter ate MageFlow Edit's vision tower (2026-09-08)
 
 Defect: every Mage-Flow Edit load failed with `MissingMageFlowWeight` (`model.visual.patch_embed.proj.weight`) while the pack on disk carried all 1426 tensors. Cause: `model.shouldKeepWeightKey` gained `model.visual.` in its `--no-vision` drop list on 2026-08-20 for the Alis Qwen3.8 packs, and `mage_flow.VisionTower.load` read its `text_encoder/model.safetensors` through `loadWeights` (load_vision = false), so the loader dropped the 524 tower tensors before the backend saw them. The Turbo pack was unaffected (no tower). Fix: `VisionTower.openWeights` reads through `loadWeightsWithVision`. Guard: `VisionTower.openWeights keeps the model.visual tower keys` (writes a two-tensor safetensors, red on the old loader).

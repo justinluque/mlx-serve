@@ -18,6 +18,7 @@ const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
+const ideogram4 = @import("ideogram4.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -91,15 +92,16 @@ pub const Modality = enum {
 /// "unsupported model_type" while the engine that serves it was ready and
 /// waiting. The test at the bottom of this file pins them together.
 pub const media_model_types = [_][]const u8{
-    "flux2",     "krea",       "mage_flow",      "mageflow",
-    "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3",
+    "flux2",      "krea",      "mage_flow",  "mageflow",
+    "ideogram4",  "qwen3_tts", "acestep",    "kokoro",
+    "AudioVideo", "hunyuan3d", "minimax_h3", "minimax_music3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
+    if (std.mem.startsWith(u8, model_type, "ideogram4")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -168,6 +170,10 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
     // the "mage_flow" marker so routing + the backend dispatch light up.
     if (isMageFlowRepo(io, allocator, model_dir)) return allocator.dupe(u8, "mage_flow") catch null;
+    // Ideogram 4 publishes in the same shape: a diffusers `model_index.json`
+    // naming `Ideogram4Pipeline` and no root `model_type`. Our own converted
+    // packs DO write one, so this arm only serves an unconverted upstream repo.
+    if (isIdeogram4Repo(io, allocator, model_dir)) return allocator.dupe(u8, "ideogram4") catch null;
     // Same for an mflux FLUX.2 conversion with no config.json at all (the only
     // MLX build of klein 9B). Identified by the DiT's own weight names, through
     // the SAME predicate discovery uses — a private copy here is how `list` and
@@ -220,6 +226,23 @@ fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
     if (parsed.value.object.get("_mage_flow_version") != null) return true;
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+}
+
+/// True when `model_dir/model_index.json` marks an Ideogram 4 pipeline.
+fn isIdeogram4Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const cn = parsed.value.object.get("_class_name") orelse return false;
+    return cn == .string and std.mem.eql(u8, cn.string, "Ideogram4Pipeline");
 }
 
 /// Classify a model dir into a media modality (reads its `model_type`), or null
@@ -285,6 +308,173 @@ const FLUX_SEQ_LEN: usize = 512; // mflux Qwen3 tokenizer max_length
 
 /// FLUX.2 image backend internals (the original `ImageEngine` body verbatim).
 /// Holds the three sub-models + tokenizer; owned by the `ImageBackend` union.
+/// Ideogram 4: two 9.3B transformers (asymmetric CFG), a 13-tap Qwen3-VL-8B
+/// encoder, and the Flux2 KL autoencoder. Residency is the defining constraint
+/// — the unconditional branch is its OWN checkpoint, not the conditional
+/// weights run with an empty prompt — so the text encoder follows FluxImpl's
+/// low-mem policy: it runs exactly one forward per image and is the only part
+/// that can be reloaded cheaply from page cache.
+const Ideogram4Impl = struct {
+    s: mlx.mlx_stream,
+    te: ?flux.TextEncoder,
+    cond: ideogram4.Transformer,
+    uncond: ideogram4.Transformer,
+    vae: flux.Vae,
+    /// The Flux2 autoencoder ships BOTH halves and Ideogram publishes both, so
+    /// img2img is available — but a pack converted without the encoder half
+    /// still loads and still generates, hence the optional.
+    vae_enc: ?flux.VaeEncoder,
+    tok: tok_mod.Tokenizer,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []u8,
+    low_mem: bool,
+    /// Chat-template framing around the prompt, written into the pack's
+    /// config.json by the converter from the checkpoint's OWN
+    /// `tokenizer/chat_template.jinja`. Owned. Empty = use the defaults below,
+    /// which are Qwen3-VL-Instruct's rendering of a single text turn.
+    chat_prefix: []u8,
+    chat_suffix: []u8,
+
+    const default_chat_prefix = "<|im_start|>user\n";
+    const default_chat_suffix = "<|im_end|>\n<|im_start|>assistant\n";
+
+    fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Ideogram4Impl {
+        const self = try allocator.create(Ideogram4Impl);
+        errdefer allocator.destroy(self);
+        self.io = io;
+        self.allocator = allocator;
+        self.low_mem = FluxImpl.lowMemDefault();
+        self.model_dir = try allocator.dupe(u8, model_dir);
+        errdefer allocator.free(self.model_dir);
+        self.s = mlx.mlx_default_gpu_stream_new();
+
+        self.chat_prefix = &.{};
+        self.chat_suffix = &.{};
+        errdefer allocator.free(self.chat_prefix);
+        errdefer allocator.free(self.chat_suffix);
+        readChatFraming(io, allocator, model_dir, &self.chat_prefix, &self.chat_suffix);
+
+        if (self.low_mem) {
+            self.te = null;
+            log.info("[image] Ideogram 4 low-mem mode: text encoder loads per request\n", .{});
+        } else {
+            self.te = try loadTe(io, allocator, self.s, model_dir);
+        }
+        errdefer if (self.te) |*t| t.deinit();
+        self.cond = try ideogram4.loadTransformer(io, allocator, self.s, model_dir, "transformer");
+        errdefer self.cond.deinit();
+        self.uncond = try ideogram4.loadTransformer(io, allocator, self.s, model_dir, "unconditional_transformer");
+        errdefer self.uncond.deinit();
+        self.vae = try flux.loadVae(io, allocator, self.s, model_dir);
+        errdefer self.vae.deinit();
+        self.vae_enc = flux.loadVaeEncoder(io, allocator, self.s, model_dir) catch |e| blk: {
+            log.warn("[image] Ideogram 4 VAE encoder load failed ({}) — image-to-image disabled\n", .{e});
+            break :blk null;
+        };
+        errdefer if (self.vae_enc) |*e| e.deinit();
+        const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{model_dir});
+        defer allocator.free(tok_dir);
+        self.tok = try tok_mod.loadTokenizerAny(io, allocator, tok_dir);
+        log.info("[image] Ideogram 4 ready (cond + uncond transformers, Flux2 VAE)\n", .{});
+        return self;
+    }
+
+    fn loadTe(io: std.Io, allocator: std.mem.Allocator, s: mlx.mlx_stream, model_dir: []const u8) !flux.TextEncoder {
+        return flux.loadTextEncoderWith(io, allocator, s, model_dir, .{
+            .taps = &ideogram4.qwen3_vl_taps,
+            .tap_inner = true,
+            .rope_theta = 5_000_000.0,
+            .tag = "ideogram4",
+        });
+    }
+
+    /// Pull `chat_prefix`/`chat_suffix` out of the pack's config.json. Absent
+    /// is normal (an unconverted upstream repo); the defaults then apply.
+    fn readChatFraming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, prefix: *[]u8, suffix: *[]u8) void {
+        const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return;
+        defer allocator.free(path);
+        const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return;
+        defer file.close(io);
+        var rb: [4096]u8 = undefined;
+        var rs = file.reader(io, &rb);
+        const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return;
+        defer allocator.free(content);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        if (parsed.value.object.get("chat_prefix")) |v| {
+            if (v == .string) prefix.* = allocator.dupe(u8, v.string) catch return;
+        }
+        if (parsed.value.object.get("chat_suffix")) |v| {
+            if (v == .string) suffix.* = allocator.dupe(u8, v.string) catch return;
+        }
+    }
+
+    fn deinit(self: *Ideogram4Impl) void {
+        if (self.te) |*t| t.deinit();
+        self.cond.deinit();
+        self.uncond.deinit();
+        self.vae.deinit();
+        if (self.vae_enc) |*e| e.deinit();
+        self.tok.deinit();
+        self.allocator.free(self.model_dir);
+        self.allocator.free(self.chat_prefix);
+        self.allocator.free(self.chat_suffix);
+        self.allocator.destroy(self);
+    }
+
+    /// Tokenize the caption and run the pipeline → image [1,3,H,W] f32 [0,1].
+    ///
+    /// No padding and no left-align: the reference pads only to batch a
+    /// multi-prompt call, and we serve one prompt, so every token is real and
+    /// the attention mask is all ones. That is also what lets the DiT skip the
+    /// block-diagonal segment mask entirely.
+    fn generateImage(self: *Ideogram4Impl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, gen_opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
+        const prefix = if (self.chat_prefix.len != 0) self.chat_prefix else default_chat_prefix;
+        const suffix = if (self.chat_suffix.len != 0) self.chat_suffix else default_chat_suffix;
+        const templated = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, prompt, suffix });
+        defer allocator.free(templated);
+
+        const enc = try self.tok.encode(allocator, templated);
+        defer allocator.free(enc);
+        if (enc.len > ideogram4.max_text_tokens) return error.PromptTooLong;
+
+        const ids = try allocator.alloc(i32, enc.len);
+        defer allocator.free(ids);
+        const mask = try allocator.alloc(i32, enc.len);
+        defer allocator.free(mask);
+        for (enc, 0..) |t, i| {
+            ids[i] = @intCast(t);
+            mask[i] = 1;
+        }
+
+        var opts = ideogram4.GenOpts{ .steps = steps };
+        // img2img: VAE-encode the (already target-sized) source to its latent
+        // MEAN. `ideogram4.generateFromCond` owns the patchify and the
+        // normalization — both differ from FLUX's on the same autoencoder.
+        var init_latent: ?mlx.mlx_array = null;
+        defer if (init_latent) |l| {
+            _ = mlx.mlx_array_free(l);
+        };
+        if (gen_opts.init_image) |src| {
+            const enc_ptr = if (self.vae_enc) |*e| e else return error.Img2ImgUnsupported;
+            if (progress) |p| p.emit("Encoding source image", 0, @max(steps, 1));
+            init_latent = try enc_ptr.encodeLatent(src);
+            opts.init_latent = init_latent;
+            opts.strength = gen_opts.strength;
+        }
+        if (progress) |p| p.emit("Encoding prompt", 0, @max(steps, 1));
+        const cond_enc = blk: {
+            if (self.te) |*t| break :blk try ideogram4.encodePrompt(t, ids, mask);
+            var t = try loadTe(self.io, self.allocator, self.s, self.model_dir);
+            defer t.deinit();
+            break :blk try ideogram4.encodePrompt(&t, ids, mask);
+        };
+        return ideogram4.generateFromCond(&self.cond, &self.uncond, &self.vae, cond_enc, ids.len, seed, height, width, opts, progress);
+    }
+};
+
 const FluxImpl = struct {
     s: mlx.mlx_stream,
     /// Text encoder — nullable because LOW-MEM mode (iPhone) loads it lazily
@@ -443,6 +633,7 @@ const ImageBackend = union(enum) {
     flux: FluxImpl,
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
+    ideogram4: *Ideogram4Impl,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -467,6 +658,82 @@ pub fn videoRgbTransportReason(delivered_frames: u32, width: u32, height: u32) ?
     return std.fmt.bufPrint(&S.buf, "{d} frames at {d}x{d} is {d} MB of raw RGB; one response carries at most {d} MB — fewer frames or windows, or a smaller canvas", .{ delivered_frames, width, height, bytes / (1024 * 1024), MAX_VIDEO_RGB_BYTES / (1024 * 1024) }) catch "video too large for one response";
 }
 
+/// The prompt and requested canvas of an image body, BORROWED from `body`.
+/// The magic-prompt rewriter needs both before the job is built: the caption's
+/// `aspect_ratio` field is the first thing the system prompt asks for, and it
+/// drives every bbox in the caption that follows.
+pub const GenBodyPrompt = struct { prompt: []const u8, width: u32, height: u32 };
+
+pub fn promptAndSizeFromGenBody(body: []const u8) GenBodyPrompt {
+    var out = GenBodyPrompt{ .prompt = "", .width = 1024, .height = 1024 };
+    if (extractJsonString(body, "prompt")) |p| out.prompt = p;
+    if (extractJsonString(body, "size")) |size| {
+        if (parseSize(size)) |wh| {
+            out.width = wh.w;
+            out.height = wh.h;
+        }
+    }
+    return out;
+}
+
+/// How a request wants its prompt handled before it reaches the model.
+///
+/// `auto` is the default and means "rewrite when the backend needs a
+/// structured caption and this prompt is not one already" — which is exactly
+/// Ideogram 4 and nothing else today. Explicit `true`/`false` override it.
+pub const MagicPromptMode = enum { auto, on, off };
+
+pub const MagicPromptFields = struct {
+    mode: MagicPromptMode = .auto,
+    /// Model id to rewrite WITH. Empty = the server's default text model.
+    /// Borrows from the request body.
+    model: []const u8 = "",
+};
+
+/// Read `magic_prompt` / `magic_prompt_model` off a generation body. A body
+/// that does not parse, or carries neither field, is `auto` with no model —
+/// the caller has already validated the body it will actually run.
+pub fn parseMagicPromptFields(allocator: std.mem.Allocator, body: []const u8, out_model: *[]u8) MagicPromptFields {
+    out_model.* = &.{};
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    var f = MagicPromptFields{};
+    if (parsed.value.object.get("magic_prompt")) |v| switch (v) {
+        .bool => |b| f.mode = if (b) .on else .off,
+        // The string spellings exist because form-encoded clients (and the
+        // OpenAI edits surface) cannot send a JSON bool.
+        .string => |s| {
+            if (std.mem.eql(u8, s, "auto")) f.mode = .auto;
+            if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "on")) f.mode = .on;
+            if (std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "off")) f.mode = .off;
+        },
+        else => {},
+    };
+    if (parsed.value.object.get("magic_prompt_model")) |v| {
+        if (v == .string) {
+            out_model.* = allocator.dupe(u8, v.string) catch &.{};
+            f.model = out_model.*;
+        }
+    }
+    return f;
+}
+
+/// Replace a body's `prompt` with `caption`, preserving every other field.
+/// Returns a fresh body (caller frees), or an error when the body is not a
+/// JSON object — which the caller treats as "do not rewrite" rather than as a
+/// request failure.
+pub fn withRewrittenPrompt(allocator: std.mem.Allocator, body: []const u8, caption: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.NotAnObject;
+    var obj = parsed.value.object;
+    try obj.put(allocator, "prompt", .{ .string = caption });
+    // Echoed back so a client can see what was actually rendered — the whole
+    // point of a rewriter is that the caption is not what the user typed.
+    try obj.put(allocator, "revised_prompt", .{ .string = caption });
+    return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = obj }, .{});
+}
 
 /// Per-request image-generation options shared by both backends.
 pub const ImageGenOpts = struct {
@@ -521,6 +788,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
                 return self;
             }
+            if (std.mem.startsWith(u8, mt, "ideogram4")) {
+                self.backend = .{ .ideogram4 = try Ideogram4Impl.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -532,6 +803,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.deinit(),
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
+            .ideogram4 => |i| i.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -541,6 +813,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.s,
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
+            .ideogram4 => |i| i.s,
         };
     }
 
@@ -550,6 +823,9 @@ pub const ImageEngine = struct {
             .flux => 3,
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
+            // 13 taps, but the rebalance slicing assumes tap-MAJOR features and
+            // Ideogram's are tap-INNER — wiring it needs its own reshape.
+            .ideogram4 => 0,
         };
     }
 
@@ -559,6 +835,10 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
+            // The Flux2 autoencoder ships both halves and Ideogram publishes
+            // both, so this is a real capability — not the decoder-only pack
+            // it was first assumed to be.
+            .ideogram4 => |i| i.vae_enc != null,
         };
     }
 
@@ -569,7 +849,16 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
+            .ideogram4 => false, // text-to-image only; no edit training
         };
+    }
+
+    /// True when the backend was trained on STRUCTURED JSON captions and a
+    /// plain sentence is out of distribution for it, not merely weaker. Only
+    /// Ideogram 4 — the magic-prompt rewriter keys on this, never on a
+    /// model-id string.
+    pub fn wantsStructuredCaption(self: *const ImageEngine) bool {
+        return self.backend == .ideogram4;
     }
 
     /// True when the edit backend consumes RAW reference bytes (`edit_image_bytes`)
@@ -604,6 +893,7 @@ pub const ImageEngine = struct {
                 .flux => .flux2,
                 .krea => .krea2,
                 .mage_flow => .generic,
+                .ideogram4 => .ideogram4,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -614,6 +904,10 @@ pub const ImageEngine = struct {
         const matched = switch (self.backend) {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
+            // The adapter attaches to the CONDITIONAL transformer only: the
+            // unconditional branch never sees the prompt, and every published
+            // fine-tune trains against the conditional weights.
+            .ideogram4 => |i| ideogram4.attachLora(&i.cond, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
         };
         if (matched == 0) {
@@ -629,6 +923,7 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
+            .ideogram4 => |i| ideogram4.detachLora(&i.cond),
             .mage_flow => {}, // no LoRA attached
         }
         if (self.lora_stack) |*st| st.deinit();
@@ -663,6 +958,12 @@ pub const ImageEngine = struct {
                 m.editImage(allocator, prompt, opts.edit_image_bytes, width, height, seed, steps, progress)
             else
                 m.generateImage(allocator, prompt, width, height, seed, steps, progress),
+            .ideogram4 => |i| blk: {
+                // No edit training: in-context reference conditioning is a
+                // capability, not a code path we simply have not written.
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                break :blk i.generateImage(allocator, prompt, width, height, seed, steps, opts, progress);
+            },
         };
     }
 
@@ -682,6 +983,8 @@ pub const ImageEngine = struct {
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
             // MageFlow is native-resolution, VAE downsample 16 → multiples of 16.
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            // Ideogram: 256–2048 per side, multiples of patch·ae_scale = 16.
+            .ideogram4 => .{ .w = ideogram4.clampDim(req_w), .h = ideogram4.clampDim(req_h) },
         };
     }
 
@@ -692,7 +995,7 @@ pub const ImageEngine = struct {
     pub fn maxDimFor(kind: std.meta.Tag(ImageBackend)) u32 {
         return switch (kind) {
             .flux => 1536,
-            .krea, .mage_flow => 2048,
+            .krea, .mage_flow, .ideogram4 => 2048,
         };
     }
 
@@ -5446,4 +5749,86 @@ test "videoRgbTransportReason: chained windows are billed into the response cap 
     try std.testing.expect(videoRgbTransportReason(minimax_h3.chainDeliveredFrames(5, 141), 1056, 864) != null);
     // One window of the same shape fits.
     try std.testing.expect(videoRgbTransportReason(141, 1056, 864) == null);
+}
+
+test "magic_prompt parses as bool, as the string spellings, and defaults to auto" {
+    const a = std.testing.allocator;
+    const Case = struct { body: []const u8, want: MagicPromptMode };
+    for ([_]Case{
+        .{ .body = "{\"prompt\":\"x\"}", .want = .auto },
+        .{ .body = "{\"magic_prompt\":true}", .want = .on },
+        .{ .body = "{\"magic_prompt\":false}", .want = .off },
+        .{ .body = "{\"magic_prompt\":\"auto\"}", .want = .auto },
+        // Form-encoded clients cannot send a JSON bool.
+        .{ .body = "{\"magic_prompt\":\"true\"}", .want = .on },
+        .{ .body = "{\"magic_prompt\":\"off\"}", .want = .off },
+        // Garbage is `auto`, not a request failure: the body the job will
+        // actually run has already been validated elsewhere.
+        .{ .body = "not json", .want = .auto },
+        .{ .body = "{\"magic_prompt\":42}", .want = .auto },
+    }) |c| {
+        var owned: []u8 = &.{};
+        const f = parseMagicPromptFields(a, c.body, &owned);
+        defer if (owned.len != 0) a.free(owned);
+        try std.testing.expectEqual(c.want, f.mode);
+    }
+}
+
+test "magic_prompt_model comes back OWNED, so it outlives the parse" {
+    const a = std.testing.allocator;
+    var owned: []u8 = &.{};
+    const f = parseMagicPromptFields(a, "{\"magic_prompt_model\":\"org/repo\"}", &owned);
+    defer if (owned.len != 0) a.free(owned);
+    try std.testing.expectEqualStrings("org/repo", f.model);
+    try std.testing.expectEqualStrings("org/repo", owned);
+}
+
+test "a rewritten body keeps every other field and echoes the caption back" {
+    const a = std.testing.allocator;
+    const body = "{\"model\":\"ideogram4\",\"prompt\":\"a red barn\",\"size\":\"1024x768\",\"seed\":7}";
+    const caption = "{\"high_level_description\":\"A red barn.\"}";
+    const out = try withRewrittenPrompt(a, body, caption);
+    defer a.free(out);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings(caption, o.get("prompt").?.string);
+    // The caller can see what was actually rendered — the point of a rewriter
+    // is that the caption is not what the user typed.
+    try std.testing.expectEqualStrings(caption, o.get("revised_prompt").?.string);
+    try std.testing.expectEqualStrings("ideogram4", o.get("model").?.string);
+    try std.testing.expectEqualStrings("1024x768", o.get("size").?.string);
+    try std.testing.expectEqual(@as(i64, 7), o.get("seed").?.integer);
+}
+
+test "a non-object body is refused, not silently rewritten" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.NotAnObject, withRewrittenPrompt(a, "[1,2,3]", "x"));
+    try std.testing.expect(std.meta.isError(withRewrittenPrompt(a, "nope", "x")));
+}
+
+test "the rewriter reads the prompt and the canvas the caption must describe" {
+    // The system prompt asks for `aspect_ratio` FIRST and every bbox follows
+    // from it, so the size has to be read before the job is built.
+    const b = promptAndSizeFromGenBody("{\"prompt\":\"a red barn\",\"size\":\"1536x512\"}");
+    try std.testing.expectEqualStrings("a red barn", b.prompt);
+    try std.testing.expectEqual(@as(u32, 1536), b.width);
+    try std.testing.expectEqual(@as(u32, 512), b.height);
+    // No size = the endpoint's documented 1024² default, not zero.
+    const d = promptAndSizeFromGenBody("{\"prompt\":\"x\"}");
+    try std.testing.expectEqual(@as(u32, 1024), d.width);
+    try std.testing.expectEqual(@as(u32, 1024), d.height);
+    try std.testing.expectEqualStrings("", promptAndSizeFromGenBody("{}").prompt);
+}
+
+test "ideogram4 classifies as image media on both sides of the duplicated predicate" {
+    try std.testing.expectEqual(Modality.image, modalityFromType("ideogram4").?);
+    try std.testing.expect(discovery.isMediaModelType("ideogram4"));
+    // The completeness marker is the SECOND transformer: a pack with only the
+    // conditional weights would load and then denoise against a branch that
+    // never loaded.
+    try std.testing.expectEqualStrings(
+        "unconditional_transformer/config.json",
+        discovery.requiredMediaMarker("ideogram4").?,
+    );
 }
