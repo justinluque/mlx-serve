@@ -1907,6 +1907,18 @@ struct ImageGenRequest {
     /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
     /// Empty = none. Rows with an empty `path` are dropped before sending.
     var loras: [LoraAdapter] = []
+    /// Whether to request live per-step ghost-image previews from the server
+    /// (streamed as SSE "preview" events). Always on for interactive generations;
+    /// the agent path can opt out if it doesn't render them.
+    var livePreview: Bool = true
+    /// Live-preview testing knobs (Advanced): independently enable/disable
+    /// each preview mechanism (see the Image pane's "Latent RGB" / "TAESD"
+    /// checkboxes) so they can be compared/debugged in isolation.
+    /// Both default true (normal operation). Sent to the server as
+    /// `preview_latent_rgb` / `preview_taesd` only when off — see
+    /// `ImageGenService.requestJson`.
+    var previewLatentRGB: Bool = true
+    var previewTAESD: Bool = true
 }
 
 extension ImageModelPreset {

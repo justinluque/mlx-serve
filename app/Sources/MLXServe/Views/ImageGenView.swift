@@ -57,6 +57,10 @@ struct ImageGenView: View {
     /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
     /// Several can attach at once — their effects sum, so order doesn't matter.
     @State private var loras: [LoraAdapter] = []
+    /// Live-preview testing knobs (Advanced): see `advancedSection`'s
+    /// "Live preview (testing)" toggles.
+    @State private var previewLatentRGB: Bool = true
+    @State private var previewTAESD: Bool = true
     /// True while `hydrate()` seeds `@State` from saved settings. Hydrating
     /// `model`/`quality` fires their `.onChange` (applyModelDefaults /
     /// applyQualityDefaults) which would clobber the just-restored
@@ -117,6 +121,9 @@ struct ImageGenView: View {
             // Freshen the network-model list so LAN entries are current in
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
+            // Best-effort: provision the live-preview decoder so the first
+            // generation already has it (missing → linear preview, never an error).
+            downloads.ensurePreviewDecoder(for: model.bundle)
         }
         // Persist every other sticky field on change (model/quality persist in
         // their sections after applying preset defaults).
@@ -429,7 +436,13 @@ struct ImageGenView: View {
             downloads: downloads,
             onDownloadFinished: { appState.refreshModels() },
             persist: persist)
-        .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
+        .onChange(of: model) { _, _ in
+            guard !hydrating else { return }
+            applyModelDefaults(); persist()
+            // Each family has its own decoder (taef2 vs taew2_1) — fetch the
+            // one this model needs, not the one the last model needed.
+            downloads.ensurePreviewDecoder(for: model.bundle)
+        }
     }
 
     @ViewBuilder
@@ -763,6 +776,22 @@ struct ImageGenView: View {
                 }
             }
             } // model.supportsLoRA
+
+            Divider()
+            Text("Live preview (testing)").font(.caption.weight(.semibold))
+            Toggle("Latent RGB", isOn: $previewLatentRGB)
+                .font(.caption)
+                .help("The cheap per-step linear latent\u{2192}RGB projection. On by default. Uncheck to test the TAESD decoder in isolation \u{2014} if it fails or isn't downloaded, no preview frame is shown instead of silently falling back to this.")
+                .onChange(of: previewLatentRGB) { _, _ in guard !hydrating else { return }; persist() }
+            Toggle("TAESD", isOn: $previewTAESD)
+                .font(.caption)
+                .help("Prefer the sharper TAESD-family decoder when it's downloaded. On by default. Uncheck to compare against the plain Latent RGB projection.")
+                .onChange(of: previewTAESD) { _, _ in guard !hydrating else { return }; persist() }
+            if !previewLatentRGB && !previewTAESD {
+                Text("Both are off \u{2014} live previews will be disabled for this generation.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         } // image-model-only controls
     }
 
@@ -963,10 +992,35 @@ struct ImageGenView: View {
                     }
                 case .running(.generated, let message):
                     VStack(spacing: 12) {
-                        ProgressView(value: Double(generateStep.step), total: max(1, Double(generateStep.total)))
-                            .progressViewStyle(.linear)
-                            .frame(width: 240)
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                        if let preview = service.previewImage {
+                            Image(nsImage: preview)
+                                .resizable()
+                                .scaledToFit()
+                                .opacity(0.7)
+                                .cornerRadius(6)
+                                .animation(.easeInOut(duration: 0.15), value: service.previewImage)
+                                .overlay(alignment: .bottom) {
+                                    VStack(spacing: 6) {
+                                        ProgressView(value: Double(generateStep.step),
+                                                     total: max(1, Double(generateStep.total)))
+                                            .progressViewStyle(.linear)
+                                            .tint(.white)
+                                        Text(message)
+                                            .font(.footnote)
+                                            .foregroundStyle(.white)
+                                    }
+                                    .padding(8)
+                                    .background(.ultraThinMaterial)
+                                    .cornerRadius(6)
+                                    .padding(8)
+                                }
+                        } else {
+                            ProgressView(value: Double(generateStep.step),
+                                         total: max(1, Double(generateStep.total)))
+                                .progressViewStyle(.linear)
+                                .frame(width: 240)
+                            Text(message).font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
                 case .running(.enlarged, let message):
                     // No step events on this endpoint — one request, minutes of
@@ -1237,6 +1291,8 @@ struct ImageGenView: View {
         loras = s.loras
         customWidthText = String(s.customWidth)
         customHeightText = String(s.customHeight)
+        previewLatentRGB = s.previewLatentRGB
+        previewTAESD = s.previewTAESD
         // A LoRA file may have moved since last session — drop stale entries.
         loras.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
         // The enlarge side keeps its own model and scale; seed and
@@ -1266,6 +1322,8 @@ struct ImageGenView: View {
         s.condGain = condGain
         s.condWeightsText = condWeightsText
         s.loras = loras
+        s.previewLatentRGB = previewLatentRGB
+        s.previewTAESD = previewTAESD
         s.save()
         RestoreGenSettings(modelId: LanPick.persisted(lanModel: restoreLanModel, presetId: restoreModel.id),
                            scale: scale).save()
@@ -1306,7 +1364,9 @@ struct ImageGenView: View {
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             condGain: condGain,
             condWeightsText: condWeightsText,
-            loras: loras
+            loras: loras,
+            previewLatentRGB: previewLatentRGB,
+            previewTAESD: previewTAESD
         )
         persist()  // final capture — the agent's generate_image reuses these
 

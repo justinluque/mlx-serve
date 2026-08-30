@@ -12,6 +12,7 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const sse = @import("gen_sse.zig");
 const lora_mod = @import("lora.zig");
+const latent_preview = @import("latent_preview.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -1282,10 +1283,17 @@ pub const Vae = struct {
         for (0..3) |i| { _ = mlx.mlx_array_free(self.up_conv_w[i]); _ = mlx.mlx_array_free(self.up_conv_b[i]); }
     }
 
-    /// packed_latents [1,128,64,64] (NCHW) -> image [1,3,1024,1024] (NCHW, [-1,1]).
-    pub fn decode(self: *Vae, packed_in: mlx.mlx_array) !mlx.mlx_array {
+    /// bn denorm: packed * sqrt(var+eps) + mean (per-channel over 128).
+    /// Split out of `decode` so the live-preview path (flux.zig's denoise
+    /// loop, see latent_preview.zig) can apply the SAME denormalization to
+    /// the raw sampling latent before projecting it — skipping this step
+    /// feeds the preview's channel→RGB factors (and the taef2 decoder,
+    /// both fit on the denormalized space) values on the wrong numeric
+    /// scale, which is why an earlier version of the preview just looked
+    /// like a flat, unchanging blur regardless of how far denoising had
+    /// actually progressed.
+    pub fn bnDenorm(self: *Vae, packed_in: mlx.mlx_array) !mlx.mlx_array {
         const s = self.s;
-        // bn denorm: packed * sqrt(var+eps) + mean   (per-channel over 128)
         const vsh = [_]c_int{ 1, 128, 1, 1 };
         const bnm = try reshape(self.bn_mean, &vsh, s); defer _ = mlx.mlx_array_free(bnm);
         const bnv = try reshape(self.bn_var, &vsh, s); defer _ = mlx.mlx_array_free(bnv);
@@ -1298,7 +1306,13 @@ pub const Vae = struct {
         const stdf = try astype(std_, .float32, s); defer _ = mlx.mlx_array_free(stdf);
         const bnmf = try astype(bnm, .float32, s); defer _ = mlx.mlx_array_free(bnmf);
         const scaled = try mulA(pf, stdf, s); defer _ = mlx.mlx_array_free(scaled);
-        const denorm = try addA(scaled, bnmf, s); defer _ = mlx.mlx_array_free(denorm);
+        return addA(scaled, bnmf, s);
+    }
+
+    /// packed_latents [1,128,64,64] (NCHW) -> image [1,3,1024,1024] (NCHW, [-1,1]).
+    pub fn decode(self: *Vae, packed_in: mlx.mlx_array) !mlx.mlx_array {
+        const s = self.s;
+        const denorm = try self.bnDenorm(packed_in); defer _ = mlx.mlx_array_free(denorm);
         // unpatchify [1,128,64,64] -> [1,32,128,128]
         const up = try unpatchify(denorm, s); defer _ = mlx.mlx_array_free(up);
         const up_bf = try astype(up, .bfloat16, s); defer _ = mlx.mlx_array_free(up_bf);
@@ -2224,7 +2238,45 @@ pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, 
         const nl = try addA(latents, step, s);
         _ = mlx.mlx_array_free(latents); latents = nl;
         _ = mlx.mlx_array_eval(latents);
-        if (progress) |p| p.emit("Generating", @intCast(t + 1 - start_step), run_steps);
+        if (progress) |p| {
+            const step_no: u32 = @intCast(t + 1 - start_step);
+            if (p.wantsPreview() and latent_preview.shouldPreviewStep(step_no, run_steps)) preview_blk: {
+                // Same unpack the final decode does (reshape tokens back to
+                // NCHW, then the SAME bn denorm `Vae.decode` applies before
+                // unpatchify — skipping it puts the preview on the wrong
+                // numeric scale, see `Vae.bnDenorm`'s doc comment), minus
+                // the VAE convnet itself: 32 real channels projected
+                // straight to RGB (or through the tiny taesd decoder). See
+                // latent_preview.zig.
+                const lr2 = reshape(latents, &[_]c_int{ 1, @intCast(lh), @intCast(lw), 128 }, s) catch |err| {
+                    log.warn("[image] flux preview step {d}/{d} skipped (reshape: {s})\n", .{ step_no, run_steps, @errorName(err) });
+                    break :preview_blk;
+                };
+                defer _ = mlx.mlx_array_free(lr2);
+                const packed2 = transpose(lr2, &[_]c_int{ 0, 3, 1, 2 }, s) catch |err| {
+                    log.warn("[image] flux preview step {d}/{d} skipped (transpose: {s})\n", .{ step_no, run_steps, @errorName(err) });
+                    break :preview_blk;
+                };
+                defer _ = mlx.mlx_array_free(packed2);
+                const denorm2 = vae.bnDenorm(packed2) catch |err| {
+                    log.warn("[image] flux preview step {d}/{d} skipped (bnDenorm: {s})\n", .{ step_no, run_steps, @errorName(err) });
+                    break :preview_blk;
+                };
+                defer _ = mlx.mlx_array_free(denorm2);
+                const unpk = latent_preview.unpatchifyFlux2(denorm2, s) catch |err| {
+                    log.warn("[image] flux preview step {d}/{d} skipped (unpatchifyFlux2: {s})\n", .{ step_no, run_steps, @errorName(err) });
+                    break :preview_blk;
+                };
+                defer _ = mlx.mlx_array_free(unpk);
+                const pv = latent_preview.previewToPng(a, unpk, latent_preview.flux2_32ch, p.taesd_decoder, p.allow_linear_fallback, s) catch |err| {
+                    log.warn("[image] flux preview step {d}/{d} skipped (previewToPng: {s}, taesd_decoder={}, allow_linear_fallback={})\n", .{ step_no, run_steps, @errorName(err), p.taesd_decoder != null, p.allow_linear_fallback });
+                    break :preview_blk;
+                };
+                defer a.free(pv.bytes);
+                p.preview(@intCast(step_no), run_steps, pv.bytes, pv.width, pv.height);
+            }
+            p.emit("Generating", @intCast(step_no), run_steps);
+        }
     }
     if (progress) |p| p.emit("Decoding image", steps, steps);
 

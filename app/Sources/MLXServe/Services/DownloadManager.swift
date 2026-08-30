@@ -991,6 +991,151 @@ class DownloadManager: ObservableObject {
         try? FileManager.default.removeItem(atPath: base + ".partial.parts")
     }
 
+    // MARK: - Companion preview decoder (TAESD)
+    //
+    // FLUX.2-klein and Krea can show a live per-step "ghost image" preview
+    // during generation using a real (not linear-approximated) tiny
+    // distilled decoder — madebyollin's TAEF2/TAEF1 (MIT, ~10 MB each; see
+    // src/taesd.zig). Same shape as the Gemma drafter above: never its own
+    // Model Browser destination, never gates the primary bundle's
+    // readiness (a missing decoder just means the server falls back to the
+    // cheaper linear-projection preview — src/latent_preview.zig), and
+    // auto-pulled once the primary image model finishes downloading.
+
+    /// The preview-decoder repo that pairs with an image bundle, or nil.
+    /// Matched on the bundle's primary repo name, same as `companionDrafterRepo`.
+    /// Krea isn't handled here: its decoder (taew2_1) isn't a normal HF
+    /// repo at all — see `ensureTaew21` below.
+    nonisolated static func companionPreviewDecoderRepo(for bundle: MediaBundle) -> String? {
+        let base = bundle.primaryRepo.lowercased()
+        // Real repo ids aren't consistent about the dot ("FLUX.2-klein-4B-..."
+        // vs "flux2-klein-9b-..."), so match on the two words rather than an
+        // exact substring.
+        if base.contains("flux") && base.contains("klein") { return "madebyollin/taef2" }
+        return nil
+    }
+
+    /// The marker file inside a preview-decoder repo that proves it's fully
+    /// downloaded. taef2's HF card says its architecture "isn't properly
+    /// integrated into Diffusers yet", so its repo is just two files,
+    /// `README.md` and a bare `taef2.safetensors` — no `config.json` at
+    /// all. That's why this can't go through the generic `isReady()` (it
+    /// hard-requires `config.json`, same as any chat model) — same
+    /// reasoning as the single-file pack fetches above, and the same fix as
+    /// `src/gen.zig`'s `resolveTaesdDir`, which had the identical bug
+    /// server-side.
+    private func previewDecoderMarkerFile(for repoId: String) -> String { "taef2.safetensors" }
+
+    /// Whether `repoId` (a preview-decoder repo) is fully downloaded. See
+    /// `previewDecoderMarkerFile`'s doc for why this can't reuse `isReady()`
+    /// — and can't route through `existingModelDir`/`holdsModel` either:
+    /// those gate on `config.json`/`model_index.json`/a GGUF/a `transformer/`
+    /// subdir being present to recognize a directory as "holding a model"
+    /// at all, which a bare `taef2.safetensors`-only repo never satisfies.
+    /// Builds the path directly instead (mirrors `newLayoutDir` and
+    /// `src/gen.zig`'s `resolveTaesdDir` on the server side).
+    func previewDecoderReady(_ repoId: String) -> Bool {
+        let dir = Self.newLayoutDir(rootDir: modelsDir, repoId: repoId)
+        return FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent(previewDecoderMarkerFile(for: repoId)))
+    }
+
+    /// Fetch the paired preview decoder after an image bundle completes,
+    /// unless it's already here. Failures stay silent (the Downloads pane
+    /// still shows the failed row) — same reasoning as the drafter: an
+    /// alert naming a repo the user never asked for reads as a bug in the
+    /// download they DID ask for, and generation still works without it.
+    /// Krea routes to `ensureTaew21()` — see its doc.
+    private func downloadCompanionPreviewDecoderIfNeeded(for bundle: MediaBundle) async {
+        guard !Task.isCancelled, bundleReady(bundle) else { return }
+        if bundle.primaryRepo.lowercased().contains("krea") {
+            ensureTaew21()
+            return
+        }
+        guard let decoder = Self.companionPreviewDecoderRepo(for: bundle),
+              !previewDecoderReady(decoder) else { return }
+        await download(repoId: decoder, alertOnFailure: false)
+    }
+
+    // MARK: - Krea's preview decoder (TAEW2.1)
+    //
+    // Krea 2's own VAE is the Qwen-Image 3D causal VAE (see src/krea.zig's
+    // module doc) — NOT FLUX.1's — so taef1 (trained to reproduce FLUX.1's
+    // VAE specifically) was architecturally the wrong decoder for it,
+    // independent of whether it loaded correctly (it did; it just produced
+    // garbage). The right one, per madebyollin/taehv's own README: "taew2_1
+    // .pth serves three models: Wan 2.1, Wan 2.2 14B, and Qwen Image."
+    //
+    // Unlike taef1/taef2, this isn't a normal downloadable HF repo — the
+    // taehv GitHub repo bundles ~7 unrelated tiny-decoder checkpoints
+    // (Hunyuan, CogVideoX, LTX, etc., ~150MB combined) as one repo, and
+    // isn't mirrored to HF as a clean single-file listing. Pulling the one
+    // ~11MB file we actually need straight from GitHub's raw endpoint is
+    // both simpler and far smaller than reusing `download(repoId:)`'s
+    // HF-tree-listing machinery for it. Lands at the same conventional
+    // `~/.mlx-serve/models/<repo>/<file>` path gen.zig's own
+    // `resolveTaesdDir` expects (`TAEW21_REPO_DIR = "madebyollin/taehv"`).
+
+    private static let taew21RepoId = "madebyollin/taehv"
+    private static let taew21Filename = "taew2_1.safetensors"
+    private static let taew21RawURL = URL(string: "https://raw.githubusercontent.com/madebyollin/taehv/main/safetensors/taew2_1.safetensors")!
+
+    func taew21Ready() -> Bool {
+        let dir = Self.newLayoutDir(rootDir: modelsDir, repoId: Self.taew21RepoId)
+        return FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent(Self.taew21Filename))
+    }
+
+    /// Best-effort: fetch Krea's TAEW2.1 preview decoder in the background
+    /// if missing. Idempotent (tracked under its own key) and silent, same
+    /// reasoning as `ensurePreviewDecoder` — a missing decoder just means
+    /// the server falls back to the linear preview. Safe to call whenever
+    /// the Krea model is selected/appears, even before Krea itself has
+    /// finished downloading.
+    func ensureTaew21() {
+        if taew21Ready() { return }
+        if activeTasks[Self.taew21RepoId] != nil { return } // already downloading
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.activeTasks.removeValue(forKey: Self.taew21RepoId) }
+            guard !Task.isCancelled else { return }
+            let dir = Self.newLayoutDir(rootDir: self.modelsDir, repoId: Self.taew21RepoId)
+            do {
+                try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                let (data, response) = try await DownloadSession.shared.data(for: URLRequest(url: Self.taew21RawURL))
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    throw URLError(.badServerResponse)
+                }
+                let dest = (dir as NSString).appendingPathComponent(Self.taew21Filename)
+                try data.write(to: URL(fileURLWithPath: dest), options: .atomic)
+            } catch {
+                // Silent — same reasoning as the companion drafter/decoder
+                // above: the user never explicitly asked to download this,
+                // so surfacing a failure here would read as a bug in
+                // whatever they actually asked for.
+            }
+        }
+        activeTasks[Self.taew21RepoId] = task
+    }
+
+    /// Best-effort: provision `bundle`'s preview decoder in the background if
+    /// missing, WITHOUT requiring the primary model to redownload — covers
+    /// installs from before this feature existed. Idempotent (tracked under
+    /// its own repoId) and silent; the server just falls back to the linear
+    /// preview until it lands. Safe to call whenever the selected image
+    /// model changes, even if that model isn't downloaded yet (the decoder
+    /// is independent — it just won't be USED until both are present).
+    /// Krea routes to `ensureTaew21()` instead — see its doc for why it
+    /// can't go through the same HF-repo-based path as taef2.
+    func ensurePreviewDecoder(for bundle: MediaBundle) {
+        if bundle.primaryRepo.lowercased().contains("krea") {
+            ensureTaew21()
+            return
+        }
+        guard let decoder = Self.companionPreviewDecoderRepo(for: bundle) else { return }
+        if previewDecoderReady(decoder) { return }
+        if activeTasks[decoder] != nil { return } // already downloading
+        start(repoId: decoder) {}
+    }
+
     // MARK: - Media bundles
     //
     // A media model + its dependencies, downloaded as a unit (LTX → LTX +
@@ -1019,6 +1164,7 @@ class DownloadManager: ObservableObject {
                 if Task.isCancelled { break }
                 if self.downloads[comp.repo]?.status == .failed { break }
             }
+            await self.downloadCompanionPreviewDecoderIfNeeded(for: bundle)
             self.activeTasks.removeValue(forKey: bundle.id)
             onFinish()
         }

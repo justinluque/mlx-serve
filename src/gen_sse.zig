@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const server_mod = @import("server.zig");
+const latent_preview = @import("latent_preview.zig");
+const log = @import("log.zig");
 const Conn = server_mod.Conn;
 
 /// Erased progress callback handed into the model code (flux/tts/ltx) so the
@@ -17,12 +19,41 @@ pub const Progress = struct {
     /// each step and abort with error.Cancelled — without it a cancelled
     /// request burns the GPU to completion and queues everything behind it.
     cancelled_cb: ?*const fn (ctx: *anyopaque) bool = null,
+    /// Optional live-preview sink (see latent_preview.zig): a cheap per-step
+    /// latent→RGB projection, PNG-encoded — NOT a real VAE decode. Left null
+    /// by callers that only want step counters (audio/video, or image
+    /// requests that didn't opt into `"preview": true`); image denoise loops
+    /// check `wantsPreview()` before doing the projection/encode work at all,
+    /// so an unset sink costs nothing beyond the null check.
+    preview_cb: ?*const fn (ctx: *anyopaque, step: u32, total: u32, png: []const u8, width: u32, height: u32) void = null,
+    /// Optional loaded TAESD-family decoder (taef1/taef2 — taesd.zig — or
+    /// taew2_1 for Krea's Qwen-Image VAE space — taew.zig; see
+    /// `latent_preview.PreviewDecoder`) the preview path should prefer over
+    /// the linear Latent2RGB projection when set. Resolved once per request
+    /// by the HTTP layer (which knows which image backend/arch is loaded),
+    /// not by the model code — the denoise loop just reads whatever's here,
+    /// or falls back if it's null.
+    taesd_decoder: ?latent_preview.PreviewDecoder = null,
+    /// Whether the preview path may fall back to the linear Latent2RGB
+    /// projection when `taesd_decoder` is null or a decode attempt fails.
+    /// True (default) is normal operation. False is for testing the TAESD
+    /// path in isolation (Image gen window: TAESD checked, Latent RGB
+    /// unchecked) — a taesd failure then drops that preview frame instead
+    /// of quietly rendering the linear one in its place.
+    allow_linear_fallback: bool = true,
     pub fn emit(self: Progress, stage: []const u8, step: u32, total: u32) void {
         self.cb(self.ctx, stage, step, total);
     }
     pub fn cancelled(self: Progress) bool {
         const f = self.cancelled_cb orelse return false;
         return f(self.ctx);
+    }
+    pub fn wantsPreview(self: Progress) bool {
+        return self.preview_cb != null;
+    }
+    pub fn preview(self: Progress, step: u32, total: u32, png: []const u8, width: u32, height: u32) void {
+        const f = self.preview_cb orelse return;
+        f(self.ctx, step, total, png, width, height);
     }
 };
 
@@ -44,6 +75,23 @@ pub const StreamCtx = struct {
     /// runs.
     stream: bool = true,
     cancelled: bool = false,
+    /// Set before calling `progress()` to opt into `preview` SSE events
+    /// (`"preview": true` in the request body). Left false, `progress()`
+    /// hands out a null `preview_cb` and the generator skips the work.
+    preview_wanted: bool = false,
+    /// Set by the caller (after `preview_wanted`) to the loaded TAESD-family
+    /// decoder for the active image model, if any — rides through to
+    /// `Progress.taesd_decoder`. Null = linear-projection preview only.
+    taesd: ?latent_preview.PreviewDecoder = null,
+    /// Rides through to `Progress.allow_linear_fallback` — see its doc.
+    allow_linear_fallback: bool = true,
+    /// Optional allocator for `previewCb`'s base64 encode buffer. When set,
+    /// the buffer is sized exactly to the frame (no cap — a real TAESD
+    /// decode routinely runs 100-200KB+ of PNG, well past the old fixed
+    /// 128KB stack buffer, which silently dropped every single frame).
+    /// When null (callers that never opt into preview don't bother setting
+    /// this), falls back to the old bounded stack buffer.
+    allocator: ?std.mem.Allocator = null,
     pub fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
         if (!self.stream) return;
@@ -66,8 +114,64 @@ pub const StreamCtx = struct {
         }
         return false;
     }
+    /// Writes a `data: {"type":"preview",...,"image":"data:image/png;base64,..."}`
+    /// event. When `self.allocator` is set, the base64 buffer is sized
+    /// exactly to the frame — no cap. A real TAESD decode routinely runs
+    /// well past what a fixed stack buffer could hold (a single 384px-long-
+    /// side PNG is commonly 100-200KB), so a fixed cap here just meant
+    /// every TAESD frame got silently dropped. Falls back to a bounded
+    /// stack buffer (frame dropped if it doesn't fit) when no allocator was
+    /// provided — losing one ghost-image frame doesn't affect the real
+    /// generation, so that path still fails soft, never the request.
+    fn previewCb(ptr: *anyopaque, step: u32, total: u32, png_bytes: []const u8, width: u32, height: u32) void {
+        const self: *StreamCtx = @ptrCast(@alignCast(ptr));
+        const need = std.base64.standard.Encoder.calcSize(png_bytes.len);
+
+        var stack_buf: [131072]u8 = undefined;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |hb| self.allocator.?.free(hb);
+
+        const dest: []u8 = blk: {
+            if (self.allocator) |a| {
+                const hb = a.alloc(u8, need) catch {
+                    log.warn("[image] preview step {d}/{d} DROPPED — OOM allocating {d} bytes for base64\n", .{ step, total, need });
+                    return;
+                };
+                heap_buf = hb;
+                break :blk hb;
+            }
+            if (need > stack_buf.len) {
+                log.warn("[image] preview step {d}/{d} DROPPED — {d} PNG bytes ({d} b64) exceeds the {d}-byte SSE buffer\n", .{ step, total, png_bytes.len, need, stack_buf.len });
+                return;
+            }
+            break :blk stack_buf[0..need];
+        };
+        const b64 = std.base64.standard.Encoder.encode(dest, png_bytes);
+        var hdr_buf: [128]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&hdr_buf, "data: {{\"type\":\"preview\",\"step\":{d},\"total\":{d},\"width\":{d},\"height\":{d},\"image\":\"data:image/png;base64,", .{ step, total, width, height }) catch return;
+        self.conn.writeAll(hdr) catch {
+            self.cancelled = true;
+            return;
+        };
+        self.conn.writeAll(b64) catch {
+            self.cancelled = true;
+            return;
+        };
+        self.conn.writeAll("\"}\n\n") catch {
+            self.cancelled = true;
+            return;
+        };
+        log.info("[image] preview step {d}/{d} -> {d}x{d} {d} PNG bytes ({d} b64)\n", .{ step, total, width, height, png_bytes.len, need });
+    }
     pub fn progress(self: *StreamCtx) Progress {
-        return .{ .ctx = self, .cb = StreamCtx.cb, .cancelled_cb = StreamCtx.cancelledCb };
+        return .{
+            .ctx = self,
+            .cb = StreamCtx.cb,
+            .cancelled_cb = StreamCtx.cancelledCb,
+            .preview_cb = if (self.preview_wanted) StreamCtx.previewCb else null,
+            .taesd_decoder = self.taesd,
+            .allow_linear_fallback = self.allow_linear_fallback,
+        };
     }
 };
 
@@ -172,6 +276,41 @@ test "jsonEscapeMessage keeps an error body parseable (live: the mode:\"edit\" 4
     // A trailing escape is emitted whole or not at all.
     var tiny: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), jsonEscapeMessage(&tiny, "\"").len);
+}
+
+test "Progress.preview is a no-op when preview_cb is unset" {
+    const H = struct {
+        fn emitCb(ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+            _ = ctx;
+            _ = stage;
+            _ = step;
+            _ = total;
+        }
+    };
+    var dummy: u8 = 0;
+    const p = Progress{ .ctx = &dummy, .cb = H.emitCb };
+    try std.testing.expect(!p.wantsPreview());
+    p.preview(1, 4, "not a real png", 8, 8); // must not crash / must not call anything
+}
+
+test "Progress.wantsPreview true once preview_cb is set" {
+    const H = struct {
+        fn emitCb(ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+            _ = ctx;
+            _ = stage;
+            _ = step;
+            _ = total;
+        }
+        fn previewCb(ctx: *anyopaque, step: u32, total: u32, png: []const u8, width: u32, height: u32) void {
+            const self: *bool = @ptrCast(@alignCast(ctx));
+            self.* = step == 2 and total == 5 and std.mem.eql(u8, png, "abc") and width == 9 and height == 9;
+        }
+    };
+    var got_called = false;
+    const p = Progress{ .ctx = &got_called, .cb = H.emitCb, .preview_cb = H.previewCb };
+    try std.testing.expect(p.wantsPreview());
+    p.preview(2, 5, "abc", 9, 9);
+    try std.testing.expect(got_called);
 }
 
 test "Progress.cancelled defaults false, reads the probe when set" {

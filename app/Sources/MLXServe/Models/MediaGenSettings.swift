@@ -83,6 +83,13 @@ struct ImageGenSettings: Codable, Equatable {
     /// the same convention as the H3 reference lists surviving a preset switch.
     var customWidth: Int = 1024
     var customHeight: Int = 1024
+    /// Live-preview testing knobs (Advanced): independently enable/disable
+    /// each preview mechanism so they can be compared/debugged in
+    /// isolation. Both default on (normal operation: prefer TAESD, fall
+    /// back to the linear Latent RGB projection). Unchecking both disables
+    /// live previews entirely for this request.
+    var previewLatentRGB: Bool = true
+    var previewTAESD: Bool = true
 
     private static let storageKey = "imageGenSettings"
 
@@ -182,6 +189,8 @@ extension ImageGenSettings {
         }
         if let v = try c.decodeIfPresent(Int.self, forKey: .customWidth) { customWidth = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .customHeight) { customHeight = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .previewLatentRGB) { previewLatentRGB = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .previewTAESD) { previewTAESD = v }
     }
 }
 
