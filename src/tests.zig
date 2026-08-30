@@ -52,6 +52,7 @@ test {
     _ = @import("krea.zig");
     _ = @import("latent_preview.zig");
     _ = @import("taesd.zig");
+    _ = @import("taew.zig");
     _ = @import("mage_flow.zig");
     _ = @import("lora.zig");
     _ = @import("ane.zig");

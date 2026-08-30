@@ -321,9 +321,22 @@ pub const Decoder = struct {
 
     /// latent [1,16,H,W] (any float dtype) → RGB [1,3,8H,8W] f32 clipped to
     /// [0,1] (NCHW, caller frees).
+/// Eval + trace one intermediate, but ONLY when debug logging is on.
+///
+/// Both halves are gated together on purpose: the `eval` exists solely so the
+/// shape in the trace is real, and an unconditional one is a GPU barrier in
+/// the middle of a layer loop — on the LIVE PREVIEW path, nine times per
+/// previewed step. At the default level this is a no-op and the decode stays
+/// one lazy graph, evaluated once at the end.
+fn traceShape(x: mlx.mlx_array, comptime fmt: []const u8, args: anytype) void {
+    if (!log.isDebug()) return;
+    _ = mlx.mlx_array_eval(x);
+    log.debug("[taew] decode: " ++ fmt ++ ", shape={any}\n", args ++ .{mlx.getShape(x)});
+}
+
     pub fn decode(self: *const Decoder, latent: mlx.mlx_array) !mlx.mlx_array {
         const sh = mlx.getShape(latent);
-        log.info("[taew] decode: entered, input shape={any}\n", .{sh});
+        log.debug("[taew] decode: entered, input shape={any}\n", .{sh});
         if (sh[1] != 16) return error.ChannelMismatch;
         const s = self.s;
 
@@ -349,34 +362,29 @@ pub const Decoder = struct {
         defer _ = mlx.mlx_array_free(nhwc);
 
         var h = try conv3x3(nhwc, self.conv_in_w, self.conv_in_b, s);
-        _ = mlx.mlx_array_eval(h);
-        log.info("[taew] decode: conv_in OK, shape={any}\n", .{mlx.getShape(h)});
+        traceShape(h, "conv_in OK", .{});
 
         var nt: usize = 1;
         var bi: usize = 0;
         for (0..3) |group| {
             for (0..3) |_| {
                 const nh = try self.blocks[bi].forward(h, nt, s);
-                _ = mlx.mlx_array_eval(nh);
-                log.info("[taew] decode: block[{d}] (group {d}, nt={d}) OK, shape={any}\n", .{ bi, group, nt, mlx.getShape(nh) });
+                traceShape(nh, "block[{d}] (group {d}, nt={d}) OK", .{ bi, group, nt });
                 _ = mlx.mlx_array_free(h);
                 h = nh;
                 bi += 1;
             }
             const up = try upsampleNearest2x(h, s);
-            _ = mlx.mlx_array_eval(up);
-            log.info("[taew] decode: upsample (group {d}) OK, shape={any}\n", .{ group, mlx.getShape(up) });
+            traceShape(up, "upsample (group {d}) OK", .{group});
             _ = mlx.mlx_array_free(h);
             h = up;
             const grown = try tgrowSplit(h, self.tgrow_w[group], nt, s);
-            _ = mlx.mlx_array_eval(grown.out);
-            log.info("[taew] decode: tgrow (group {d}) OK, nt {d}->{d}, shape={any}\n", .{ group, nt, grown.nt, mlx.getShape(grown.out) });
+            traceShape(grown.out, "tgrow (group {d}) OK, nt {d}->{d}", .{ group, nt, grown.nt });
             _ = mlx.mlx_array_free(h);
             h = grown.out;
             nt = grown.nt;
             const transitioned = try conv3x3(h, self.trans_w[group], null, s);
-            _ = mlx.mlx_array_eval(transitioned);
-            log.info("[taew] decode: transition (group {d}) OK, shape={any}\n", .{ group, mlx.getShape(transitioned) });
+            traceShape(transitioned, "transition (group {d}) OK", .{group});
             _ = mlx.mlx_array_free(h);
             h = transitioned;
         }
@@ -389,7 +397,7 @@ pub const Decoder = struct {
             const last = try selectLastFrame(h, nt, s);
             _ = mlx.mlx_array_free(h);
             h = last;
-            log.info("[taew] decode: selected last of {d} frame(s), shape={any}\n", .{ nt, mlx.getShape(h) });
+            traceShape(h, "selected last of {d} frame(s)", .{nt});
         }
 
         {
@@ -648,4 +656,29 @@ test "MemBlock.forward on a zeroed weight set is a shape no-op" {
     for (buf, 0..) |v, i| {
         try testing.expectApproxEqAbs(@max(v, 0.0), d[i], 1e-5);
     }
+}
+
+test "the per-block decode trace never costs a barrier at the default log level" {
+    // Every `mlx_array_eval` in this decoder's block loop existed only so the
+    // trace line beside it could print a shape. That is the "host read inside
+    // a layer loop is a GPU BARRIER" antipattern, and it sat on the LIVE
+    // PREVIEW path: nine forced syncs per previewed step, every third step of
+    // every Krea generation, plus seven log lines each time at `info` — the
+    // level a normal server runs at. taesd.zig, the sibling decoder, logs only
+    // at load. Both halves are now gated behind `log.isDebug()`.
+    //
+    // Needles are assembled at comptime so this test's own source cannot
+    // satisfy the scan.
+    const src = @embedFile("taew.zig");
+    const decode_start = std.mem.indexOf(u8, src, "pub fn " ++ "decode(self: *const Decoder").?;
+    const decode_end = std.mem.indexOf(u8, src[decode_start..], "\n    }\n").? + decode_start;
+    const body = src[decode_start..decode_end];
+
+    // No unconditional eval survives in the decode body: each one is inside a
+    // `traceShape` call, which is itself a no-op unless debug is on.
+    try testing.expect(std.mem.indexOf(u8, body, "_ = mlx.mlx_array_" ++ "eval(") == null);
+    // ...and no per-decode line may go out at `info`.
+    try testing.expect(std.mem.indexOf(u8, body, "log." ++ "info(") == null);
+    // The load-time summary is the one line that SHOULD stay at info.
+    try testing.expect(std.mem.indexOf(u8, src, "log." ++ "info(\"[taew] loaded taew2_1") != null);
 }
