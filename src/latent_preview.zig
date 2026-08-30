@@ -35,19 +35,33 @@
 //!     The call site unpatchifies the sampling tokens, then runs the result
 //!     through `Vae.denorm` — the SAME per-channel `* STD + MEAN` affine
 //!     `Vae.decode` applies before its own post_quant_conv — before handing
-//!     it to `flux1_16ch`/the taef1 decoder. (An earlier version skipped
-//!     this denorm, same class of bug as the FLUX.2 one described above:
-//!     the preview stayed on the raw/normalized sampling scale instead of
-//!     the scale the factors table and taef1 weights were fit on.) Krea's
-//!     own VAE isn't guaranteed to be numerically identical to FLUX.1's, so
-//!     even with the denorm applied this is an approximation of an
-//!     approximation — right ballpark colors/composition, not a
-//!     color-accurate thumbnail. Good enough for "is this failing".
+//!     it to `flux1_16ch` (linear) or the taew2_1 decoder. (An earlier
+//!     version skipped this denorm, same class of bug as the FLUX.2 one
+//!     described above: the preview stayed on the raw/normalized sampling
+//!     scale instead of the scale the factors table and the decoder weights
+//!     were fit on.) Krea's VAE is the Qwen-Image 3D causal one, so its
+//!     decoder is taew2_1, NOT taef1 — see `gen.zig`'s `ensureTaew21`. The
+//!     LINEAR table is still FLUX.1's, which is an approximation of an
+//!     approximation; the taew2_1 decode is the accurate path.
 //!
-//! Swap-out path: if we can ever source (or train) channel-matched TAESD/
-//! TAEF1-style tiny decoder weights, add a second `Approximator` variant next
-//! to this one and switch call sites — the `projectToPng`/`PreviewPng`
-//! surface callers use doesn't need to change.
+//! Resolution: a preview's detail comes from decoding the latent at its
+//! NATIVE resolution — the decoder is what turns latent channels into fur
+//! and grass, and it can only work with what it is given. Shrinking the
+//! LATENT first (which this file used to do, by stride decimation, at a
+//! 48-cell cap) throws that detail away before the decoder ever runs, and
+//! no amount of decoding recovers it: measured on FLUX.2-klein at
+//! 1024x1024, that path produced a smeared fox with no eyes. So the two
+//! caps are separate and pull in opposite directions:
+//!   - `MAX_DECODE_INPUT_SIDE` (latent, 128) keeps the DECODE at native
+//!     resolution for anything up to a 1024x1024 generation, and only
+//!     kicks in above that — where it AREA-AVERAGES (`poolDownsample`)
+//!     rather than decimating.
+//!   - `MAX_PREVIEW_OUTPUT_SIDE` (pixels, 512) box-filters the DECODED
+//!     image down to a thumbnail for the wire.
+//! Full-detail decode, small frame. Measured on an M-series Mac at 6 steps
+//! /1024x1024, previewing every 3rd step costs nothing outside run-to-run
+//! variance (89.8 s with previews against 93.5 s without) — the DiT steps
+//! dominate, so quality here is close to free.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -97,6 +111,58 @@ fn strideDownsample(x: mlx.mlx_array, factor: c_int, s: S) !mlx.mlx_array {
     try mlx.check(mlx.mlx_slice(&o, x, &start, 4, &stop, 4, &strides, 4, s));
     defer _ = mlx.mlx_array_free(o);
     return contig(o, s);
+}
+/// Area-average downsample of an NCHW array by an integer factor on H and W
+/// (factor==1 returns an owned copy). Each output cell is the MEAN of its
+/// `factor x factor` input block, so a plane's energy survives the shrink
+/// instead of being sampled away — see the `strideDownsample` doc for what
+/// that costs, and the "averages a block" test for the demonstration.
+///
+/// H/W are cropped down to a whole multiple of `factor` first; the discarded
+/// remainder is at most `factor-1` latent cells on each side (2 of 128 in the
+/// real FLUX.2-at-1024 case), which is a sliver of a live thumbnail's edge.
+fn poolDownsample(x: mlx.mlx_array, factor: c_int, s: S) !mlx.mlx_array {
+    if (factor <= 1) return contig(x, s);
+    const sh = mlx.getShape(x);
+    const oh = @divFloor(sh[2], factor);
+    const ow = @divFloor(sh[3], factor);
+    if (oh < 1 or ow < 1) return error.DownsampleTooLarge;
+
+    // Crop to a whole number of blocks so the reshape below is exact.
+    var src = x;
+    var src_owned = false;
+    if (oh * factor != sh[2] or ow * factor != sh[3]) {
+        const start = [_]c_int{ 0, 0, 0, 0 };
+        const stop = [_]c_int{ sh[0], sh[1], oh * factor, ow * factor };
+        const strides = [_]c_int{ 1, 1, 1, 1 };
+        var cropped = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&cropped, x, &start, 4, &stop, 4, &strides, 4, s));
+        src = cropped;
+        src_owned = true;
+    }
+    defer if (src_owned) {
+        _ = mlx.mlx_array_free(src);
+    };
+
+    // [N,C,oh*f,ow*f] -> [N,C,oh,f,ow,f], then mean over the two block axes.
+    const blocked = try reshape(src, &[_]c_int{ sh[0], sh[1], oh, factor, ow, factor }, s);
+    defer _ = mlx.mlx_array_free(blocked);
+    const axes = [_]c_int{ 3, 5 };
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_mean_axes(&o, blocked, &axes, 2, false, s));
+    defer _ = mlx.mlx_array_free(o);
+    return contig(o, s);
+}
+/// Box-filter a decoded [1,3,H,W] image down until its long side is within
+/// `cap`. Integer factors only (the pool is a whole-block mean), and an image
+/// already inside the cap is returned as an owned copy — a preview is never
+/// upscaled to meet a cap it already satisfies.
+fn shrinkDecodedImage(img: mlx.mlx_array, cap: u32, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(img);
+    const long_side: u32 = @intCast(@max(sh[2], sh[3]));
+    if (long_side <= cap) return contig(img, s);
+    const factor: c_int = @intCast(@max(@as(u32, 2), (long_side + cap - 1) / cap));
+    return poolDownsample(img, factor, s);
 }
 inline fn contig(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
@@ -199,7 +265,54 @@ pub fn shouldPreviewStep(step_no: u32, total_steps: u32) bool {
 /// full-image-resolution decode (matching the real VAE's output size) on
 /// every previewed step, which is the other half of what was blowing up
 /// memory on larger Krea/FLUX.2 generations.
-const MAX_DECODE_INPUT_SIDE: u32 = 48;
+const MAX_DECODE_INPUT_SIDE: u32 = 128;
+
+var preview_max_side_cached: ?u32 = null;
+var preview_pool_cached: ?bool = null;
+
+/// The live cap. `MLX_SERVE_PREVIEW_MAX_SIDE=<n>` overrides it — the A/B lever
+/// for "is a sharper preview worth its decode time on this machine".
+fn maxDecodeInputSide() u32 {
+    if (preview_max_side_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_PREVIEW_MAX_SIDE") orelse break :blk MAX_DECODE_INPUT_SIDE;
+        const parsed = std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch break :blk MAX_DECODE_INPUT_SIDE;
+        break :blk @max(@as(u32, 8), parsed);
+    };
+    preview_max_side_cached = v;
+    return v;
+}
+
+/// Longest side of the PNG a preview frame actually ships. The decode runs at
+/// full latent detail (see `MAX_DECODE_INPUT_SIDE`); this only decides how big
+/// the resulting thumbnail is on the wire, where a 1024-wide frame is ~3 MB
+/// against ~700 KB at 512 — and the pane displays it a few hundred pixels
+/// wide either way. `MLX_SERVE_PREVIEW_OUTPUT_SIDE=<n>` overrides it.
+const MAX_PREVIEW_OUTPUT_SIDE: u32 = 512;
+
+var preview_output_side_cached: ?u32 = null;
+
+fn maxPreviewOutputSide() u32 {
+    if (preview_output_side_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_PREVIEW_OUTPUT_SIDE") orelse break :blk MAX_PREVIEW_OUTPUT_SIDE;
+        const parsed = std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch break :blk MAX_PREVIEW_OUTPUT_SIDE;
+        break :blk @max(@as(u32, 64), parsed);
+    };
+    preview_output_side_cached = v;
+    return v;
+}
+
+/// `MLX_SERVE_PREVIEW_POOL=0` restores the old stride decimation.
+fn previewPoolEnabled() bool {
+    if (preview_pool_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_PREVIEW_POOL") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    preview_pool_cached = v;
+    return v;
+}
 
 // ── FLUX.2's 128→32×2×2 unpack, mirroring flux.zig's private `unpatchify` ──
 
@@ -363,11 +476,20 @@ pub fn previewToPng(allocator: std.mem.Allocator, unpacked_latent: mlx.mlx_array
         // resolution just for a live thumbnail (see MAX_DECODE_INPUT_SIDE).
         const in_sh = mlx.getShape(unpacked_latent);
         const long_side: u32 = @intCast(@max(in_sh[2], in_sh[3]));
-        const factor: c_int = @intCast(@max(@as(u32, 1), (long_side + MAX_DECODE_INPUT_SIDE - 1) / MAX_DECODE_INPUT_SIDE));
+        const cap = maxDecodeInputSide();
+        const factor: c_int = @intCast(@max(@as(u32, 1), (long_side + cap - 1) / cap));
         var decode_input = unpacked_latent;
         var decode_input_owned = false;
         if (factor > 1) {
-            if (strideDownsample(unpacked_latent, factor, s)) |ds| {
+            // Area-average, not stride: a thumbnail of a high-frequency latent
+            // should be its local mean, and decimation throws that away (see
+            // `poolDownsample`). A pool failure falls back to the old stride
+            // rather than dropping the frame.
+            const ds_or = if (previewPoolEnabled())
+                poolDownsample(unpacked_latent, factor, s) catch strideDownsample(unpacked_latent, factor, s)
+            else
+                strideDownsample(unpacked_latent, factor, s);
+            if (ds_or) |ds| {
                 decode_input = ds;
                 decode_input_owned = true;
             } else |_| {}
@@ -375,8 +497,19 @@ pub fn previewToPng(allocator: std.mem.Allocator, unpacked_latent: mlx.mlx_array
         defer if (decode_input_owned) {
             _ = mlx.mlx_array_free(decode_input);
         };
-        if (d.decode(decode_input)) |img| {
-            defer _ = mlx.mlx_array_free(img);
+        if (d.decode(decode_input)) |decoded| {
+            defer _ = mlx.mlx_array_free(decoded);
+            // Full-detail decode, thumbnail on the wire. A shrink failure is
+            // not worth dropping the frame over — ship the full-size decode.
+            var img = decoded;
+            var img_owned = false;
+            if (shrinkDecodedImage(decoded, maxPreviewOutputSide(), s)) |sm| {
+                img = sm;
+                img_owned = true;
+            } else |_| {}
+            defer if (img_owned) {
+                _ = mlx.mlx_array_free(img);
+            };
             const sh = mlx.getShape(img);
             const h: u32 = @intCast(sh[2]);
             const w: u32 = @intCast(sh[3]);
@@ -397,6 +530,115 @@ pub fn previewToPng(allocator: std.mem.Allocator, unpacked_latent: mlx.mlx_array
 // ════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+
+test "a full-detail decode is shipped as a box-filtered thumbnail, not a decimated one" {
+    // The two halves of the preview pipeline pull in opposite directions: the
+    // DECODER wants the latent at native resolution (that is where the detail
+    // is), while the WIRE wants a thumbnail (a live preview is displayed a few
+    // hundred pixels wide; a 1024x1024 PNG is ~3 MB per frame).
+    //
+    // Resolving that by shrinking the LATENT is what made previews smeared —
+    // it destroys the detail before the decoder can use it. Shrinking the
+    // decoded IMAGE instead keeps the decode at full detail and box-filters
+    // the result, so the thumbnail is sharp rather than aliased.
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const H = 1024;
+    const W = 1024;
+    const buf = try testing.allocator.alloc(f32, 3 * H * W);
+    defer testing.allocator.free(buf);
+    for (buf, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.017) * 0.5 + 0.5;
+    const sh = [_]c_int{ 1, 3, H, W };
+    const img = mlx.mlx_array_new_data(buf.ptr, &sh, 4, .float32);
+    defer _ = mlx.mlx_array_free(img);
+
+    const shrunk = try shrinkDecodedImage(img, 512, s);
+    defer _ = mlx.mlx_array_free(shrunk);
+    _ = mlx.mlx_array_eval(shrunk);
+    const osh = mlx.getShape(shrunk);
+    try testing.expectEqual(@as(c_int, 3), osh[1]);
+    try testing.expectEqual(@as(c_int, 512), osh[2]);
+    try testing.expectEqual(@as(c_int, 512), osh[3]);
+
+    // Already under the cap: handed back untouched (same geometry), never
+    // upscaled to meet it.
+    const small = try shrinkDecodedImage(img, 4096, s);
+    defer _ = mlx.mlx_array_free(small);
+    _ = mlx.mlx_array_eval(small);
+    const ssh = mlx.getShape(small);
+    try testing.expectEqual(@as(c_int, H), ssh[2]);
+    try testing.expectEqual(@as(c_int, W), ssh[3]);
+}
+
+test "the decode downsample averages a block instead of sampling one cell of it" {
+    // A latent whose detail lives ENTIRELY at the per-cell scale: each 3x3
+    // block holds one high value and eight low ones, tiled across the plane.
+    // Stride decimation lands on one fixed phase of that pattern, so its
+    // output is a constant — every block reads back as whatever single cell
+    // the stride happened to hit, and the block's actual content is gone.
+    // Area averaging carries the block's mean through, which is what a
+    // thumbnail of a high-frequency image is supposed to be.
+    //
+    // This is the whole reason a 1024x1024 preview looked smeared: at that
+    // size the latent is downsampled 3x before the decoder ever runs, so
+    // eight of every nine latent cells were being thrown away rather than
+    // folded in.
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const H = 9;
+    const W = 9;
+    var buf: [1 * 1 * H * W]f32 = @splat(0.0);
+    // Peak at every (3k+1, 3j+1) — the CENTER of each 3x3 block, so the
+    // stride-0 phase misses all of them.
+    for (0..H) |y| for (0..W) |x| {
+        if (y % 3 == 1 and x % 3 == 1) buf[y * W + x] = 9.0;
+    };
+    const sh = [_]c_int{ 1, 1, H, W };
+    const lat = mlx.mlx_array_new_data(&buf, &sh, 4, .float32);
+    defer _ = mlx.mlx_array_free(lat);
+
+    const pooled = try poolDownsample(lat, 3, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    _ = mlx.mlx_array_eval(pooled);
+    const psh = mlx.getShape(pooled);
+    try testing.expectEqual(@as(c_int, 3), psh[2]);
+    try testing.expectEqual(@as(c_int, 3), psh[3]);
+    const pd = mlx.mlx_array_data_float32(pooled) orelse return error.NoData;
+    // Each 3x3 block sums to 9.0 over 9 cells -> mean 1.0 everywhere.
+    for (pd[0..9]) |v| try testing.expectApproxEqAbs(@as(f32, 1.0), v, 1e-5);
+
+    // The stride path, on the same input, returns all zeros: it samples the
+    // (0,0) phase of every block and never sees a peak. Energy is not
+    // preserved -- it is discarded.
+    const strided = try strideDownsample(lat, 3, s);
+    defer _ = mlx.mlx_array_free(strided);
+    _ = mlx.mlx_array_eval(strided);
+    const sd = mlx.mlx_array_data_float32(strided) orelse return error.NoData;
+    for (sd[0..9]) |v| try testing.expectApproxEqAbs(@as(f32, 0.0), v, 1e-5);
+}
+
+test "the decode downsample handles a size that is not a multiple of the factor" {
+    // 128 latent cells at factor 3 is the real FLUX.2-at-1024 case: 42 whole
+    // blocks and a 2-cell remainder. The remainder must not make the pool
+    // fail (that would drop the frame) or read past the plane.
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const H = 128;
+    const W = 128;
+    const buf = try testing.allocator.alloc(f32, H * W);
+    defer testing.allocator.free(buf);
+    for (buf, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.11);
+    const sh = [_]c_int{ 1, 1, H, W };
+    const lat = mlx.mlx_array_new_data(buf.ptr, &sh, 4, .float32);
+    defer _ = mlx.mlx_array_free(lat);
+
+    const pooled = try poolDownsample(lat, 3, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    _ = mlx.mlx_array_eval(pooled);
+    const psh = mlx.getShape(pooled);
+    try testing.expectEqual(@as(c_int, 42), psh[2]);
+    try testing.expectEqual(@as(c_int, 42), psh[3]);
+}
 
 test "project rejects a channel-count mismatch instead of corrupting memory" {
     const s = mlx.mlx_default_gpu_stream_new();
