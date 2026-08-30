@@ -6062,7 +6062,9 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
         submits += 1;
         submit_pos = end + 3;
     }
-    try testing.expectEqual(@as(usize, 5), submits);
+    // 5 request paths + the Ideogram 4 magic-prompt rewriter, which is a real
+    // generation on the connection thread and inherits the same contract.
+    try testing.expectEqual(@as(usize, 6), submits);
 
     // Positional calls into the non-streaming wrapper must pass the resolved
     // value; the raw text-completion path is the sole explicit false arm.

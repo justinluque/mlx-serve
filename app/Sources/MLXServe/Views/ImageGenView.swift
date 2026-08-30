@@ -32,6 +32,9 @@ struct ImageGenView: View {
     /// Keep the model resident after generating (default off → unload to free
     /// GPU memory). On → the next generation reuses it instantly.
     @State private var keepResident: Bool = false
+    /// Ideogram 4 only — see `ImageModelPreset.supportsMagicPrompt`.
+    @State private var magicPrompt: Bool = true
+    @State private var magicPromptModel: String = ""
     /// Image-to-image source (transient — not persisted, like video's first frame).
     @State private var initImageURL: URL? = nil
     /// Extra in-context references for edit mode (FLUX.2 multi-reference):
@@ -495,6 +498,29 @@ struct ImageGenView: View {
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
 
+            // Ideogram 4 was trained EXCLUSIVELY on structured JSON captions, so
+            // a plain sentence is out of distribution rather than merely weaker.
+            // The server rewrites it with a chat model before conditioning.
+            if model.supportsMagicPrompt {
+                Divider()
+                Text("Magic prompt").font(.caption.weight(.semibold))
+                Toggle("Rewrite my prompt into a structured caption", isOn: $magicPrompt)
+                    .font(.caption)
+                    .help("This model was trained only on structured JSON captions describing layout, elements and colours. On (default): the server turns your sentence into one first. Off: your text is used verbatim — the right choice when you wrote the caption yourself.")
+                    .onChange(of: magicPrompt) { _, _ in guard !hydrating else { return }; persist() }
+                if magicPrompt {
+                    VStack(alignment: .leading, spacing: 4) {
+                        TextField("", text: $magicPromptModel, prompt: Text("default text model"))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption.monospaced())
+                            .onChange(of: magicPromptModel) { _, _ in guard !hydrating else { return }; persist() }
+                        Text("Which loaded chat model writes the caption. Empty = the server's default. The rewrite runs first, so it adds its own few seconds.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
             // Rebalance scales the TAPPED text-encoder layers. A backend that
             // conditions on a single final hidden state has none to tap
             // (`condWeightCount == 0`), and the panel used to ask for
@@ -872,6 +898,8 @@ struct ImageGenView: View {
             lanModelId: lanModel,
             initImagePath: initImageURL?.path,
             strength: strength,
+            magicPrompt: magicPrompt,
+            magicPromptModel: magicPromptModel,
             editMode: effectiveEditMode,
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             condGain: condGain,

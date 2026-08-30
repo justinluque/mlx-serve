@@ -422,6 +422,105 @@ Beyond the main MiniMax-H3 section above: position coordinates are AREA-NORMALIZ
 
 StyleTTS2 + iSTFTNet, NON-autoregressive, ~17x realtime, 325 MB f32: ALBERT (shared layer) → DurationEncoder (BiLSTM+AdaLayerNorm) → duration-driven frame expansion → F0/N AdainResBlk stacks → iSTFTNet generator. 54 voice packs, each a `[510,1,256]` table indexed by PHONEME COUNT; comma-separated names BLEND by mean. `kokoro_g2p.zig` = text→IPA (misaki dicts → case → suffix stemming w/ -s/-ed allomorphy → acronym spelling → letter-to-sound; NO espeak, it is GPLv3). Weights via `tests/convert_kokoro_weights.py`, published at `ddalcu/Kokoro-82M-MLX-Serve` (f32, ~345 MB, `g2p/` included), which is what the app downloads.
 
+### Ideogram 4 (`src/ideogram4.zig`, `src/ideogram4_prompt.zig`)
+
+Ideogram AI's first open-weight text-to-image model (June 2026, Apache-2.0
+CODE, separately-licensed weights). 9.3B parameters per transformer, and it
+ships two of them.
+
+**Shape.** A fully single-stream DiT: text tokens and image latent tokens are
+concatenated into ONE sequence and share the same projections at every layer —
+no cross-attention, no context branch. 34 layers, `emb_dim` 4608, 18 heads
+(head_dim 256), SwiGLU 12288, QK-RMSNorm, AdaLN scale/gate from a 512-d
+timestep embedding with `tanh` on the gates and `1 + scale` on the scales. The
+two token roles are told apart by a 2-row indicator embedding and by their
+MRoPE positions (text at 0.., image at `65536 + (h, w)`).
+
+**Conditioning.** Qwen3-VL-8B-Instruct in text-only mode, with hidden states
+from 13 intermediate layers (0, 3, …, 33, 35) concatenated along the feature
+dim to 53248, then RMSNorm + a projection into 4608. mlx-serve runs this on
+`flux.TextEncoder` — the same Qwen3 block stack FLUX.2 uses — with the tap list
+and the flattening order as config (`te_taps`, `te_tap_inner`). The two models
+flatten DIFFERENTLY: FLUX is tap-major, Ideogram permutes (T,B,L,H)→(B,L,H,T),
+so the tap axis ends up innermost. Same shape, different vector.
+
+**Asymmetric CFG.** The negative branch is a SEPARATE checkpoint
+(`unconditional_transformer/`), run image-only with zeroed conditioning and no
+text tokens at all. `v = gw·v_pos + (1−gw)·v_neg`. This is the defining
+residency fact: the DiT bill is 2 × 9.3B, not 9.3B.
+
+**Sampler.** Euler flow-matching on a resolution-aware logit-normal schedule:
+`mean = mu + 0.5·ln(pixels / 512²)`, clamped to a log-SNR window, walked from
+t=1 down to t=0. Guidance is per-step and in LOOP-INDEX order — index 0 is the
+LAST step — so each preset does its bulk at gw 7 and finishes with a few polish
+steps at gw 3. Three presets: 12 (mu 0.5, std 1.75), 20 (mu 0, std 1.75), 48
+(mu 0, std 1.5). The step count SELECTS the preset (`SamplerPreset.forSteps`),
+because mu and std travel with it.
+
+**VAE.** The Flux2 KL autoencoder, byte-for-byte — `flux.Vae.decodeLatent` is
+shared. What differs is the latent normalization: the reference decodes with a
+published per-channel table (`src/ideogram4_latent.zig`) rather than the
+checkpoint's `bn` running stats, and the patch packing is `[ph, pw, channel]`
+where FLUX.2's is `[channel, ph, pw]`.
+
+**Prompting.** The model was trained EXCLUSIVELY on structured JSON captions —
+`high_level_description`, an optional `style_description`, and a
+`compositional_deconstruction` of a background plus elements carrying `bbox`
+(`[ymin, xmin, ymax, xmax]` on a 0–1000 grid) and `color_palette` (uppercase
+`#RRGGBB`). A plain sentence is out of distribution, not merely weaker. So:
+
+- `magic_prompt` (`true` / `false` / `"auto"`, default auto) rewrites a plain
+  idea into a caption using the reference's own system prompt, run through a
+  chat model this server already has. `magic_prompt_model` picks which one;
+  empty is the default text model. The rewrite happens on the CONNECTION
+  thread, before the job reaches the inference thread — a nested submit from
+  the gen job would wait on itself.
+- Every failure is non-fatal and falls back to the raw prompt.
+- A prompt that already looks like a caption is passed through untouched, so
+  hand-written layout control is never silently rewritten.
+- The caption verifier (`ideogram4_prompt.verify`) reports warnings, including
+  key ORDER, because JSON key order is preserved in the text the model sees.
+
+**LoRA.** Stacked and summed at forward time like every other backend
+(`lora.Arch.ideogram4`), attached to the CONDITIONAL transformer only — the
+unconditional branch never sees the prompt, and published fine-tunes train
+against the conditional weights. Targets are `layers.N.attention.qkv` (fused,
+1:1 — no third-splitting), `.attention.o`, `feed_forward.w1/w2/w3` and
+`adaln_modulation`, plus `transformer.`-prefixed aliases for diffusers/PEFT
+exports.
+
+**Not supported:** img2img and instruction editing. The pack ships the VAE
+DECODER only, and there is no edit training; both are named refusals, not
+silent no-ops.
+
+**Packs.** `tests/convert_ideogram4.py` reads the published FP8 (weight-only,
+per-row scales) or NF4 checkpoints, dequantizes to bf16 and re-quantizes.
+`--precision 3 | 4 | 8 | mixed | mixed_3_8` (a mixed name reads
+bulk_sensitive): the attention/MLP bulk at `bulk`, the modulation and
+conditioning projections at 8-bit in EVERY policy (1.13B params across the two
+transformers = 0.28 GB to hold two bits above the bulk, 2% of the smallest
+pack), the embedding, timestep and final-layer projections dense — ~60 MB to
+remove them as suspects — and a per-policy width for the Qwen3-VL text encoder
+(`te_bits_for`), which is a third of the download: shrinking only the DiT does
+not shrink the pack, so the small policies take the encoder to 4-bit, the width
+flat `--precision 4` already runs it at. `--bulk-bits`/`--sensitive-bits`/
+`--te-bits` override any tier (mixed policies only, refused BEFORE the download).
+Whole-pack estimates (`estimate_pack_bytes`, ordering pinned by `--self-test`):
+8 ~27 GB, mixed ~18 GB, 4 ~14 GB, `mixed_3_8` ~13 GB, 3 ~11 GB. 3 bits is the
+FLOOR for the bulk (`MIN_BULK_BITS`): a `mixed_2_8` pack was published and
+withdrawn — it renders a woven grid texture at every prompt, seed and
+resolution, while `mixed_3_8` renders the same prompts correctly — so the
+policy is gone and `--bulk-bits 2` is refused rather than documented as a
+smaller option.
+`unconditional_transformer/config.json` is written LAST and is the completeness
+marker `model_discovery.requiredMediaMarker` looks for.
+
+**Oracle.** `tests/dump_ideogram4_fixtures.py` builds a TINY randomly-
+initialised transformer from the reference's own classes and dumps the rope
+tables and the velocity; `IDEOGRAM4_FIXTURE_DIR` arms the `ideogram4 fixture`
+test. The published weights are gated and 27 GB, so the oracle deliberately
+proves the ARITHMETIC rather than a checkpoint.
+
 ### Runtime LoRA (`src/lora.zig`)
 
 Runtime unfused LoRA adapters, STACKED (`Stack` = up to `MAX_LORAS` 8 files; `deltaSum` sums per-linear, never merges) across QLinear/MixedLinear/MfLinear. `parseKey` accepts diffusers/kohya/dotted-`lora.down`/PEFT-`.default.` spellings + flat `lora_unet_` scheme; `canonicalize` maps every alias onto OUR module name per `Arch` (flux2/krea2/minimax_h3/generic), splitting a fused BFL QKV source into thirds (shared full-rank A). `validatePath` is the ONE path rule (absolute + regular file, checked before mlx sees it); `fileAlphaScale` resolves the file's declared alpha/rank out of the safetensors `__metadata__` (per-module `.alpha` tensor still wins).

@@ -105,6 +105,28 @@ conv and power-of-two accumulator wrap); only the bank structure and the
 affinity handle are theirs.
 
 --------------------------------------------------------------------------------
+Ideogram 4
+https://github.com/ideogram-oss/ideogram4
+Copyright 2026 Ideogram AI
+Licensed under the Apache License, Version 2.0.
+
+Two pieces are carried over rather than reimplemented, because both are part of
+the model's trained interface rather than of its architecture:
+
+  * `src/ideogram4_magic_prompt_v1.txt` is `magic_prompt_system_prompts/v1.txt`
+    verbatim — the system prompt that turns a plain idea into the structured
+    JSON caption Ideogram 4 was trained on. It lives at
+    `src/data/ideogram4_magic_prompt_v1.txt` and is embedded into the binary.
+  * The caption verifier in `src/ideogram4_prompt.zig` is a port of
+    `caption_verifier.py`: the same key sets, key ORDER, bbox grid, palette
+    limits and hex-colour spelling, restated in Zig.
+
+The Ideogram 4 architecture itself was reimplemented from the reference rather
+than translated; see the reference-implementations section below. The MODEL
+WEIGHTS are not redistributed by mlx-serve and are governed by their own
+license, which is not Apache-2.0.
+
+--------------------------------------------------------------------------------
 jinja.cpp
 https://github.com/wangzhaode/jinja.cpp
 Copyright 2025 Wang Zhaode
@@ -369,6 +391,15 @@ and they are listed because they made that work possible.
 
   * poolside `modeling_laguna.py` (Apache-2.0), the reference for the `laguna`
     architecture.
+  * `ideogram-oss/ideogram4` (Apache-2.0, Ideogram AI), the reference for the
+    `ideogram4` architecture: its single-stream MRoPE DiT, the 13-tap Qwen3-VL
+    conditioning, the logit-normal flow-matching schedule with asymmetric CFG,
+    and the published per-channel latent table transcribed into
+    `src/ideogram4_latent.zig`. Its magic-prompt system prompt and caption
+    verifier are not merely read but carried over — they are listed in the
+    Apache-2.0 section above. (The Ideogram 4 WEIGHTS are not redistributed
+    here and carry their own separate, non-Apache license — see the model
+    card.)
   * The `inkling_mlx/` package bundled with Thinking Machines' Inkling Small
     checkpoints (Apache-2.0), the reference and parity oracle for
     `inkling_mm_model`.

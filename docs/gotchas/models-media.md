@@ -1691,3 +1691,89 @@ Two things learned on the way:
 - **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
 
 H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
+## Ideogram 4: two transformers, an interleave that skips a section, and a prompt format
+
+**The negative branch is a second checkpoint.** `Ideogram4Pipeline` builds
+`conditional_transformer` and `unconditional_transformer` from two separate
+9.3 GB files and runs both every step. Reading "asymmetric CFG" as "the usual
+CFG, on one model, with an empty prompt" gets you a pipeline that loads, runs,
+and produces images — with a negative branch that is the positive one. The
+tell is not in the output, it is in the boot log, which is why
+`tests/test_ideogram4.sh` asserts BOTH load lines by name rather than asserting
+anything about the image. The same reasoning makes
+`unconditional_transformer/config.json` the completeness marker: the component
+most likely to be missing from a half-finished pull is the one whose absence
+still leaves a working-looking pipeline.
+
+**The MRoPE interleave leaves `mrope_section[0]` unread.** The reference fills
+all 128 frequency slots from the t axis, then overwrites indices
+`1, 4, … < 3·section[1]` with H and `2, 5, … < 3·section[2]` with W. With
+sections `(24, 20, 20)` that is 20 H slots, 20 W slots, and 88 t slots — the
+first section's 24 never appears in the code. It reads like an off-by-one
+waiting to be tidied up. It is not: a table partitioned by all three sections
+is a different model. And a wrong rope table is the worst kind of wrong here,
+because it is diffuse — every layer is slightly off, nothing crashes, and an
+end-to-end cosine against a reference still looks plausible. So the fixture
+dumps and compares `rope_cos`/`rope_sin` on their own, before it looks at a
+velocity.
+
+**Two models, one VAE, two packings.** Ideogram's autoencoder is FLUX.2's KL
+autoencoder — same `ch_mult`, same 32 latent channels, same diffusers key
+names, down to shipping the `bn` running stats. `flux.Vae` loads it unchanged.
+What is NOT shared is the patch packing: Ideogram's `_decode` reshapes to
+`(B, gh, gw, 2, 2, ae_ch)`, so the last dim runs `[ph, pw, channel]`, while
+`flux.unpatchify` assumes `[channel, ph, pw]`. Both produce a correctly-shaped
+image. One of them is scrambled in 2×2 blocks. Ideogram also decodes with its
+own published shift/scale table instead of the `bn` stats it ships — those are
+presumably the same numbers, but the reference uses the table, so the table is
+the oracle.
+
+**The tap flattening is not the same as FLUX's either.** Both models
+concatenate hidden states from several encoder layers, and both end up with
+`[1, seq, taps·hidden]`. FLUX transposes to `[seq, tap, hidden]`; Ideogram
+permutes `(T,B,L,H) → (B,L,H,T)`, i.e. tap-innermost. Identical shapes,
+different vectors, and no error anywhere. Generalizing `flux.TextEncoder` for
+Ideogram's 13 taps started as a one-line change to the tap list and a
+transpose — which would have silently re-ordered FLUX's own conditioning. It is
+a config flag (`te_tap_inner`) for that reason, and the same fact is why
+`condWeightCount` reports 0 rather than 13: the conditioning-rebalance UI
+slices the tap-major layout.
+
+**A plain sentence is out of distribution.** The model saw only structured JSON
+captions in training. That makes the rewriter part of the model's interface
+rather than a nicety, which is why the system prompt is vendored verbatim and
+the caption verifier is ported rather than approximated — including the KEY
+ORDER checks, which look like pedantry until you remember the model reads the
+serialized JSON, where key order is preserved. The rewrite runs on the
+connection thread: the inference thread is the sole mlx caller and
+`runGeneration` owns it for the duration of the image job, so a rewrite
+submitted from inside the job would wait on itself. And it is non-fatal
+everywhere — no text model loaded, a model that will not load, output that is
+not JSON — because a 503 instead of a slightly-worse image is a bad trade for a
+field the caller may not know exists.
+
+**2-bit on the DiT bulk does not render, and the failure looks like a port
+bug.** A `mixed_2_8` pack (attention + MLP at 2-bit affine gs64, the modulation
+and conditioning tier still 8-bit) was published, then withdrawn: it produces a
+woven grid texture at every prompt, seed, resolution and step count. The
+`mixed_3_8` pack — the same converter, the same policy shape, one more bit on
+the same tensors — renders the same prompts correctly. Nothing in the pipeline
+tells the two apart from the outside: both load with the same boot lines, both
+report both transformers, both denoise for the same wall clock, and the bad one
+comes back as a 200 with a valid PNG.
+
+That matters because the artifact is *structured* — a regular grid, which is
+exactly what a wrong patch packing, a mis-built MRoPE table or a scrambled tap
+flattening also look like. Every one of those is a plausible reading of that
+image, and all of them are wrong. The check that costs a minute and settles it
+is generating the same prompt on a second pack at a different width: an
+arithmetic bug is in the code and reproduces on every pack, a quantization
+failure is in the weights and does not. Do that before reading a single line of
+the forward.
+
+So 3 bits is the floor for the bulk (`MIN_BULK_BITS` in
+`tests/convert_ideogram4.py`), the named policy is gone, and `--bulk-bits 2` is
+a refusal rather than a documented small option — the earlier docstring hedged
+it as "past where any of this was measured", which reads as a quality tier when
+it is a broken pack. The catalog ships exactly one Ideogram preset for the same
+reason: a quantization offered in the model picker is a promise that it works.

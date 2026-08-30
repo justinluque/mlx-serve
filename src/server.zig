@@ -6,6 +6,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
+const ideogram_prompt = @import("ideogram4_prompt.zig");
 const model_mod = @import("model.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
@@ -4033,6 +4034,121 @@ fn genJobRun(ctx: *anyopaque) void {
 /// already-resolved + refcounted model (so it can't be evicted mid-gen). The
 /// generation runs on the scheduler's inference thread (the sole mlx caller);
 /// the body writes its own response. A wrong-modality target gets a clear 400.
+/// Ideogram 4's magic prompt: rewrite a plain idea into the structured JSON
+/// caption the model was actually trained on.
+///
+/// The reference ships this as a call to OpenRouter or to Ideogram's hosted
+/// API. mlx-serve sends nothing anywhere, so the same system prompt runs
+/// through a chat model THIS server already has, on the connection thread —
+/// exactly where a normal client request would sit. Doing it on the inference
+/// thread instead would deadlock: `runGeneration` owns that thread for the
+/// duration of the image job, and a nested `submit` would wait on itself.
+///
+/// Every failure is NON-FATAL and falls back to the raw prompt: no text model
+/// loaded, a model that will not load, a rewrite that comes back unparseable.
+/// A rewriter is a quality lever, and a 503 instead of a slightly-worse image
+/// is a bad trade for a field the caller may not even know exists.
+const MagicPromptResult = struct {
+    /// Owned caption, or null when nothing was rewritten.
+    caption: ?[]u8 = null,
+    /// Why nothing was rewritten (for the log line). Static.
+    skipped: ?[]const u8 = null,
+};
+
+/// Cap on the rewriter's own output. The caption schema tops out well under
+/// this; past it the model is looping, and a caption longer than the DiT's
+/// 2048-token text window cannot be conditioned on anyway.
+const MAGIC_PROMPT_MAX_TOKENS: u32 = 1536;
+
+fn magicPromptRewrite(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    prompt: []const u8,
+    width: u32,
+    height: u32,
+    model_id: []const u8,
+) MagicPromptResult {
+    if (ideogram_prompt.looksLikeCaption(prompt)) return .{ .skipped = "prompt is already a structured caption" };
+    const sch = global_scheduler orelse return .{ .skipped = "scheduler not ready" };
+
+    // An empty id means "the default model" — the same shorthand every other
+    // endpoint takes. A media model resolved here would have no tokenizer and
+    // no transformer, so it is refused rather than half-run.
+    const lm = sch.ensureLoaded(model_id) catch |err| {
+        log.warn("[ideogram4] magic prompt: model '{s}' unavailable ({s}); using the raw prompt\n", .{ model_id, @errorName(err) });
+        return .{ .skipped = "rewriter model unavailable" };
+    };
+    defer sch.release(lm);
+    const config = lm.config orelse return .{ .skipped = "rewriter model has no text config" };
+    const tok = lm.tokenizer orelse return .{ .skipped = "rewriter model has no tokenizer" };
+    const chat_config = lm.chat_config orelse return .{ .skipped = "rewriter model has no chat template" };
+
+    const sections = ideogram_prompt.parseSections(ideogram_prompt.system_prompt_v1);
+    const aspect = ideogram_prompt.aspectRatio(allocator, width, height) catch return .{ .skipped = "oom" };
+    defer allocator.free(aspect);
+    const user_msg = ideogram_prompt.buildUserMessage(allocator, sections, prompt, aspect) catch return .{ .skipped = "oom" };
+    defer allocator.free(user_msg);
+
+    const messages = [_]chat_mod.Message{
+        .{ .role = "system", .content = sections.system },
+        .{ .role = "user", .content = user_msg },
+    };
+    // `thinking_mode: disabled` in the prompt file's [META] block is not a
+    // suggestion — the output contract is one minified JSON object, and a
+    // reasoning preamble is what a fence-stripper cannot rescue.
+    const prompt_ids = cachedFormatChat(allocator, io, lm, tok, chat_config, &messages, null, null, false, null, false) catch |err| {
+        log.warn("[ideogram4] magic prompt: template render failed ({s})\n", .{@errorName(err)});
+        return .{ .skipped = "template render failed" };
+    };
+    defer allocator.free(prompt_ids);
+
+    var slot_handle: ?*scheduler_mod.Slot = null;
+    defer if (slot_handle) |s| sch.complete(s);
+    slot_handle = sch.submit(.{
+        .model = lm,
+        .prompt_ids = prompt_ids,
+        .full_prompt = prompt_ids,
+        .sampling = .{ .temperature = 1.0, .top_p = 0.95 },
+        // `thinking_mode: disabled` in the prompt file's [META] block: the
+        // output contract is ONE minified JSON object, and a reasoning
+        // preamble is what a fence-stripper cannot rescue.
+        .enable_thinking = false,
+        .eos_token_ids = config.eosTokenSlice(),
+        .max_tokens = MAGIC_PROMPT_MAX_TOKENS,
+        .timeout_ns = getTimeoutNs(),
+    }) catch |err| {
+        log.warn("[ideogram4] magic prompt: submit failed ({s})\n", .{@errorName(err)});
+        return .{ .skipped = "rewriter submit failed" };
+    };
+
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(allocator);
+    while (true) {
+        switch (slot_handle.?.waitNext()) {
+            .token => |t| out.append(allocator, t) catch return .{ .skipped = "oom" },
+            .done => break,
+            .err => {
+                log.warn("[ideogram4] magic prompt: generation failed\n", .{});
+                return .{ .skipped = "rewriter generation failed" };
+            },
+        }
+    }
+    const text = tok.decode(allocator, out.items, false) catch return .{ .skipped = "oom" };
+    defer allocator.free(text);
+    const stripped = ideogram_prompt.stripCodeFences(text);
+    if (stripped.len == 0) return .{ .skipped = "rewriter returned nothing" };
+
+    var report = ideogram_prompt.verify(allocator, stripped);
+    if (report.invalid_json) {
+        log.warn("[ideogram4] magic prompt: rewriter output is not JSON; using the raw prompt\n", .{});
+        return .{ .skipped = "rewriter output is not JSON" };
+    }
+    for (report.items()) |w| log.warn("[ideogram4] caption verifier: {s}\n", .{w});
+    const owned = allocator.dupe(u8, stripped) catch return .{ .skipped = "oom" };
+    log.info("[ideogram4] magic prompt: {d} chars -> {d} ({d} verifier warnings)\n", .{ prompt.len, owned.len, report.count });
+    return .{ .caption = owned };
+}
+
 fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute) !void {
     const scheduler = global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
@@ -4048,7 +4164,43 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this media modality. Load the matching image/audio/video/3D model and target it by id.", 400);
         return;
     }
-    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route };
+    // Ideogram 4's magic prompt. Runs HERE — on the connection thread, before
+    // the job is handed to the inference thread — because the rewriter is
+    // itself a generation, and the inference thread is single-threaded.
+    var rewritten_body: ?[]u8 = null;
+    defer if (rewritten_body) |b| allocator.free(b);
+    var effective_body = body;
+    if (route.modality() == .image) {
+        if (lm.image_engine) |eng| {
+            var mp_model_owned: []u8 = &.{};
+            defer if (mp_model_owned.len != 0) allocator.free(mp_model_owned);
+            const mp = media_mod.parseMagicPromptFields(allocator, body, &mp_model_owned);
+            const wanted = switch (mp.mode) {
+                .off => false,
+                .on => true,
+                .auto => eng.wantsStructuredCaption(),
+            };
+            if (wanted) {
+                const bp = media_mod.promptAndSizeFromGenBody(body);
+                if (bp.prompt.len != 0) {
+                    const res = magicPromptRewrite(allocator, stream.io, bp.prompt, bp.width, bp.height, mp.model);
+                    if (res.caption) |cap| {
+                        defer allocator.free(cap);
+                        if (media_mod.withRewrittenPrompt(allocator, body, cap)) |nb| {
+                            rewritten_body = nb;
+                            effective_body = nb;
+                        } else |err| {
+                            log.warn("[ideogram4] magic prompt: body rewrite failed ({s}); using the raw prompt\n", .{@errorName(err)});
+                        }
+                    } else if (res.skipped) |why| {
+                        log.info("[ideogram4] magic prompt skipped: {s}\n", .{why});
+                    }
+                }
+            }
+        }
+    }
+
+    var job = GenJob{ .allocator = allocator, .conn = stream, .body = effective_body, .lm = lm, .route = route };
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm };
     scheduler.runGeneration(&req) catch |err| switch (err) {
         error.Shutdown => {
