@@ -4326,6 +4326,35 @@ fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// img2img source, decoded once. Used by the magic-prompt rewriter, which
+/// needs the source image BEFORE a `GenJob` exists — `genJobRun` (above)
+/// re-reads `image`/`mode` off the same body on its own when it actually
+/// builds `ImageGenOpts`. Duplicated WORK (one extra base64 decode per
+/// request, cheap relative to vision-encoding or diffusion), not duplicated
+/// logic: both call through `extractJsonString`/`base64DecodeAlloc`, so a
+/// future change to either only has one implementation to track.
+pub const GenBodyImage = struct {
+    /// Raw (still-encoded PNG/JPEG) bytes, plain base64 — the same convention
+    /// `genJobRun` uses for `image`, NOT a `data:...;base64,` URL. Owned;
+    /// caller frees.
+    bytes: []u8,
+    /// false only when `mode` is explicitly `"edit"`.
+    is_variation: bool,
+};
+
+/// Read + base64-decode the `image` field off a generation request body, if
+/// present. Returns null when there's no `image` field or it fails to
+/// base64-decode — callers treat either the same as "no source image".
+pub fn decodeGenBodyImage(allocator: std.mem.Allocator, body: []const u8) ?GenBodyImage {
+    const raw = extractJsonString(body, "image") orelse return null;
+    var is_variation = true;
+    if (extractJsonString(body, "mode")) |m| {
+        if (std.mem.eql(u8, m, "edit")) is_variation = false;
+    }
+    const bytes = base64DecodeAlloc(allocator, raw) catch return null;
+    return .{ .bytes = bytes, .is_variation = is_variation };
+}
+
 /// Parse a "WxH" size string (e.g. "1024x1024", "512x768") → {w,h}, or null.
 fn parseSize(size: []const u8) ?struct { w: u32, h: u32 } {
     const xi = std.mem.indexOfScalar(u8, size, 'x') orelse std.mem.indexOfScalar(u8, size, 'X') orelse return null;

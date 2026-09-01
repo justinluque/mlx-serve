@@ -19,6 +19,15 @@ const std = @import("std");
 /// Sections are `[META]`, `[SYSTEM]`, `[USER]`.
 pub const system_prompt_v1 = @embedFile("data/ideogram4_magic_prompt_v1.txt");
 
+/// mlx-serve's OWN addendum, NOT part of the vendored reference — the vendored
+/// `[USER]` block was written for blank-canvas ideation and has no notion of
+/// an attached source image. Used in place of `[USER]` only when rewriting an
+/// img2img (`mode:"variation"`) request whose source image successfully
+/// decoded AND vision-encoded, so the caption can be grounded in what is
+/// actually in the frame instead of describing a fresh composition that then
+/// fights the renoise schedule trying to preserve the source's layout.
+pub const variation_addendum_v1 = @embedFile("data/ideogram4_magic_prompt_variation_v1.txt");
+
 // ── Section parsing ───────────────────────────────────────────────────────
 
 pub const Sections = struct {
@@ -88,6 +97,22 @@ pub fn buildUserMessage(allocator: std.mem.Allocator, sections: Sections, prompt
         sections.user
     else
         "TARGET IMAGE ASPECT RATIO: {{aspect_ratio}} (width:height).";
+    const with_aspect = try std.mem.replaceOwned(u8, allocator, template, "{{aspect_ratio}}", aspect);
+    defer allocator.free(with_aspect);
+    if (std.mem.indexOf(u8, with_aspect, "{{original_prompt}}") != null) {
+        return std.mem.replaceOwned(u8, allocator, with_aspect, "{{original_prompt}}", prompt);
+    }
+    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ with_aspect, prompt });
+}
+
+/// The user message for a GROUNDED img2img rewrite: `variation_addendum_v1`
+/// with `{{aspect_ratio}}`/`{{original_prompt}}` substituted, in place of the
+/// vendored `[USER]` template. Only call this once vision-encoding of the
+/// source actually succeeded — the addendum tells the model "an image is
+/// attached," so using it without one actually reaching the model produces a
+/// caption grounded in nothing. Caller frees.
+pub fn buildUserMessageForVariation(allocator: std.mem.Allocator, prompt: []const u8, aspect: []const u8) ![]u8 {
+    const template = std.mem.trim(u8, variation_addendum_v1, " \t\r\n");
     const with_aspect = try std.mem.replaceOwned(u8, allocator, template, "{{aspect_ratio}}", aspect);
     defer allocator.free(with_aspect);
     if (std.mem.indexOf(u8, with_aspect, "{{original_prompt}}") != null) {

@@ -438,33 +438,6 @@ struct ImageModelPreset: Identifiable, Hashable {
         works; send JSON yourself to place elements and pick colours by hand.
         """
 
-    /// Our mixed 3/8-bit conversion: attention and MLP at 3-bit, the modulation
-    /// and conditioning projections at 8-bit, embeddings and the output layer
-    /// dense. TWO transformers ship — the unconditional branch is its own
-    /// checkpoint (asymmetric CFG), which is why the download is roughly double
-    /// what a 9.3B model suggests.
-    ///
-    /// 3-bit is the FLOOR for the bulk, and the catalog carries exactly one
-    /// Ideogram pack because of it: a `mixed_2_8` build was published here and
-    /// withdrawn — it renders a woven grid texture at every prompt, seed and
-    /// resolution, while this pack renders the same prompts correctly. The
-    /// converter refuses to mint another one (`MIN_BULK_BITS` in
-    /// `tests/convert_ideogram4.py`).
-    static let ideogram4_mixed_3_8 = ImageModelPreset(
-        id: "justintime47/ideogram_4_mixed_3_8",
-        name: "Ideogram 4 mixed 3/8-bit (~14 GB)",
-        variant: .ideogram4,
-        configName: "ideogram4",
-        repo: "justintime47/Ideogram-4-MLX-Serve-mixed_3_8",
-        approxDownloadGB: 14,
-        approxRAMGB: 12,
-        resolutions: ideogramResolutions,
-        defaultResolution: ideogramResolutions[0],
-        qualityProfiles: ideogramQuality,
-        defaultQuality: .good,
-        description: ideogramDescription
-    )
-
     static let ideogram4_nf4 = ImageModelPreset(
         id: "ideogram-ai/Ideogram-4-nf4",
         name: "Ideogram 4 nf4 (~16 GB)",
@@ -480,31 +453,14 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: ideogramDescription
     )
 
-    static let ideogram4_mixed_4_8 = ImageModelPreset(
-        id: "justintime47/ideogram_4_mixed_4_8",
-        name: "Ideogram 4 mixed 4/8-bit (~20 GB)",
-        variant: .ideogram4,
-        configName: "ideogram4",
-        repo: "justintime47/Ideogram-4-MLX-Serve-mixed_4_8",
-        approxDownloadGB: 20,
-        approxRAMGB: 17,
-        resolutions: ideogramResolutions,
-        defaultResolution: ideogramResolutions[0],
-        qualityProfiles: ideogramQuality,
-        defaultQuality: .good,
-        description: ideogramDescription
-    )
-
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
         .flux2Klein4B_Q4,                              // 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
-        .ideogram4_mixed_3_8,                          // 12
         .ideogram4_nf4,                                // 14
         .krea2Turbo,                                   // 15
-        .ideogram4_mixed_4_8,                          // 17
     ]
 }
 
@@ -1941,9 +1897,10 @@ extension ImageModelPreset {
     var supportsImg2Img: Bool {
         switch variant {
         case .mageFlowTurbo, .mageFlowEditTurbo: return false
-        // The pack ships the VAE DECODER only — there is no encoder to
-        // renoise a source through.
-        case .ideogram4: return false
+        // The Flux2 autoencoder ships BOTH halves and `convert_ideogram4.py`
+        // carries them both into the pack, so the server-side VAE encoder
+        // loads and `mode:"variation"` is a real path — not the
+        // decoder-only pack this was first assumed to be.
         default: return true
         }
     }

@@ -1869,6 +1869,100 @@ fn handleConnection(
         try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
         return;
     }
+    // ── Ideogram 4 magic-prompt-first ordering (image gen routes) ──
+    // The generic `ensureLoaded` right below holds a refcount on the TARGET
+    // model for the rest of this request, including through generation —
+    // that's necessary, but it also makes the target non-evictable from the
+    // moment it loads. `handleGen`'s own magic-prompt block (further down
+    // the call chain) runs its OWN separate rewriter model via its OWN
+    // `ensureLoaded` call — and by the time it runs, the target image model
+    // is already loaded AND pinned. On a machine that can't fit both
+    // resident at once, the rewriter's `ensureLoaded` starves for memory
+    // (nothing is evictable) and fails; magic-prompt then does exactly what
+    // it's designed to do on failure — falls back to the raw, un-rewritten
+    // prompt — silently, which is what this looked like from the outside.
+    //
+    // Fix: for a plausibly-Ideogram-4 target, run the ENTIRE magic-prompt
+    // rewrite (load rewriter, generate, release rewriter) BEFORE the target
+    // model is ever resolved here, so there's nothing pinned yet to starve
+    // it. `arch_hint` is Discovery's own classification (`model_type` off
+    // the checkpoint's config.json — see `model_discovery.zig`), cheap to
+    // peek via `resolveEntry` (no weights touched, same call `ensureLoaded`
+    // uses internally). This is used ONLY to decide ORDERING: the real
+    // "does this engine want a rewrite" gate is still
+    // `eng.wantsStructuredCaption()` against the actually-loaded engine,
+    // unchanged, inside `handleGen`. A stale/wrong peek here (checkpoint
+    // reports `ideogram4` but the real engine ends up different, or vice
+    // versa) can only ever cost wasted rewriter work — it never changes
+    // what gets generated.
+    //
+    // Covers both image routes. `/v1/images/edits` carries its fields in a
+    // multipart form, so it needs converting to our JSON edit body
+    // (`openaiEditFormToJson`) before any of this can read `prompt`/
+    // `magic_prompt`/`image` — done once here and reused verbatim as
+    // `precomputed_body` below (rewritten or not), so the dispatch branch
+    // never re-parses the same multipart body a second time. If the
+    // conversion fails here, it's simply skipped (not surfaced) — the
+    // existing dispatch branch runs the identical conversion again and
+    // reports the real 400, unchanged.
+    var precomputed_body: ?[]u8 = null;
+    defer if (precomputed_body) |b| allocator.free(b);
+    const is_images_gen = std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/generations");
+    const is_images_edit = std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/edits");
+    if (is_images_gen or is_images_edit) {
+        const peeked: ?*model_registry_mod.LoadedModel = registry.resolveEntry(requested_model_id) catch null;
+        if (peeked) |p| {
+            if (std.mem.startsWith(u8, p.arch_hint, "ideogram4")) {
+                var converted_edit_json: ?[]u8 = null;
+                defer if (converted_edit_json) |j| allocator.free(j);
+                const body_for_check: []const u8 = if (is_images_edit) blk: {
+                    const j = media_mod.openaiEditFormToJson(allocator, request_body, request_content_type) catch break :blk "";
+                    converted_edit_json = j;
+                    break :blk j;
+                } else request_body;
+
+                if (body_for_check.len != 0) {
+                    var mp_model_owned: []u8 = &.{};
+                    defer if (mp_model_owned.len != 0) allocator.free(mp_model_owned);
+                    const mp = media_mod.parseMagicPromptFields(allocator, body_for_check, &mp_model_owned);
+                    // `.auto` resolves to `true` here without waiting for the real
+                    // engine: `arch_hint` already says `ideogram4`, and Ideogram
+                    // 4's `wantsStructuredCaption()` is unconditionally true for
+                    // that backend — see its doc comment in `gen.zig`.
+                    const wanted = mp.mode != .off;
+                    var rewrote = false;
+                    if (wanted) {
+                        const bp = media_mod.promptAndSizeFromGenBody(body_for_check);
+                        if (bp.prompt.len != 0 and !ideogram_prompt.looksLikeCaption(bp.prompt)) {
+                            const gen_img = media_mod.decodeGenBodyImage(allocator, body_for_check);
+                            defer if (gen_img) |gi| allocator.free(gi.bytes);
+                            const src_for_rewrite: ?[]const u8 = if (gen_img) |gi| (if (gi.is_variation) gi.bytes else null) else null;
+                            const res = magicPromptRewrite(allocator, stream.io, bp.prompt, bp.width, bp.height, mp.model, src_for_rewrite);
+                            if (res.caption) |cap| {
+                                defer allocator.free(cap);
+                                if (media_mod.withRewrittenPrompt(allocator, body_for_check, cap)) |nb| {
+                                    precomputed_body = nb;
+                                    rewrote = true;
+                                } else |err| {
+                                    log.warn("[ideogram4] magic prompt: body rewrite failed ({s}); using the raw prompt\n", .{@errorName(err)});
+                                }
+                            } else if (res.skipped) |why| {
+                                log.info("[ideogram4] magic prompt skipped: {s}\n", .{why});
+                            }
+                        }
+                    }
+                    // No rewrite happened, but the multipart body is already
+                    // converted — hand that down instead of converting again.
+                    if (!rewrote and is_images_edit) {
+                        if (converted_edit_json) |j| {
+                            precomputed_body = j;
+                            converted_edit_json = null; // ownership moved to precomputed_body
+                        }
+                    }
+                }
+            }
+        }
+    }
     const lm = scheduler.ensureLoaded(requested_model_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
@@ -2000,20 +2094,33 @@ fn handleConnection(
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleGen(allocator, stream, body, lm, .image);
+        // Use the already-rewritten body from the pre-load ordering step
+        // above when we have one — `handleGen`'s own magic-prompt block
+        // will see a prompt that already looks like a structured caption
+        // (`ideogram_prompt.looksLikeCaption`) and no-op cleanly, so this
+        // never double-rewrites.
+        try handleGen(allocator, stream, precomputed_body orelse body, lm, .image);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/edits")) {
         // OpenAI's image-EDIT surface: multipart/form-data, not JSON. Translated
         // into the `/v1/images/generations` edit body (gen.openaiEditFormToJson)
         // and served by the identical path — no second inference route.
-        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
-        const ct = findHeaderValue(request[0..header_end], "content-type") orelse "";
-        const body = request[header_end + 4 .. total_read];
-        const json = media_mod.openaiEditFormToJson(allocator, body, ct) catch |err| {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", media_mod.editFormErrorMessage(err), 400);
-            return;
-        };
-        defer allocator.free(json);
-        try handleGen(allocator, stream, json, lm, .image);
+        //
+        // `precomputed_body` from the pre-load ordering step above, when
+        // set, is already this exact conversion (rewritten or not) —
+        // reuse it instead of re-parsing the same multipart body.
+        if (precomputed_body) |pb| {
+            try handleGen(allocator, stream, pb, lm, .image);
+        } else {
+            const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+            const ct = findHeaderValue(request[0..header_end], "content-type") orelse "";
+            const body = request[header_end + 4 .. total_read];
+            const json = media_mod.openaiEditFormToJson(allocator, body, ct) catch |err| {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", media_mod.editFormErrorMessage(err), 400);
+                return;
+            };
+            defer allocator.free(json);
+            try handleGen(allocator, stream, json, lm, .image);
+        }
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/speech")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -4048,6 +4155,19 @@ fn genJobRun(ctx: *anyopaque) void {
 /// loaded, a model that will not load, a rewrite that comes back unparseable.
 /// A rewriter is a quality lever, and a 503 instead of a slightly-worse image
 /// is a bad trade for a field the caller may not even know exists.
+///
+/// img2img grounding: when `src_image` is set (an img2img "variation"
+/// request) AND the resolved rewriter model has a loaded vision tower, the
+/// source is decoded and vision-encoded through the SAME machinery
+/// `/v1/chat/completions` uses for image messages (`processVisionImages`,
+/// `insertMultimodalTokens`, `computeQwenMrope`) and the caption is built
+/// from `variation_addendum_v1` instead of the vendored `[USER]` block, so
+/// `compositional_deconstruction`'s bboxes describe what is actually in the
+/// frame instead of a fresh composition that then fights the renoise
+/// schedule. Any failure along that path (no vision tower, decode failure,
+/// encode failure) falls back to skipping the rewrite entirely rather than
+/// emitting a caption that talks about an attached image the model never
+/// actually saw.
 const MagicPromptResult = struct {
     /// Owned caption, or null when nothing was rewritten.
     caption: ?[]u8 = null,
@@ -4067,6 +4187,9 @@ fn magicPromptRewrite(
     width: u32,
     height: u32,
     model_id: []const u8,
+    /// img2img source (raw, still-encoded PNG/JPEG bytes), or null for
+    /// txt2img / edit-mode requests. Borrowed.
+    src_image: ?[]const u8,
 ) MagicPromptResult {
     if (ideogram_prompt.looksLikeCaption(prompt)) return .{ .skipped = "prompt is already a structured caption" };
     const sch = global_scheduler orelse return .{ .skipped = "scheduler not ready" };
@@ -4086,24 +4209,96 @@ fn magicPromptRewrite(
     const sections = ideogram_prompt.parseSections(ideogram_prompt.system_prompt_v1);
     const aspect = ideogram_prompt.aspectRatio(allocator, width, height) catch return .{ .skipped = "oom" };
     defer allocator.free(aspect);
-    const user_msg = ideogram_prompt.buildUserMessage(allocator, sections, prompt, aspect) catch return .{ .skipped = "oom" };
+
+    // Decode the source (CPU-only, cheap) if this is an img2img request AND
+    // the rewriter model actually has a vision tower loaded — most default
+    // chat models won't. Decode failure or no vision tower just means an
+    // ungrounded (vendored-template) rewrite, same as txt2img.
+    var img_data: ?chat_mod.ImageData = null;
+    defer if (img_data) |d| allocator.free(d.pixels);
+    if (src_image) |raw| {
+        if (lm.vision_encoder != null) {
+            const vp = visionPreprocFromConfig(config);
+            img_data = decodeImageToPixels(allocator, raw, vp);
+            if (img_data == null) log.warn("[ideogram4] magic prompt: could not decode source image; grounding on text only\n", .{});
+        }
+    }
+    const grounded = img_data != null;
+
+    const user_msg = if (grounded)
+        ideogram_prompt.buildUserMessageForVariation(allocator, prompt, aspect) catch return .{ .skipped = "oom" }
+    else
+        ideogram_prompt.buildUserMessage(allocator, sections, prompt, aspect) catch return .{ .skipped = "oom" };
     defer allocator.free(user_msg);
 
+    var img_slice = [_]chat_mod.ImageData{if (grounded) img_data.? else undefined};
     const messages = [_]chat_mod.Message{
         .{ .role = "system", .content = sections.system },
-        .{ .role = "user", .content = user_msg },
+        .{ .role = "user", .content = user_msg, .images = if (grounded) img_slice[0..] else null },
     };
+
+    // Vision-encode BEFORE templating: on failure this bails out entirely
+    // (falls back to no rewrite) rather than templating a "an image is
+    // attached" caption whose image never actually reached the model.
+    var vision_arr: ?mlx.mlx_array = null;
+    defer {
+        if (vision_arr) |v| {
+            _ = mlx.mlx_array_free(v);
+        }
+    }
+    var vision_key: u64 = 0;
+    var n_vis: usize = 0;
+    if (grounded) {
+        var n_vid: usize = 0;
+        var n_aud: usize = 0;
+        vision_arr = processVisionImages(allocator, lm, lm.vision_encoder.?, &messages, &n_vis, &n_vid, &n_aud, &vision_key) catch |err| {
+            log.warn("[ideogram4] magic prompt: vision encode failed ({s}); skipping the rewrite\n", .{@errorName(err)});
+            return .{ .skipped = "vision encode failed" };
+        };
+        if (vision_arr == null) return .{ .skipped = "vision encode produced nothing" };
+    }
+
     // `thinking_mode: disabled` in the prompt file's [META] block is not a
     // suggestion — the output contract is one minified JSON object, and a
     // reasoning preamble is what a fence-stripper cannot rescue.
-    const prompt_ids = cachedFormatChat(allocator, io, lm, tok, chat_config, &messages, null, null, false, null, false) catch |err| {
+    const prompt_ids_raw = cachedFormatChat(allocator, io, lm, tok, chat_config, &messages, null, null, false, null, false) catch |err| {
         log.warn("[ideogram4] magic prompt: template render failed ({s})\n", .{@errorName(err)});
         return .{ .skipped = "template render failed" };
     };
+    var prompt_ids = prompt_ids_raw;
+    if (grounded) {
+        const expanded = insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, 0, config.audio_token_id, 0, config, &messages) catch |err| {
+            log.warn("[ideogram4] magic prompt: image-token insert failed ({s}); skipping the rewrite\n", .{@errorName(err)});
+            allocator.free(prompt_ids_raw);
+            return .{ .skipped = "image-token insert failed" };
+        };
+        allocator.free(prompt_ids_raw);
+        prompt_ids = expanded;
+    }
     defer allocator.free(prompt_ids);
+
+    // Qwen3-VL interleaved M-RoPE: no-op (empty bundle) for non-Qwen-vision
+    // rewriter models or when this isn't a grounded request.
+    const local_mrope: MropeData = if (grounded) (computeQwenMrope(allocator, prompt_ids, &messages, config) catch MropeData{}) else MropeData{};
+    var mrope_pos = local_mrope.pos;
+    defer if (mrope_pos) |p| allocator.free(p);
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| sch.complete(s);
+    // Ownership of `vision_arr`/`local_mrope.pos` transfers to the slot the
+    // moment they're handed to `submit` — disarm the defers above BEFORE the
+    // call (mirrors the `ve_local`/`slot_ve` handoff in the chat-completions
+    // paths), trusting `submit`'s own error paths to free them on failure.
+    const submit_ve: ?mlx.mlx_array = blk: {
+        const v = vision_arr;
+        vision_arr = null;
+        break :blk v;
+    };
+    const submit_mrope_pos: ?[]const i32 = blk: {
+        const p = mrope_pos;
+        mrope_pos = null;
+        break :blk p;
+    };
     slot_handle = sch.submit(.{
         .model = lm,
         .prompt_ids = prompt_ids,
@@ -4116,6 +4311,11 @@ fn magicPromptRewrite(
         .eos_token_ids = config.eosTokenSlice(),
         .max_tokens = MAGIC_PROMPT_MAX_TOKENS,
         .timeout_ns = getTimeoutNs(),
+        .vision_embeddings = submit_ve,
+        .vision_key = vision_key,
+        .mrope_pos = submit_mrope_pos,
+        .mrope_total = local_mrope.total,
+        .mrope_delta = local_mrope.delta,
     }) catch |err| {
         log.warn("[ideogram4] magic prompt: submit failed ({s})\n", .{@errorName(err)});
         return .{ .skipped = "rewriter submit failed" };
@@ -4183,7 +4383,21 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
             if (wanted) {
                 const bp = media_mod.promptAndSizeFromGenBody(body);
                 if (bp.prompt.len != 0) {
-                    const res = magicPromptRewrite(allocator, stream.io, bp.prompt, bp.width, bp.height, mp.model);
+                    // img2img source, so the rewriter can ground
+                    // `compositional_deconstruction` on what is actually in
+                    // the frame instead of inventing a fresh composition.
+                    // Read once here — `genJobRun` re-reads `image`/`mode`
+                    // off the same body on its own when it builds
+                    // `ImageGenOpts`; see `GenBodyImage`'s doc comment for
+                    // why that duplication is fine. Edit mode (FLUX.2
+                    // in-context reference) is a different conditioning
+                    // mechanism with its own concerns — out of scope here,
+                    // so only "variation" gets a source passed to the
+                    // rewriter.
+                    const gen_img = media_mod.decodeGenBodyImage(allocator, body);
+                    defer if (gen_img) |gi| allocator.free(gi.bytes);
+                    const src_for_rewrite: ?[]const u8 = if (gen_img) |gi| (if (gi.is_variation) gi.bytes else null) else null;
+                    const res = magicPromptRewrite(allocator, stream.io, bp.prompt, bp.width, bp.height, mp.model, src_for_rewrite);
                     if (res.caption) |cap| {
                         defer allocator.free(cap);
                         if (media_mod.withRewrittenPrompt(allocator, body, cap)) |nb| {
