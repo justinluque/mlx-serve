@@ -1,0 +1,12 @@
+TARGET IMAGE ASPECT RATIO: {{aspect_ratio}} (width:height).
+
+An image is attached: the CURRENT state of the picture, before this edit.
+
+Build `compositional_deconstruction` from what is ACTUALLY VISIBLE in the
+attached image — not an invented composition. Every element's `bbox` must
+match where that element already sits in the frame, on the 0-1000 grid
+described above. Elements the instruction below does not target should
+describe the attached image as it already is; elements it does target should
+describe the frame once the change is applied.
+
+Edit instruction: {{original_prompt}}
