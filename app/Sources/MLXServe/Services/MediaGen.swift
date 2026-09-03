@@ -438,14 +438,23 @@ struct ImageModelPreset: Identifiable, Hashable {
         works; send JSON yourself to place elements and pick colours by hand.
         """
 
-    static let ideogram4_nf4 = ImageModelPreset(
-        id: "ideogram-ai/Ideogram-4-nf4",
-        name: "Ideogram 4 nf4 (~16 GB)",
+    // Converted with `tests/convert_ideogram4.py --precision mixed_3_8` from
+    // the upstream FP8 release (NF4 dequant needs a CUDA host for
+    // `bitsandbytes` — there is no way to unpack it on Apple Silicon, so FP8
+    // is the source every mirror is built from). `mixed_3_8` is the only
+    // preset the catalog ships: it is sized to fit a 24 GB Mac with 6 GB not
+    // guaranteed by the system, with headroom left for activations. A
+    // `mixed_2_8` pack was tried and withdrawn — 2-bit affine on the DiT bulk
+    // renders a woven-grid artifact at every prompt (`MIN_BULK_BITS` in the
+    // converter refuses it now), so a smaller download is not on offer.
+    static let ideogram4_mixed_3_8 = ImageModelPreset(
+        id: "justintime47/ideogram-4-mixed-3-8",
+        name: "Ideogram 4 mixed 3/8-bit (~13 GB)",
         variant: .ideogram4,
         configName: "ideogram4",
-        repo: "ideogram-ai/ideogram-4-nf4",
-        approxDownloadGB: 16,
-        approxRAMGB: 14,
+        repo: "justintime47/Ideogram-4-MLX-Serve-mixed_3_8",
+        approxDownloadGB: 13,
+        approxRAMGB: 18,
         resolutions: ideogramResolutions,
         defaultResolution: ideogramResolutions[0],
         qualityProfiles: ideogramQuality,
@@ -459,7 +468,7 @@ struct ImageModelPreset: Identifiable, Hashable {
         .flux2Klein4B_Q4,                              // 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
-        .ideogram4_nf4,                                // 14
+        .ideogram4_mixed_3_8,                          // 13
         .krea2Turbo,                                   // 15
     ]
 }

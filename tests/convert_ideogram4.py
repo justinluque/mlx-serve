@@ -3,28 +3,66 @@
 
     python tests/convert_ideogram4.py \
         --src ideogram-ai/ideogram-4-fp8 \
-        --out ~/.mlx-serve/models/ddalcu/Ideogram-4-MLX-Serve-mixed \
-        --precision mixed
+        --out ~/.mlx-serve/models/justintime47/Ideogram-4-MLX-Serve-mixed_3_8 \
+        --precision mixed_3_8
 
-Reads either published quantization (weight-only FP8 with per-row scales, or
-bitsandbytes NF4), dequantizes to bf16, and re-quantizes with `mx.quantize`
-into the affine layout `flux.QLinear` / `ideogram4.IgLinear` read.
+FP8 is the canonical source. NF4 dequant only exists inside `bitsandbytes`,
+which needs a CUDA host — there is no way to unpack a bitsandbytes NF4
+checkpoint on Apple Silicon, so `--src ideogram-ai/ideogram-4-nf4` dead-ends
+here with a named error pointing at the FP8 repo instead. Both are read the
+same way otherwise: weight-only quantization, dequantized to bf16 tensor by
+tensor, then re-quantized with `mx.quantize` into the affine layout
+`flux.QLinear` / `ideogram4.IgLinear` read.
 
-`--precision`:
+Sizes below are the WHOLE pack — both transformers, the text encoder and the
+VAE — from `estimate_pack_bytes`, which the self-test pins in the same order.
 
-  4       every projection at 4-bit, ~7.5 GB. Smallest.
-  8       every projection at 8-bit, ~13 GB. The reference point.
-  mixed   the bulk (attention + MLP, ~8.7B of the 9.3B) at 4-bit, the
-          modulation and conditioning projections at 8-bit, and everything
-          small enough not to matter left dense bf16. ~8.5 GB.
+`--precision` (a mixed name reads bulk_sensitive; the text encoder's width is
+per policy below, and `--bulk-bits`/`--sensitive-bits`/`--te-bits` override
+any tier of a mixed policy):
 
-The mixed policy is not a guess about which tensors "matter" in general — it
-is about which ones are cheap. `adaln_modulation` is 320M parameters whose
-output is a per-layer SCALE and a tanh GATE, so its error is multiplicative
-over the whole residual stream rather than averaged into one projection (the
-same reason mlx-serve's MageFlow notes flag `img_mod`/`txt_mod` at 4-bit); the
-embedding, timestep and final-layer projections together are under 30M, so
-holding them at bf16 costs ~60 MB and removes them as suspects entirely.
+  3         every projection at 3-bit, ~11 GB. Noticeably softer text
+            rendering than 4-bit.
+  4         every projection at 4-bit, ~14 GB. Smallest well-tested flat
+            point.
+  8         every projection at 8-bit, ~27 GB. The reference point.
+  mixed     the bulk (attention + MLP, ~8.7B of the 9.3B per transformer) at
+            4-bit, the modulation and conditioning projections at 8-bit,
+            everything small enough not to matter left dense bf16, text
+            encoder 8-bit. ~18 GB.
+  mixed_3_8 bulk 3-bit, sensitive tier still 8-bit, text encoder 4-bit.
+            ~13 GB — THE PRESET: fits a 24 GB Mac with 6 GB not guaranteed by
+            the system (~18 GB usable), with headroom left for activations
+            and everything else running.
+
+2-bit on the bulk is NOT offered. A `mixed_2_8` pack was published and
+withdrawn: 2-bit affine on the DiT bulk renders a woven grid texture at every
+prompt, seed and resolution — indistinguishable from a wrong patch packing or
+a scrambled MRoPE table from the outside, and the check that settles it is
+the SAME prompt on a pack at a different width (`docs/gotchas/models-media.md`).
+`MIN_BULK_BITS` refuses `--bulk-bits 2` by name rather than shipping a pack
+that does not render.
+
+The mixed policies are not a guess about which tensors "matter" in general —
+they are about which ones are cheap, and it independently matches the
+per-layer precision map QuantFunc ships for their CUDA engine
+(`Ideogram-4-Series/config.json`: block attention/MLP at 4-bit, non-block
+projections at 8-bit, `adaln_modulation` held out of quantization entirely).
+`adaln_modulation` is 320M parameters whose output is a per-layer SCALE and a
+tanh GATE, so its error is multiplicative over the whole residual stream
+rather than averaged into one projection (the same reason mlx-serve's
+MageFlow notes flag `img_mod`/`txt_mod` at 4-bit); the embedding, timestep and
+final-layer projections together are under 30M, so holding them at bf16 costs
+~60 MB and removes them as suspects entirely. The sensitive tier stays at
+8-bit in EVERY mixed policy rather than tracking the bulk down: it is 1.13B
+parameters across the two transformers, so 8-bit instead of 6 costs 0.28 GB —
+2% of the smallest pack, and the tier a low-bit bulk most needs protecting
+from. The bits worth arguing about are the bulk (17.4B total) and the text
+encoder (6.6B, a third of the download on its own), which is why `mixed_3_8`
+spends its budget by taking the encoder to 4-bit — the width the shipped flat
+`--precision 4` pack already runs it at — rather than by shaving the tier
+that protects glyph shape and prompt adherence. See `te_bits_for` and
+`apply_overrides`.
 
 TWO transformers are converted: the conditional one and its own separate
 unconditional checkpoint (asymmetric CFG). Both get the same policy.
@@ -43,14 +81,12 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
 import re
 import shutil
 import sys
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
 import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
@@ -64,10 +100,10 @@ BULK_SUFFIXES = (
     ".feed_forward.w2",
     ".feed_forward.w3",
 )
-# Held at 8-bit under `mixed` — see the module docstring.
+# Held at 8-bit under every mixed policy — see the module docstring.
 SENSITIVE_MODULES = (".adaln_modulation", "llm_cond_proj")
-# Left dense under `mixed`: small, and every one of them is either an input
-# embedding or the output projection.
+# Left dense under every mixed policy: small, and every one of them is either
+# an input embedding or the output projection.
 DENSE_MODULES = (
     "input_proj",
     "t_embedding.mlp_in",
@@ -233,7 +269,7 @@ def dequantize(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
                 continue
             if v.dtype == torch.uint8 and (k + ".absmax") in state:
                 qs = bnbf.QuantState.from_dict(
-                    {kk[len(k) + 1 :]: vv for kk, vv in state.items() if kk.startswith(k + ".")},
+                    {kk[len(k) + 1 :]: state[kk] for kk in state if kk.startswith(k + ".")},
                     device="cpu",
                 )
                 out[k] = bnbf.dequantize_4bit(v, qs).to(torch.bfloat16)
@@ -253,18 +289,107 @@ def to_mx(t: torch.Tensor) -> mx.array:
 
 # ── quantization policy ───────────────────────────────────────────────────
 
+# 2-bit affine on the DiT bulk does not render — see the module docstring and
+# docs/gotchas/models-media.md. `--bulk-bits` below this is a refusal, not a
+# documented small option.
+MIN_BULK_BITS = 3
+
+# Name reads bulk_sensitive. The sensitive tier stays at 8-bit in EVERY
+# policy; `other` covers everything not in BULK_SUFFIXES/SENSITIVE_MODULES/
+# DENSE_MODULES — small tensors that aren't worth a dedicated bucket, held at
+# the same width as the sensitive one. `te` is the Qwen3-VL text encoder's
+# own width, independent of the DiT bulk (see the module docstring).
+BASE_POLICIES: dict[str, dict[str, int]] = {
+    "mixed": {"bulk": 4, "sensitive": 8, "other": 8, "te": 8},
+    "mixed_3_8": {"bulk": 3, "sensitive": 8, "other": 8, "te": 4},
+}
+# The live table: `apply_overrides` rewrites the selected policy in place from
+# `--bulk-bits`/`--sensitive-bits`/`--te-bits`, so any point in the space is
+# reachable without minting another named policy for it.
+MIXED_POLICIES: dict[str, dict[str, int]] = {k: dict(v) for k, v in BASE_POLICIES.items()}
+
+
+def apply_overrides(precision: str, bulk: int | None, sensitive: int | None, te: int | None) -> dict[str, int]:
+    """Fold per-tier CLI overrides into the named policy IN PLACE. Mixed
+    policies only — a flat precision has no tiers to override, and silently
+    ignoring the flags would ship a pack that does not match what was asked
+    for. Raises ValueError rather than exiting, so the self-test can probe a
+    refusal without killing the process."""
+    policy = MIXED_POLICIES.get(precision)
+    if policy is None:
+        if bulk is not None or sensitive is not None or te is not None:
+            raise ValueError(
+                f"--bulk-bits/--sensitive-bits/--te-bits need a mixed policy; "
+                f"--precision {precision} quantizes everything at one width"
+            )
+        return {}
+    if bulk is not None:
+        if bulk < MIN_BULK_BITS:
+            raise ValueError(
+                f"--bulk-bits {bulk}: a {bulk}-bit DiT bulk renders a woven-grid "
+                f"artifact, not an image (measured on the withdrawn mixed_2_8 "
+                f"pack) — {MIN_BULK_BITS} is the floor"
+            )
+        policy["bulk"] = bulk
+    if sensitive is not None:
+        policy["sensitive"] = sensitive
+        policy["other"] = sensitive
+    if te is not None:
+        policy["te"] = te
+    for k, v in policy.items():
+        if v not in (2, 3, 4, 5, 6, 8):
+            raise ValueError(f"{k} width {v} is not an affine width mlx-serve can read back")
+    return policy
+
 
 def bits_for(module: str, precision: str, default_bits: int) -> int | None:
     """Bit width for a module path, or None to keep it dense bf16."""
-    if precision != "mixed":
+    policy = MIXED_POLICIES.get(precision)
+    if policy is None:
         return default_bits
     if any(module.endswith(s) or module == s for s in DENSE_MODULES):
         return None
     if any(module.endswith(s) or module == s for s in SENSITIVE_MODULES):
-        return 8
+        return policy["sensitive"]
     if any(module.endswith(s) for s in BULK_SUFFIXES):
-        return 4
-    return 8
+        return policy["bulk"]
+    return policy["other"]
+
+
+def te_bits_for(precision: str, default_bits: int) -> int:
+    """Bit width for the Qwen3-VL text encoder: a mixed policy's own `te`
+    width, because the encoder is a THIRD of the download and shrinking only
+    the DiT does not produce a smaller pack — see the module docstring."""
+    policy = MIXED_POLICIES.get(precision)
+    return default_bits if policy is None else policy["te"]
+
+
+# Parameter counts read off the published checkpoint, used ONLY for the size
+# estimate printed at plan time (and the ordering assertion in the self-test).
+# Per transformer — the pack ships TWO, and they are the same geometry.
+DIT_BULK_PARAMS = 8.70e9
+DIT_SENSITIVE_PARAMS = 0.565e9
+DIT_DENSE_PARAMS = 0.030e9
+TE_PARAMS = 6.60e9  # Qwen3-VL-8B minus the dropped vision tower
+VAE_BYTES = 0.17e9
+
+
+def bytes_per_param(bits: int | None, group_size: int = 64) -> float:
+    """Affine layout: `bits/8` packed, plus a bf16 scale and bias per group."""
+    if bits is None:
+        return 2.0
+    return bits / 8 + 4 / group_size
+
+
+def estimate_pack_bytes(precision: str, group_size: int = 64) -> float:
+    default_bits = {"3": 3, "4": 4, "8": 8}.get(precision, 8)
+    dit = (
+        DIT_BULK_PARAMS * bytes_per_param(bits_for(".attention.qkv", precision, default_bits), group_size)
+        + DIT_SENSITIVE_PARAMS * bytes_per_param(bits_for(".adaln_modulation", precision, default_bits), group_size)
+        + DIT_DENSE_PARAMS * bytes_per_param(bits_for("final_layer.linear", precision, default_bits), group_size)
+    )
+    te = TE_PARAMS * bytes_per_param(te_bits_for(precision, default_bits), group_size)
+    return 2 * dit + te + VAE_BYTES
 
 
 def emit_linear(out: dict[str, mx.array], module: str, weight: torch.Tensor, bias: torch.Tensor | None, bits: int | None, group_size: int) -> int:
@@ -387,7 +512,7 @@ def convert_transformer(src: Path, out: Path, subfolder: str, precision: str, de
     gc.collect()
 
 
-def convert_text_encoder(src: Path, out: Path, default_bits: int, group_size: int) -> None:
+def convert_text_encoder(src: Path, out: Path, te_bits: int, group_size: int) -> None:
     """Qwen3-VL-8B, TEXT TOWER ONLY, renamed into the flat layout
     `flux.loadTextEncoderWith` reads.
 
@@ -456,9 +581,9 @@ def convert_text_encoder(src: Path, out: Path, default_bits: int, group_size: in
             # mlx-serve dequantizes this table once at load, so it MUST
             # ship quantized — the loader reads `.scales`/`.biases`
             # unconditionally.
-            emit_linear(tensors, module, w, None, default_bits, group_size)
+            emit_linear(tensors, module, w, None, te_bits, group_size)
         else:
-            emit_linear(tensors, module, w, b, default_bits, group_size)
+            emit_linear(tensors, module, w, b, te_bits, group_size)
         mx.eval(*(v for kk, v in tensors.items() if kk.startswith(module + ".")))
         del w, b
 
@@ -483,11 +608,16 @@ def convert_vae(src: Path, out: Path, group_size: int) -> None:
     n_conv = 0
     for k, v in state.items():
         if VAE_ATTN_RE.match(k):
-            module = k[: -len(".weight")]
+            orig_module = k[: -len(".weight")]
+            # diffusers spells the output projection `to_out.0` (element 0 of
+            # a Sequential[Linear, Dropout]); `flux.loadVae` reads a plain
+            # `to_out.weight` — strip the Sequential index so the emitted key
+            # matches what the engine looks up.
+            module = orig_module[:-2] if orig_module.endswith("to_out.0") else orig_module
             w = v
             if w.ndim == 4:  # some exports ship these as 1x1 Conv2d
                 w = w.reshape(w.shape[0], w.shape[1])
-            emit_linear(tensors, module, w, state.get(module + ".bias"), 8, group_size)
+            emit_linear(tensors, module, w, state.get(orig_module + ".bias"), 8, group_size)
             continue
         if k.endswith(".bias") and VAE_ATTN_RE.match(k[: -len(".bias")] + ".weight"):
             continue
@@ -544,21 +674,131 @@ def chat_framing(src: Path, out: Path) -> tuple[str, str]:
     return prefix, suffix
 
 
+# ── self-test (no checkpoint needed) ────────────────────────────────────────
+
+
+def self_test() -> None:
+    """Unit-test the quantization policy and the size estimate. No torch
+    tensors, no checkpoint — `mx.quantize` on a random probe array is the only
+    GPU-touching call, to prove every affine width the policies can emit is
+    one the engine's loader can solve `(bits, group_size)` back out of."""
+    bulk = "blocks.0.attention.qkv"
+    mlp = "blocks.0.feed_forward.w2"
+    sensitive = "blocks.0.adaln_modulation"
+    cond = "llm_cond_proj"
+    dense = "final_layer.linear"
+
+    # Flat precisions: one width everywhere, including the sensitive/dense
+    # modules — "every projection at N-bit" means every one of them.
+    for p_name, want in (("3", 3), ("4", 4), ("8", 8)):
+        for m in (bulk, mlp, sensitive, cond, dense):
+            assert bits_for(m, p_name, want) == want, (p_name, m)
+        assert te_bits_for(p_name, want) == want
+    print("[self-test] flat precisions OK")
+
+    # Mixed policies: bulk / sensitive / dense-bf16, plus the text encoder.
+    for p_name, b, sens, te in (("mixed", 4, 8, 8), ("mixed_3_8", 3, 8, 4)):
+        assert bits_for(bulk, p_name, 8) == b, p_name
+        assert bits_for(mlp, p_name, 8) == b, p_name
+        assert bits_for(sensitive, p_name, 8) == sens, p_name
+        assert bits_for(cond, p_name, 8) == sens, p_name
+        assert bits_for(dense, p_name, 8) is None, p_name
+        assert te_bits_for(p_name, 8) == te, p_name
+
+    # A 2-bit bulk is refused BY NAME, not silently offered — the withdrawn
+    # mixed_2_8 policy is gone; this is the only thing standing in for it now.
+    try:
+        apply_overrides("mixed_3_8", bulk=2, sensitive=None, te=None)
+        raise AssertionError("--bulk-bits 2 was accepted")
+    except ValueError as e:
+        assert str(MIN_BULK_BITS) in str(e), e
+    finally:
+        MIXED_POLICIES["mixed_3_8"] = dict(BASE_POLICIES["mixed_3_8"])
+
+    # Overrides reach every tier without inventing another named policy.
+    try:
+        apply_overrides("mixed_3_8", bulk=4, sensitive=6, te=8)
+        assert bits_for(bulk, "mixed_3_8", 8) == 4
+        assert bits_for(sensitive, "mixed_3_8", 8) == 6
+        assert bits_for(cond, "mixed_3_8", 8) == 6
+        assert te_bits_for("mixed_3_8", 8) == 8
+    finally:
+        MIXED_POLICIES["mixed_3_8"] = dict(BASE_POLICIES["mixed_3_8"])
+    assert bits_for(bulk, "mixed_3_8", 8) == 3
+
+    # A flat (non-mixed) precision has no tiers: overriding one is refused
+    # rather than silently ignored, since a dropped flag ships a pack that
+    # does not match what was asked for.
+    try:
+        apply_overrides("4", bulk=3, sensitive=None, te=None)
+        raise AssertionError("--bulk-bits on a flat precision was accepted")
+    except ValueError:
+        pass
+    print("[self-test] quantization policy OK")
+
+    # Every width the policies emit must be one the engine can solve back out
+    # of the packed geometry — the loader reads GEOMETRY, never the config
+    # block (`flux.inferQuantGeometry`, `ideogram4.IgLinear.load`).
+    widths = [2, 3, 4, 5, 6, 8]
+    probe = mx.random.normal((128, 512)).astype(mx.bfloat16)
+    for bits in widths:
+        q, sc, _ = mx.quantize(probe, group_size=64, bits=bits)
+        assert 32 * q.shape[1] % probe.shape[1] == 0
+        assert 32 * q.shape[1] // probe.shape[1] == bits, (bits, q.shape)
+        assert probe.shape[1] // sc.shape[1] == 64, (bits, sc.shape)
+    print(f"[self-test] packed geometry solves back at {widths} OK")
+
+    # A smaller policy must produce a smaller PACK.
+    sizes = {p: estimate_pack_bytes(p) for p in ("8", "4", "3", "mixed", "mixed_3_8")}
+    assert sizes["mixed"] < sizes["8"]
+    assert sizes["mixed_3_8"] < sizes["4"]
+    # NOT compared against sizes["3"]: mixed_3_8 keeps the sensitive tier at
+    # 8-bit (a flat 3 does not), so it is a few percent LARGER than flat 3 in
+    # exchange for protecting that tier — smaller-bulk does not mean smaller
+    # pack once a policy holds something back.
+    # The preset must fit a 24 GB Mac with 6 GB not guaranteed by the system —
+    # the whole reason it exists — with real headroom left over for
+    # activations and everything else running.
+    assert sizes["mixed_3_8"] < 16e9, sizes["mixed_3_8"]
+    print("[self-test] pack size ordering OK: " + ", ".join(f"{k}={v / 1e9:.1f}GB" for k, v in sizes.items()))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--src", required=True, help="HF repo id or a local checkpoint dir")
-    ap.add_argument("--out", required=True, help="destination pack directory")
-    ap.add_argument("--precision", choices=("4", "8", "mixed"), default="mixed")
+    ap.add_argument("--src", help="HF repo id or a local checkpoint dir")
+    ap.add_argument("--out", help="destination pack directory")
+    ap.add_argument("--precision", choices=("3", "4", "8", "mixed", "mixed_3_8"), default="mixed_3_8")
     ap.add_argument("--group-size", type=int, default=64)
+    ap.add_argument("--bulk-bits", type=int, help="override a mixed policy's attention/MLP width")
+    ap.add_argument("--sensitive-bits", type=int, help="override a mixed policy's modulation/conditioning width")
+    ap.add_argument("--te-bits", type=int, help="override a mixed policy's text-encoder width")
+    ap.add_argument("--self-test", action="store_true", help="run the policy/size unit tests and exit (no checkpoint needed)")
     args = ap.parse_args()
+    if args.self_test:
+        self_test()
+        return
+    if not args.src or not args.out:
+        ap.error("--src and --out are required")
+
+    # Only read for a flat (non-mixed) precision — bits_for takes the
+    # MIXED_POLICIES branch instead whenever args.precision names one of those.
+    default_bits = {"3": 3, "4": 4, "8": 8}.get(args.precision, 8)
+    # BEFORE resolve_src: a refused width must not cost a multi-GB download.
+    try:
+        apply_overrides(args.precision, args.bulk_bits, args.sensitive_bits, args.te_bits)
+    except ValueError as e:
+        ap.error(str(e))
+    te_bits = te_bits_for(args.precision, default_bits)
 
     src = resolve_src(args.src)
     out = Path(args.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
-    default_bits = 4 if args.precision == "4" else 8
-    log(f"[plan] {src} → {out}  precision={args.precision} group_size={args.group_size}")
+    log(
+        f"[plan] {src} → {out}  precision={args.precision} group_size={args.group_size} "
+        f"text_encoder={te_bits}-bit  (estimated pack ≈ {estimate_pack_bytes(args.precision, args.group_size) / 1e9:.1f} GB)"
+    )
 
-    convert_text_encoder(src, out, default_bits, args.group_size)
+    convert_text_encoder(src, out, te_bits, args.group_size)
     convert_vae(src, out, args.group_size)
     copy_tokenizer(src, out)
     convert_transformer(src, out, "transformer", args.precision, default_bits, args.group_size)
@@ -570,6 +810,7 @@ def main() -> None:
         "_class_name": "Ideogram4Pipeline",
         "source_repo": args.src,
         "precision": args.precision,
+        "widths": MIXED_POLICIES.get(args.precision, {"flat": default_bits}),
         "quantization": {"mode": "affine", "group_size": args.group_size},
     }
     if prefix or suffix:
