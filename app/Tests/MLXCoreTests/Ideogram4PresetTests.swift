@@ -11,15 +11,20 @@ final class Ideogram4PresetTests: XCTestCase {
         ImageModelPreset.all.filter { $0.variant == .ideogram4 }
     }
 
-    /// The catalog ships exactly the pack that RENDERS. A `mixed_2_8` build
-    /// was published here and withdrawn: 2-bit affine on the DiT bulk renders
-    /// a woven grid texture at every prompt, seed and resolution, while
+    /// The catalog ships only packs that RENDER. A `mixed_2_8` build was
+    /// published here and withdrawn: 2-bit affine on the DiT bulk renders a
+    /// woven grid texture at every prompt, seed and resolution, while
     /// `mixed_3_8` renders the same prompts correctly — so 3 bits is the floor
     /// and the converter refuses to mint another one (`MIN_BULK_BITS` in
     /// `tests/convert_ideogram4.py`). A quantization the catalog offers is a
     /// promise that it works; a smaller download is not worth breaking it.
-    func testTheCatalogShipsOnlyThePackThatRenders() {
-        XCTAssertEqual(presets.map(\.repo), ["justintime47/Ideogram-4-MLX-Serve-mixed_3_8"])
+    /// Two sizes ship: `mixed_3_8` for the 24 GB / 6-GB-not-guaranteed floor,
+    /// `mixed_4_8` for a Mac with more headroom to spend on quality.
+    func testTheCatalogShipsOnlyThePacksThatRender() {
+        XCTAssertEqual(presets.map(\.repo), [
+            "justintime47/Ideogram-4-MLX-Serve-mixed_3_8",
+            "justintime47/Ideogram-4-MLX-Serve-mixed_4_8",
+        ])
         for p in ImageModelPreset.all {
             XCTAssertFalse(p.repo.hasSuffix("_2_8"), "\(p.id) is a withdrawn 2-bit pack")
         }

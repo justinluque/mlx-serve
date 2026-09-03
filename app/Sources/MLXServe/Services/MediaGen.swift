@@ -438,15 +438,19 @@ struct ImageModelPreset: Identifiable, Hashable {
         works; send JSON yourself to place elements and pick colours by hand.
         """
 
-    // Converted with `tests/convert_ideogram4.py --precision mixed_3_8` from
-    // the upstream FP8 release (NF4 dequant needs a CUDA host for
-    // `bitsandbytes` — there is no way to unpack it on Apple Silicon, so FP8
-    // is the source every mirror is built from). `mixed_3_8` is the only
-    // preset the catalog ships: it is sized to fit a 24 GB Mac with 6 GB not
-    // guaranteed by the system, with headroom left for activations. A
-    // `mixed_2_8` pack was tried and withdrawn — 2-bit affine on the DiT bulk
-    // renders a woven-grid artifact at every prompt (`MIN_BULK_BITS` in the
-    // converter refuses it now), so a smaller download is not on offer.
+    // Converted with `tests/convert_ideogram4.py` from the upstream FP8
+    // release (NF4 dequant needs a CUDA host for `bitsandbytes` — there is
+    // no way to unpack it on Apple Silicon, so FP8 is the source every
+    // mirror is built from). A `mixed_2_8` pack was tried and withdrawn —
+    // 2-bit affine on the DiT bulk renders a woven-grid artifact at every
+    // prompt (`MIN_BULK_BITS` in the converter refuses it now).
+    //
+    // Two presets: `mixed_3_8` (bulk 3-bit) is sized to fit a 24 GB Mac with
+    // 6 GB not guaranteed by the system, with real headroom left for
+    // activations. `mixed_4_8` (bulk 4-bit, text encoder 8-bit — the
+    // reference `mixed` policy) is the quality point for a Mac with more
+    // headroom to spend; both hold the modulation/conditioning tier at
+    // 8-bit regardless.
     static let ideogram4_mixed_3_8 = ImageModelPreset(
         id: "justintime47/ideogram-4-mixed-3-8",
         name: "Ideogram 4 mixed 3/8-bit (~13 GB)",
@@ -462,6 +466,21 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: ideogramDescription
     )
 
+    static let ideogram4_mixed_4_8 = ImageModelPreset(
+        id: "justintime47/ideogram-4-mixed-4-8",
+        name: "Ideogram 4 mixed 4/8-bit (~19 GB)",
+        variant: .ideogram4,
+        configName: "ideogram4",
+        repo: "justintime47/Ideogram-4-MLX-Serve-mixed_4_8",
+        approxDownloadGB: 19,
+        approxRAMGB: 24,
+        resolutions: ideogramResolutions,
+        defaultResolution: ideogramResolutions[0],
+        qualityProfiles: ideogramQuality,
+        defaultQuality: .good,
+        description: ideogramDescription
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
@@ -470,6 +489,7 @@ struct ImageModelPreset: Identifiable, Hashable {
         .flux2Klein9B_Q4,                              // 10
         .ideogram4_mixed_3_8,                          // 13
         .krea2Turbo,                                   // 15
+        .ideogram4_mixed_4_8,                          // 18
     ]
 }
 
