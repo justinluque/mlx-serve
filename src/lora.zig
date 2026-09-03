@@ -38,20 +38,38 @@
 //! mapping, `Stack.findAll` collects every file's `Ref` for a given module,
 //! and `deltaSum` adds their deltas — the same "sum, don't merge" semantics
 //! as mflux's `FusedLoRALinear`.
+//!
+//! LoKr (LyCORIS Kronecker-product) adapters carry `<module>.lokr_w1`
+//! [p,q] / `<module>.lokr_w2` [r,c] instead of an A/B pair; the weight delta
+//! is ΔW = kron(w1,w2), a full [p·r, q·c] matrix. `deltaLokr` never
+//! materializes it — the standard Kronecker-vec identity lets it compute
+//! `y = reshape((w1 @ reshape(x,[...,q,c])) @ w2ᵀ, [...,p·r])` with two small
+//! matmuls instead. A LoKr `Ref` is just another delta-producing term to
+//! `deltaSum`, so it stacks with ordinary LoRA adapters on the same module
+//! exactly like two LoRAs would — same "sum every attached term" semantics,
+//! only the per-term shape differs. `Ref.kind`/`Entry.kind` selects which
+//! math `delta()` runs; the fused-split fan-out (`Split`, BFL's packed QKV)
+//! is LoRA-only for now — see `deltaLokr`'s doc comment.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 
-/// Non-owning adapter reference installed on a linear layer. `at`/`bt` are
-/// pre-transposed bf16 so the hot path is two plain matmuls.
+pub const Kind = enum { lora, lokr };
+
+/// Non-owning adapter reference installed on a linear layer. For `.lora`,
+/// `at`/`bt` are pre-transposed bf16 A/B so the hot path is two plain
+/// matmuls: `at` [in,r], `bt` [r,out]. For `.lokr`, `at`/`bt` hold the
+/// UNTRANSPOSED Kronecker factors instead: `at` = w1 [p,q], `bt` = w2 [r,c]
+/// (out = p·r, in = q·c) — see `deltaLokr`.
 pub const Ref = struct {
-    at: mlx.mlx_array, // [in, r]
-    bt: mlx.mlx_array, // [r, out]
+    at: mlx.mlx_array,
+    bt: mlx.mlx_array,
     scale: f32,
+    kind: Kind = .lora,
 };
 
-pub const Role = enum { a, b, alpha };
+pub const Role = enum { a, b, w1, w2, alpha };
 pub const KeyInfo = struct { module: []const u8, role: Role, flat: bool = false };
 
 /// Classify one safetensors key: strip a wrapper prefix and a matrix-role
@@ -65,8 +83,9 @@ pub const KeyInfo = struct { module: []const u8, role: Role, flat: bool = false 
 /// export never uses dots in the module portion of the key.
 ///
 /// Suffixes accept diffusers (`lora_A`/`lora_B`), Kohya (`lora_down`/
-/// `lora_up`), and the dotted `lora.down`/`lora.up` variant, each with an
-/// optional PEFT `.default.` adapter-name infix. `to_out.0` is normalized to
+/// `lora_up`), the dotted `lora.down`/`lora.up` variant (each with an
+/// optional PEFT `.default.` adapter-name infix), and LyCORIS LoKr
+/// (`lokr_w1`/`lokr_w2` — no `.default.` infix in the wild). `to_out.0` is normalized to
 /// `to_out` (dotted keys) / `to_out_0` is normalized to `to_out` (flat keys)
 /// so both forms line up with the single `to_out` linear on every backend.
 pub fn parseKey(key: []const u8) ?KeyInfo {
@@ -96,6 +115,8 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
         .{ ".lora_up.weight", Role.b },
         .{ ".lora.up.default.weight", Role.b },
         .{ ".lora.up.weight", Role.b },
+        .{ ".lokr_w1", Role.w1 },
+        .{ ".lokr_w2", Role.w2 },
         .{ ".alpha", Role.alpha },
     };
     inline for (suffixes) |sf| {
@@ -408,19 +429,83 @@ pub fn canonicalize(
 }
 
 /// y_delta = scale · (x @ at) @ bt, returned in x's dtype.
-pub fn delta(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
-    const dt = mlx.mlx_array_dtype(x);
+fn deltaLora(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
     var xa = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(xa);
     try mlx.check(mlx.mlx_matmul(&xa, x, ref.at, s));
     var xb = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(xb);
     try mlx.check(mlx.mlx_matmul(&xb, xa, ref.bt, s));
-    const sc = mlx.mlx_array_new_float(ref.scale);
+    return scaleAndCast(xb, ref.scale, mlx.mlx_array_dtype(x), s);
+}
+
+/// LoKr's ΔW = kron(w1,w2) is the full [p·r, q·c] matrix (w1 [p,q], w2
+/// [r,c]) — never materialized. The Kronecker-vec identity
+/// `kron(A,B) @ vec(X) = vec(B @ X @ Aᵀ)` (for X's columns stacked) reduces
+/// to, in the row-major/right-multiply convention `y = x @ ΔWᵀ` this codebase
+/// uses everywhere else:
+///
+///     y = reshape( (w1 @ reshape(x, [..., q, c])) @ w2ᵀ, [..., p·r] )
+///
+/// i.e. split x's last axis (in = q·c) into [q,c], left-multiply by w1
+/// (contracting q), right-multiply by w2ᵀ (contracting c), flatten back to
+/// p·r. `mlx_matmul` broadcasts a plain 2-D array against any batch of
+/// leading dims on the other operand (the same rule `deltaLora`'s `x @ at`
+/// already relies on), so no explicit batch loop is needed.
+fn deltaLokr(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
+    const w1 = ref.at; // [p, q]
+    const w2 = ref.bt; // [r, c]
+    const w1_shape = mlx.getShape(w1);
+    const w2_shape = mlx.getShape(w2);
+    const p = w1_shape[0];
+    const q = w1_shape[1];
+    const r = w2_shape[0];
+    const c = w2_shape[1];
+
+    const x_shape = mlx.getShape(x); // [..., in], in == q*c
+    const lead = x_shape.len - 1;
+    var split_buf: [8]c_int = undefined;
+    std.debug.assert(lead + 2 <= split_buf.len);
+    @memcpy(split_buf[0..lead], x_shape[0..lead]);
+    split_buf[lead] = q;
+    split_buf[lead + 1] = c;
+    const split_shape = split_buf[0 .. lead + 2];
+
+    var xr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xr);
+    try mlx.check(mlx.mlx_reshape(&xr, x, split_shape.ptr, split_shape.len, s));
+
+    var ax = mlx.mlx_array_new(); // [..., p, c]
+    defer _ = mlx.mlx_array_free(ax);
+    try mlx.check(mlx.mlx_matmul(&ax, w1, xr, s));
+
+    const t_axes = [_]c_int{ 1, 0 };
+    var w2t = mlx.mlx_array_new(); // [c, r]
+    defer _ = mlx.mlx_array_free(w2t);
+    try mlx.check(mlx.mlx_transpose_axes(&w2t, w2, &t_axes, 2, s));
+
+    var axb = mlx.mlx_array_new(); // [..., p, r]
+    defer _ = mlx.mlx_array_free(axb);
+    try mlx.check(mlx.mlx_matmul(&axb, ax, w2t, s));
+
+    var merge_buf: [8]c_int = undefined;
+    @memcpy(merge_buf[0..lead], x_shape[0..lead]);
+    merge_buf[lead] = p * r;
+    const merge_shape = merge_buf[0 .. lead + 1];
+
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_reshape(&y, axb, merge_shape.ptr, merge_shape.len, s));
+
+    return scaleAndCast(y, ref.scale, mlx.mlx_array_dtype(x), s);
+}
+
+fn scaleAndCast(x: mlx.mlx_array, scale: f32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sc = mlx.mlx_array_new_float(scale);
     defer _ = mlx.mlx_array_free(sc);
     var scaled = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(scaled);
-    try mlx.check(mlx.mlx_multiply(&scaled, xb, sc, s));
+    try mlx.check(mlx.mlx_multiply(&scaled, x, sc, s));
     if (mlx.mlx_array_dtype(scaled) != dt) {
         var back = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(back);
@@ -429,6 +514,14 @@ pub fn delta(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
         return back;
     }
     return scaled;
+}
+
+/// One attached adapter's delta, dispatched by `ref.kind`.
+pub fn delta(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
+    return switch (ref.kind) {
+        .lora => deltaLora(x, ref, s),
+        .lokr => deltaLokr(x, ref, s),
+    };
 }
 
 /// Sum of `scale_i · (x @ Aᵀᵢ) @ Bᵀᵢ` over every attached adapter — the
@@ -458,12 +551,14 @@ pub fn deltaSum(x: mlx.mlx_array, refs: []const Ref, s: mlx.mlx_stream) !mlx.mlx
 /// fixed-size array instead of a heap allocation on the hot path.
 pub const MAX_LORAS: usize = 8;
 
-/// One loaded adapter pair, keyed by the module it targets.
+/// One loaded adapter pair, keyed by the module it targets. `at`/`bt` carry
+/// LoRA's A/B or LoKr's w1/w2 depending on `kind` — see `Ref`.
 pub const Entry = struct {
     module: []u8, // owned
-    at: mlx.mlx_array, // [in, r] bf16
-    bt: mlx.mlx_array, // [r, out] bf16
-    scale: f32, // alpha/rank when the file carries alpha, else 1.0
+    at: mlx.mlx_array, // bf16
+    bt: mlx.mlx_array, // bf16
+    scale: f32, // alpha/rank (LoRA) or alpha/w1.shape[0] (LoKr) when the file carries alpha, else 1.0
+    kind: Kind = .lora,
 };
 
 /// All adapters from one safetensors file. Owns the arrays the installed
@@ -527,7 +622,7 @@ pub const Stack = struct {
         var n: usize = 0;
         for (self.files[0..self.count], self.scales[0..self.count]) |*f, user_scale| {
             if (f.find(module)) |e| {
-                out[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
+                out[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale, .kind = e.kind };
                 n += 1;
             }
         }
@@ -538,6 +633,8 @@ pub const Stack = struct {
 const Partial = struct {
     a: mlx.mlx_array = .{ .ctx = null },
     b: mlx.mlx_array = .{ .ctx = null },
+    w1: mlx.mlx_array = .{ .ctx = null }, // LoKr
+    w2: mlx.mlx_array = .{ .ctx = null }, // LoKr
     alpha: ?f32 = null,
     flat: bool = false,
 };
@@ -685,6 +782,8 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         while (it.next()) |e| {
             if (e.value_ptr.a.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.a);
             if (e.value_ptr.b.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.b);
+            if (e.value_ptr.w1.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.w1);
+            if (e.value_ptr.w2.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.w2);
             allocator.free(e.key_ptr.*);
         }
         partials.deinit();
@@ -718,6 +817,14 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
                 if (gop.value_ptr.b.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.b);
                 gop.value_ptr.b = value;
             },
+            .w1 => {
+                if (gop.value_ptr.w1.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.w1);
+                gop.value_ptr.w1 = value;
+            },
+            .w2 => {
+                if (gop.value_ptr.w2.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.w2);
+                gop.value_ptr.w2 = value;
+            },
             .alpha => {
                 gop.value_ptr.alpha = scalarValue(value, s);
                 _ = mlx.mlx_array_free(value);
@@ -737,21 +844,10 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     var it = partials.iterator();
     while (it.next()) |e| {
         const p = e.value_ptr;
-        if (p.a.ctx == null or p.b.ctx == null) continue; // incomplete pair
-        const full_rank: c_int = mlx.getShape(p.a)[0]; // A [r,in]
-        // The down-projection (A) is ALWAYS shared across every target of a
-        // fused source tensor: a LoRA trained over a fused QKV linear has
-        // ONE A applied identically to q/k/v, with only B's *output* rows
-        // split per target (mirrors mflux's `_split_qkv_up` / the shared-A
-        // half of `FusedLoRALinear`). We deliberately do NOT try to guess
-        // "these are secretly three independent rank-r/3 adapters packed
-        // block-diagonally" from the rank being divisible by 3 — that
-        // heuristic has no real signal behind it (24, 48, 96... are
-        // completely ordinary ranks for one shared adapter) and guessing
-        // wrong doesn't error, it silently feeds the DiT a corrupted 1/3-rank
-        // delta. Always sharing A is the correct behavior for every fused
-        // export this module actually targets (BFL/ComfyUI/ai-toolkit).
-        //
+        const is_lora = p.a.ctx != null and p.b.ctx != null;
+        const is_lokr = p.w1.ctx != null and p.w2.ctx != null;
+        if (!is_lora and !is_lokr) continue; // incomplete pair
+
         // Canonicalize the module name(s) for the target architecture. A
         // fused source tensor (e.g. BFL's packed img_attn.qkv) fans out to
         // up to MAX_FANOUT canonical targets — one per `Split` third — and
@@ -760,26 +856,76 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         var canon_bufs: [MAX_FANOUT]CanonBuf = undefined;
         var canon_out: [MAX_FANOUT]CanonMatch = undefined;
         const matches = canonicalize(e.key_ptr.*, p.flat, arch, &canon_bufs, &canon_out);
-        for (matches) |m| {
-            const idx = splitIndex(m.split);
-            const at = try prepTransposed(p.a, s);
-            errdefer _ = mlx.mlx_array_free(at);
-            const bt = if (idx) |i| try prepTransposedThird(p.b, i, s) else try prepTransposed(p.b, s);
-            errdefer _ = mlx.mlx_array_free(bt);
-            // A per-module `.alpha` tensor is MORE SPECIFIC than a file-wide
-            // declaration, so it wins; the file's own metadata is the default
-            // for every module that ships none; 1.0 only when the file
-            // declares nothing anywhere.
+
+        if (is_lora) {
+            const full_rank: c_int = mlx.getShape(p.a)[0]; // A [r,in]
+            // The down-projection (A) is ALWAYS shared across every target of
+            // a fused source tensor: a LoRA trained over a fused QKV linear
+            // has ONE A applied identically to q/k/v, with only B's *output*
+            // rows split per target (mirrors mflux's `_split_qkv_up` / the
+            // shared-A half of `FusedLoRALinear`). We deliberately do NOT try
+            // to guess "these are secretly three independent rank-r/3
+            // adapters packed block-diagonally" from the rank being divisible
+            // by 3 — that heuristic has no real signal behind it (24, 48,
+            // 96... are completely ordinary ranks for one shared adapter) and
+            // guessing wrong doesn't error, it silently feeds the DiT a
+            // corrupted 1/3-rank delta. Always sharing A is the correct
+            // behavior for every fused export this module actually targets
+            // (BFL/ComfyUI/ai-toolkit).
+            for (matches) |m| {
+                const idx = splitIndex(m.split);
+                const at = try prepTransposed(p.a, s);
+                errdefer _ = mlx.mlx_array_free(at);
+                const bt = if (idx) |i| try prepTransposedThird(p.b, i, s) else try prepTransposed(p.b, s);
+                errdefer _ = mlx.mlx_array_free(bt);
+                // A per-module `.alpha` tensor is MORE SPECIFIC than a
+                // file-wide declaration, so it wins; the file's own metadata
+                // is the default for every module that ships none; 1.0 only
+                // when the file declares nothing anywhere.
+                const scale: f32 = if (p.alpha) |al|
+                    al / @as(f32, @floatFromInt(full_rank))
+                else
+                    file_scale orelse 1.0;
+                try entries.append(allocator, .{
+                    .module = try allocator.dupe(u8, m.canon),
+                    .at = at,
+                    .bt = bt,
+                    .scale = scale,
+                    .kind = .lora,
+                });
+            }
+        } else {
+            // LoKr has no A/B "rank" to split an output projection along —
+            // ΔW = kron(w1,w2) is the FULL [out,in] matrix, so slicing a
+            // fused target's output rows the way `prepTransposedThird` does
+            // for LoRA's B would require slicing INSIDE the Kronecker
+            // product, not just one factor. Not implemented: refuse rather
+            // than silently attach a corrupted delta to a fused target.
+            const w1_rows: c_int = mlx.getShape(p.w1)[0]; // w1 [p,q]
+            // LyCORIS' own convention (kohya-ss `lokr.py`): the "rank" a
+            // LoKr's alpha divides by is w1's row count, not the traditional
+            // LoRA rank — there is no lower-rank factor to read one off of.
             const scale: f32 = if (p.alpha) |al|
-                al / @as(f32, @floatFromInt(full_rank))
+                al / @as(f32, @floatFromInt(w1_rows))
             else
                 file_scale orelse 1.0;
-            try entries.append(allocator, .{
-                .module = try allocator.dupe(u8, m.canon),
-                .at = at,
-                .bt = bt,
-                .scale = scale,
-            });
+            for (matches) |m| {
+                if (m.split != .none) {
+                    log.warn("[lora] {s}: LoKr target '{s}' needs a fused-output split, which LoKr does not support yet — skipped\n", .{ std.fs.path.basename(path), m.canon });
+                    continue;
+                }
+                const w1 = try prepBf16(p.w1, s);
+                errdefer _ = mlx.mlx_array_free(w1);
+                const w2 = try prepBf16(p.w2, s);
+                errdefer _ = mlx.mlx_array_free(w2);
+                try entries.append(allocator, .{
+                    .module = try allocator.dupe(u8, m.canon),
+                    .at = w1,
+                    .bt = w2,
+                    .scale = scale,
+                    .kind = .lokr,
+                });
+            }
         }
     }
     return .{ .allocator = allocator, .entries = try entries.toOwnedSlice(allocator) };
@@ -837,6 +983,19 @@ fn prepTransposed(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return out;
 }
 
+/// Materialized bf16 copy, UNTRANSPOSED — LoKr's w1/w2 are used in their
+/// natural [rows,cols] orientation (see `deltaLokr`), unlike LoRA's A/B.
+fn prepBf16(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, w, false, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, c, .bfloat16, s));
+    _ = mlx.mlx_array_eval(out);
+    return out;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════
@@ -868,6 +1027,18 @@ test "parseKey classifies diffusers + kohya LoRA keys and strips wrappers" {
     try testing.expect(parseKey("bn.running_mean") == null);
 }
 
+test "parseKey classifies LyCORIS LoKr keys" {
+    const w1 = parseKey("diffusion_model.layers.0.adaln_modulation.lokr_w1").?;
+    try testing.expectEqual(Role.w1, w1.role);
+    try testing.expectEqualStrings("layers.0.adaln_modulation", w1.module);
+    const w2 = parseKey("diffusion_model.layers.0.attention.qkv.lokr_w2").?;
+    try testing.expectEqual(Role.w2, w2.role);
+    try testing.expectEqualStrings("layers.0.attention.qkv", w2.module);
+    // Same per-module .alpha suffix as LoRA — no LoKr-specific spelling.
+    const al = parseKey("diffusion_model.layers.0.attention.qkv.alpha").?;
+    try testing.expectEqual(Role.alpha, al.role);
+}
+
 test "delta computes scale·(x@Aᵀ)@Bᵀ" {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -891,6 +1062,35 @@ test "delta computes scale·(x@Aᵀ)@Bᵀ" {
     const dd = mlx.mlx_array_data_float32(d) orelse return error.NoData;
     try testing.expectApproxEqAbs(@as(f32, 110), dd[0], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 132), dd[1], 1e-4);
+}
+
+test "deltaLokr computes the Kronecker-vec identity kron(w1,w2)@x by hand" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // w1 [p=2,q=2] = [[1,0],[0,2]], w2 [r=2,c=3] = [[1,2,3],[4,5,6]].
+    // in = q*c = 6, out = p*r = 4. kron(w1,w2) is never built — this expected
+    // vector is computed by the KRONECKER DEFINITION directly (y[a*r+b] =
+    // sum_ij w1[a,i]*w2[b,j]*x[i*c+j]), independently of `deltaLokr`'s own
+    // reshape/matmul derivation, so the two can't share a bug.
+    const w1v = [_]f32{ 1, 0, 0, 2 };
+    const w1s = [_]c_int{ 2, 2 };
+    const w1a = mlx.mlx_array_new_data(&w1v, &w1s, 2, .float32);
+    defer _ = mlx.mlx_array_free(w1a);
+    const w2v = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const w2s = [_]c_int{ 2, 3 };
+    const w2a = mlx.mlx_array_new_data(&w2v, &w2s, 2, .float32);
+    defer _ = mlx.mlx_array_free(w2a);
+    const xv = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const xs = [_]c_int{ 1, 6 }; // batched: [N=1, in=6]
+    const x = mlx.mlx_array_new_data(&xv, &xs, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+
+    const d = try delta(x, .{ .at = w1a, .bt = w2a, .scale = 1.0, .kind = .lokr }, s);
+    defer _ = mlx.mlx_array_free(d);
+    _ = mlx.mlx_array_eval(d);
+    const dd = mlx.mlx_array_data_float32(d) orelse return error.NoData;
+    const want = [_]f32{ 14, 32, 64, 154 };
+    for (want, 0..) |w, i| try testing.expectApproxEqAbs(w, dd[i], 1e-3);
 }
 
 test "deltaSum adds every attached adapter's delta — the whole point of stacking" {
@@ -939,6 +1139,54 @@ test "deltaSum adds every attached adapter's delta — the whole point of stacki
     _ = mlx.mlx_array_eval(one);
     const od = mlx.mlx_array_data_float32(one) orelse return error.NoData;
     try testing.expectApproxEqAbs(@as(f32, 110), od[0], 1e-4);
+}
+
+test "deltaSum stacks a LoRA delta and a LoKr delta on the same module" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // Same LoKr fixture as the identity test: in=6, out=4, delta = [14,32,64,154].
+    const w1v = [_]f32{ 1, 0, 0, 2 };
+    const w1s = [_]c_int{ 2, 2 };
+    const w1a = mlx.mlx_array_new_data(&w1v, &w1s, 2, .float32);
+    defer _ = mlx.mlx_array_free(w1a);
+    const w2v = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const w2s = [_]c_int{ 2, 3 };
+    const w2a = mlx.mlx_array_new_data(&w2v, &w2s, 2, .float32);
+    defer _ = mlx.mlx_array_free(w2a);
+    // A LoRA over the SAME [in=6,out=4] shape, all-ones so its delta is easy
+    // to hand-check: at [6,1] all 1s, bt [1,4] all 1s → x@at = sum(x) = 21,
+    // ·bt = [21,21,21,21].
+    const atv = [_]f32{ 1, 1, 1, 1, 1, 1 };
+    const ats = [_]c_int{ 6, 1 };
+    const at = mlx.mlx_array_new_data(&atv, &ats, 2, .float32);
+    defer _ = mlx.mlx_array_free(at);
+    const btv = [_]f32{ 1, 1, 1, 1 };
+    const bts = [_]c_int{ 1, 4 };
+    const bt = mlx.mlx_array_new_data(&btv, &bts, 2, .float32);
+    defer _ = mlx.mlx_array_free(bt);
+    const xv = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const xs = [_]c_int{ 1, 6 };
+    const x = mlx.mlx_array_new_data(&xv, &xs, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+
+    const refs = [_]Ref{
+        .{ .at = at, .bt = bt, .scale = 1.0 }, // .lora, default kind
+        .{ .at = w1a, .bt = w2a, .scale = 1.0, .kind = .lokr },
+    };
+    const d = try deltaSum(x, &refs, s);
+    defer _ = mlx.mlx_array_free(d);
+    _ = mlx.mlx_array_eval(d);
+    const dd = mlx.mlx_array_data_float32(d) orelse return error.NoData;
+    const want = [_]f32{ 35, 53, 85, 175 }; // [21,21,21,21] + [14,32,64,154]
+    for (want, 0..) |w, i| try testing.expectApproxEqAbs(w, dd[i], 1e-3);
+
+    // Order-independence — same "sum, not merge" guarantee as two LoRAs.
+    const rev = [_]Ref{ refs[1], refs[0] };
+    const d2 = try deltaSum(x, &rev, s);
+    defer _ = mlx.mlx_array_free(d2);
+    _ = mlx.mlx_array_eval(d2);
+    const dd2 = mlx.mlx_array_data_float32(d2) orelse return error.NoData;
+    for (0..4) |i| try testing.expectApproxEqAbs(dd[i], dd2[i], 1e-3);
 }
 
 test "Stack.findAll collects one Ref per file and folds in that file's user scale" {
