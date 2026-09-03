@@ -1126,7 +1126,7 @@ pub fn generateFromCond(
     }
     if (progress) |p| p.emit("Decoding image", run_steps, run_steps);
 
-    const latent = try unpatchify(a, z, grid_h, grid_w, cond.cfg.in_channels, s);
+    const latent = try unpatchify(z, grid_h, grid_w, cond.cfg.in_channels, s);
     _ = mlx.mlx_array_free(z);
     z = .{ .ctx = null };
     defer _ = mlx.mlx_array_free(latent);
@@ -1160,8 +1160,7 @@ pub fn generateFromCond(
 /// The packing order is [ph, pw, channel] — the OPPOSITE of FLUX.2's
 /// [channel, ph, pw], which is why `flux.unpatchify` is not reused here. Same
 /// shapes either way; the wrong one is a 2×2-scrambled image.
-fn unpatchify(a: std.mem.Allocator, z: mlx.mlx_array, grid_h: u32, grid_w: u32, in_channels: u32, s: S) !mlx.mlx_array {
-    _ = a;
+fn unpatchify(z: mlx.mlx_array, grid_h: u32, grid_w: u32, in_channels: u32, s: S) !mlx.mlx_array {
     const patch: c_int = 2;
     const ae_ch: c_int = @intCast(in_channels / 4);
     const shape = [_]c_int{ 1, 1, @intCast(in_channels) };

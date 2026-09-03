@@ -60,7 +60,7 @@ pub const Kind = enum { lora, lokr };
 /// Non-owning adapter reference installed on a linear layer. For `.lora`,
 /// `at`/`bt` are pre-transposed bf16 A/B so the hot path is two plain
 /// matmuls: `at` [in,r], `bt` [r,out]. For `.lokr`, `at`/`bt` hold the
-/// UNTRANSPOSED Kronecker factors instead: `at` = w1 [p,q], `bt` = w2 [r,c]
+/// Kronecker factors instead: `at` = w1 [p,q] untransposed, `bt` = w2ᵀ [c,r]
 /// (out = p·r, in = q·c) — see `deltaLokr`.
 pub const Ref = struct {
     at: mlx.mlx_array,
@@ -69,7 +69,7 @@ pub const Ref = struct {
     kind: Kind = .lora,
 };
 
-pub const Role = enum { a, b, w1, w2, alpha };
+pub const Role = enum { a, b, w1, w2, w1a, w1b, w2a, w2b, alpha };
 pub const KeyInfo = struct { module: []const u8, role: Role, flat: bool = false };
 
 /// Classify one safetensors key: strip a wrapper prefix and a matrix-role
@@ -84,8 +84,11 @@ pub const KeyInfo = struct { module: []const u8, role: Role, flat: bool = false 
 ///
 /// Suffixes accept diffusers (`lora_A`/`lora_B`), Kohya (`lora_down`/
 /// `lora_up`), the dotted `lora.down`/`lora.up` variant (each with an
-/// optional PEFT `.default.` adapter-name infix), and LyCORIS LoKr
-/// (`lokr_w1`/`lokr_w2` — no `.default.` infix in the wild). `to_out.0` is normalized to
+/// optional PEFT `.default.` adapter-name infix), and LyCORIS LoKr in both
+/// its full (`lokr_w1`/`lokr_w2`) and FACTORED (`lokr_w1_a`/`lokr_w1_b`,
+/// `lokr_w2_a`/`lokr_w2_b`) spellings — no `.default.` infix in the wild.
+/// The factored form is what most published LoKr adapters actually ship;
+/// `loadFile` folds each pair back into its factor before use. `to_out.0` is normalized to
 /// `to_out` (dotted keys) / `to_out_0` is normalized to `to_out` (flat keys)
 /// so both forms line up with the single `to_out` linear on every backend.
 pub fn parseKey(key: []const u8) ?KeyInfo {
@@ -117,6 +120,10 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
         .{ ".lora.up.weight", Role.b },
         .{ ".lokr_w1", Role.w1 },
         .{ ".lokr_w2", Role.w2 },
+        .{ ".lokr_w1_a", Role.w1a },
+        .{ ".lokr_w1_b", Role.w1b },
+        .{ ".lokr_w2_a", Role.w2a },
+        .{ ".lokr_w2_b", Role.w2b },
         .{ ".alpha", Role.alpha },
     };
     inline for (suffixes) |sf| {
@@ -449,18 +456,21 @@ fn deltaLora(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
 ///
 /// i.e. split x's last axis (in = q·c) into [q,c], left-multiply by w1
 /// (contracting q), right-multiply by w2ᵀ (contracting c), flatten back to
-/// p·r. `mlx_matmul` broadcasts a plain 2-D array against any batch of
+/// p·r. w2 is stored ALREADY TRANSPOSED (`Ref.bt` is w2ᵀ [c,r], written by
+/// `prepTransposed` at load) so the hot path is two plain matmuls and a
+/// reshape, with no transpose node per call — the same reason LoRA
+/// pre-transposes its A/B. `mlx_matmul` broadcasts a plain 2-D array against any batch of
 /// leading dims on the other operand (the same rule `deltaLora`'s `x @ at`
 /// already relies on), so no explicit batch loop is needed.
 fn deltaLokr(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
     const w1 = ref.at; // [p, q]
-    const w2 = ref.bt; // [r, c]
+    const w2t = ref.bt; // w2ᵀ [c, r] — pre-transposed at load, like LoRA's A/B
     const w1_shape = mlx.getShape(w1);
-    const w2_shape = mlx.getShape(w2);
+    const w2t_shape = mlx.getShape(w2t);
     const p = w1_shape[0];
     const q = w1_shape[1];
-    const r = w2_shape[0];
-    const c = w2_shape[1];
+    const c = w2t_shape[0];
+    const r = w2t_shape[1];
 
     const x_shape = mlx.getShape(x); // [..., in], in == q*c
     const lead = x_shape.len - 1;
@@ -478,11 +488,6 @@ fn deltaLokr(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
     var ax = mlx.mlx_array_new(); // [..., p, c]
     defer _ = mlx.mlx_array_free(ax);
     try mlx.check(mlx.mlx_matmul(&ax, w1, xr, s));
-
-    const t_axes = [_]c_int{ 1, 0 };
-    var w2t = mlx.mlx_array_new(); // [c, r]
-    defer _ = mlx.mlx_array_free(w2t);
-    try mlx.check(mlx.mlx_transpose_axes(&w2t, w2, &t_axes, 2, s));
 
     var axb = mlx.mlx_array_new(); // [..., p, r]
     defer _ = mlx.mlx_array_free(axb);
@@ -633,8 +638,14 @@ pub const Stack = struct {
 const Partial = struct {
     a: mlx.mlx_array = .{ .ctx = null },
     b: mlx.mlx_array = .{ .ctx = null },
-    w1: mlx.mlx_array = .{ .ctx = null }, // LoKr
-    w2: mlx.mlx_array = .{ .ctx = null }, // LoKr
+    w1: mlx.mlx_array = .{ .ctx = null }, // LoKr, full
+    w2: mlx.mlx_array = .{ .ctx = null }, // LoKr, full
+    // LoKr, FACTORED: w1 = w1_a @ w1_b, w2 = w2_a @ w2_b. Most published
+    // adapters ship this form; `loadFile` folds each pair before use.
+    w1_a: mlx.mlx_array = .{ .ctx = null },
+    w1_b: mlx.mlx_array = .{ .ctx = null },
+    w2_a: mlx.mlx_array = .{ .ctx = null },
+    w2_b: mlx.mlx_array = .{ .ctx = null },
     alpha: ?f32 = null,
     flat: bool = false,
 };
@@ -782,8 +793,10 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         while (it.next()) |e| {
             if (e.value_ptr.a.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.a);
             if (e.value_ptr.b.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.b);
-            if (e.value_ptr.w1.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.w1);
-            if (e.value_ptr.w2.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.w2);
+            inline for (.{ "w1", "w2", "w1_a", "w1_b", "w2_a", "w2_b" }) |f| {
+                const arr = @field(e.value_ptr.*, f);
+                if (arr.ctx != null) _ = mlx.mlx_array_free(arr);
+            }
             allocator.free(e.key_ptr.*);
         }
         partials.deinit();
@@ -825,6 +838,22 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
                 if (gop.value_ptr.w2.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.w2);
                 gop.value_ptr.w2 = value;
             },
+            .w1a => {
+                if (gop.value_ptr.w1_a.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.w1_a);
+                gop.value_ptr.w1_a = value;
+            },
+            .w1b => {
+                if (gop.value_ptr.w1_b.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.w1_b);
+                gop.value_ptr.w1_b = value;
+            },
+            .w2a => {
+                if (gop.value_ptr.w2_a.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.w2_a);
+                gop.value_ptr.w2_a = value;
+            },
+            .w2b => {
+                if (gop.value_ptr.w2_b.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.w2_b);
+                gop.value_ptr.w2_b = value;
+            },
             .alpha => {
                 gop.value_ptr.alpha = scalarValue(value, s);
                 _ = mlx.mlx_array_free(value);
@@ -844,9 +873,30 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     var it = partials.iterator();
     while (it.next()) |e| {
         const p = e.value_ptr;
+        // Fold any FACTORED LoKr factor into the full matrix first, so
+        // everything below sees one shape. A half-factored module (only the
+        // `_a` half present) stays incomplete and is skipped like any other.
+        inline for (.{ .{ "w1", "w1_a", "w1_b" }, .{ "w2", "w2_a", "w2_b" } }) |trip| {
+            const fa = @field(p.*, trip[1]);
+            const fb = @field(p.*, trip[2]);
+            if (@field(p.*, trip[0]).ctx == null and fa.ctx != null and fb.ctx != null) {
+                @field(p.*, trip[0]) = foldFactors(fa, fb, s) catch |err| blk: {
+                    log.warn("[lora] {s}: could not fold {s} ({s})\n", .{ std.fs.path.basename(path), trip[1], @errorName(err) });
+                    break :blk .{ .ctx = null };
+                };
+            }
+        }
         const is_lora = p.a.ctx != null and p.b.ctx != null;
         const is_lokr = p.w1.ctx != null and p.w2.ctx != null;
-        if (!is_lora and !is_lokr) continue; // incomplete pair
+        // A LoKr module that carried keys but never resolved is a SILENT
+        // no-op otherwise — the exact failure this module refuses to ship.
+        if (!is_lora and !is_lokr) {
+            const had_lokr_keys = p.w1.ctx != null or p.w2.ctx != null or
+                p.w1_a.ctx != null or p.w1_b.ctx != null or
+                p.w2_a.ctx != null or p.w2_b.ctx != null;
+            if (had_lokr_keys) log.warn("[lora] {s}: LoKr module '{s}' is missing a factor (w1 and w2 are both required) — skipped\n", .{ std.fs.path.basename(path), e.key_ptr.* });
+            continue; // incomplete pair
+        }
 
         // Canonicalize the module name(s) for the target architecture. A
         // fused source tensor (e.g. BFL's packed img_attn.qkv) fans out to
@@ -916,7 +966,8 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
                 }
                 const w1 = try prepBf16(p.w1, s);
                 errdefer _ = mlx.mlx_array_free(w1);
-                const w2 = try prepBf16(p.w2, s);
+                // w2ᵀ, so `deltaLokr` is two matmuls with no per-call transpose.
+                const w2 = try prepTransposed(p.w2, s);
                 errdefer _ = mlx.mlx_array_free(w2);
                 try entries.append(allocator, .{
                     .module = try allocator.dupe(u8, m.canon),
@@ -983,8 +1034,20 @@ fn prepTransposed(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return out;
 }
 
-/// Materialized bf16 copy, UNTRANSPOSED — LoKr's w1/w2 are used in their
-/// natural [rows,cols] orientation (see `deltaLokr`), unlike LoRA's A/B.
+/// `a @ b` — one factored LoKr factor folded back into the matrix it stands
+/// for (LyCORIS writes `lokr_w1_a`/`lokr_w1_b` instead of a full `lokr_w1`
+/// whenever the factor is itself low-rank, which is the common case). Done
+/// ONCE at load, so the forward path never sees the difference.
+fn foldFactors(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_matmul(&out, a, b, s));
+    _ = mlx.mlx_array_eval(out);
+    return out;
+}
+
+/// Materialized bf16 copy, UNTRANSPOSED — LoKr's w1 is used in its natural
+/// [p,q] orientation (see `deltaLokr`). w2 goes through `prepTransposed`.
 fn prepBf16(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var c = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(c);
@@ -1039,6 +1102,54 @@ test "parseKey classifies LyCORIS LoKr keys" {
     try testing.expectEqual(Role.alpha, al.role);
 }
 
+test "parseKey classifies FACTORED LyCORIS LoKr keys" {
+    // Most published LoKr adapters factor w1 and/or w2 into a low-rank pair
+    // rather than shipping the full matrix. These used to match no suffix at
+    // all, so the keys were dropped, the partial stayed incomplete, and the
+    // file loaded with zero entries and no error — the silent-no-op class this
+    // module exists to prevent.
+    const w1a = parseKey("diffusion_model.layers.0.attention.qkv.lokr_w1_a").?;
+    try testing.expectEqual(Role.w1a, w1a.role);
+    try testing.expectEqualStrings("layers.0.attention.qkv", w1a.module);
+    const w1b = parseKey("diffusion_model.layers.0.attention.qkv.lokr_w1_b").?;
+    try testing.expectEqual(Role.w1b, w1b.role);
+    const w2a = parseKey("diffusion_model.layers.0.feed_forward.w1.lokr_w2_a").?;
+    try testing.expectEqual(Role.w2a, w2a.role);
+    try testing.expectEqualStrings("layers.0.feed_forward.w1", w2a.module);
+    const w2b = parseKey("diffusion_model.layers.0.feed_forward.w1.lokr_w2_b").?;
+    try testing.expectEqual(Role.w2b, w2b.role);
+    // The unfactored spelling is a DIFFERENT role and must not be swallowed by
+    // the new suffixes (".lokr_w1_a" does not end with ".lokr_w1").
+    try testing.expectEqual(Role.w1, parseKey("diffusion_model.m.lokr_w1").?.role);
+    try testing.expectEqual(Role.w2, parseKey("diffusion_model.m.lokr_w2").?.role);
+}
+
+test "foldFactors reconstructs a factored LoKr factor as a@b" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // a [2,3] @ b [3,2] = [2,2], hand-computed.
+    const av = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const ash = [_]c_int{ 2, 3 };
+    const a = mlx.mlx_array_new_data(&av, &ash, 2, .float32);
+    defer _ = mlx.mlx_array_free(a);
+    const bv = [_]f32{ 1, 0, 0, 1, 1, 1 };
+    const bsh = [_]c_int{ 3, 2 };
+    const b = mlx.mlx_array_new_data(&bv, &bsh, 2, .float32);
+    defer _ = mlx.mlx_array_free(b);
+    const out = try foldFactors(a, b, s);
+    defer _ = mlx.mlx_array_free(out);
+    _ = mlx.mlx_array_eval(out);
+    const shape = mlx.getShape(out);
+    try testing.expectEqual(@as(c_int, 2), shape[0]);
+    try testing.expectEqual(@as(c_int, 2), shape[1]);
+    const d = mlx.mlx_array_data_float32(out) orelse return error.NoData;
+    // row0 = [1*1+2*0+3*1, 1*0+2*1+3*1] = [4,5]; row1 = [4+0+6, 0+5+6] = [10,11]
+    try testing.expectApproxEqAbs(@as(f32, 4), d[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 5), d[1], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 10), d[2], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 11), d[3], 1e-4);
+}
+
 test "delta computes scale·(x@Aᵀ)@Bᵀ" {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -1076,8 +1187,11 @@ test "deltaLokr computes the Kronecker-vec identity kron(w1,w2)@x by hand" {
     const w1s = [_]c_int{ 2, 2 };
     const w1a = mlx.mlx_array_new_data(&w1v, &w1s, 2, .float32);
     defer _ = mlx.mlx_array_free(w1a);
-    const w2v = [_]f32{ 1, 2, 3, 4, 5, 6 };
-    const w2s = [_]c_int{ 2, 3 };
+    // w2 is STORED TRANSPOSED (`Ref.bt` is w2ᵀ [c,r]) — the load path runs it
+    // through `prepTransposed`, so the fixture spells the same matrix that way:
+    // w2 = [[1,2,3],[4,5,6]] is w2ᵀ = [[1,4],[2,5],[3,6]].
+    const w2v = [_]f32{ 1, 4, 2, 5, 3, 6 };
+    const w2s = [_]c_int{ 3, 2 };
     const w2a = mlx.mlx_array_new_data(&w2v, &w2s, 2, .float32);
     defer _ = mlx.mlx_array_free(w2a);
     const xv = [_]f32{ 1, 2, 3, 4, 5, 6 };
@@ -1149,8 +1263,11 @@ test "deltaSum stacks a LoRA delta and a LoKr delta on the same module" {
     const w1s = [_]c_int{ 2, 2 };
     const w1a = mlx.mlx_array_new_data(&w1v, &w1s, 2, .float32);
     defer _ = mlx.mlx_array_free(w1a);
-    const w2v = [_]f32{ 1, 2, 3, 4, 5, 6 };
-    const w2s = [_]c_int{ 2, 3 };
+    // w2 is STORED TRANSPOSED (`Ref.bt` is w2ᵀ [c,r]) — the load path runs it
+    // through `prepTransposed`, so the fixture spells the same matrix that way:
+    // w2 = [[1,2,3],[4,5,6]] is w2ᵀ = [[1,4],[2,5],[3,6]].
+    const w2v = [_]f32{ 1, 4, 2, 5, 3, 6 };
+    const w2s = [_]c_int{ 3, 2 };
     const w2a = mlx.mlx_array_new_data(&w2v, &w2s, 2, .float32);
     defer _ = mlx.mlx_array_free(w2a);
     // A LoRA over the SAME [in=6,out=4] shape, all-ones so its delta is easy

@@ -252,6 +252,18 @@ pub const FluxConfig = struct {
     te_tap_inner: bool = false,
 };
 
+/// Every tap index must name a layer the loaded encoder actually has:
+/// `te_taps[k] == n` means "after decoder layer n-1", so `n` runs 1..layers.
+/// Cross-checkpoint config (FLUX taps 3 of a klein encoder, Ideogram 13 of a
+/// Qwen3-VL-8B) makes this a real mismatch and not a theoretical one, and an
+/// unfilled capture slot is otherwise only discovered by unwrapping a null.
+pub fn tapsFitLayers(taps: []const u32, layers: u32) bool {
+    for (taps) |t| {
+        if (t == 0 or t > layers) return false;
+    }
+    return true;
+}
+
 // ── Geometry, derived from the checkpoint ──
 //
 // FLUX.2 klein ships as 4B and 9B. Per mflux's own model configs the ENTIRE
@@ -407,7 +419,10 @@ pub const TextEncoder = struct {
     }
 
     /// Encode token ids [1, seq] (int32) with attention_mask [1, seq] → capture
-    /// raw hidden states at layers 9/18/27 → prompt_embeds [1, seq, 3*hidden].
+    /// raw hidden states at every layer `cfg.te_taps` names → prompt_embeds
+    /// [1, seq, te_taps.len * hidden]. `cfg.te_tap_inner` picks where the tap
+    /// axis lands in that flattened feature dim (FLUX tap-MAJOR, Ideogram
+    /// tap-INNER) — same shape either way, different vector.
     pub fn encode(self: *TextEncoder, ids: []const i32, mask: []const i32) !mlx.mlx_array {
         const s = self.s;
         const c = self.cfg;
@@ -459,7 +474,7 @@ pub const TextEncoder = struct {
         // different vector under the same shape.
         const cap_arrs = try self.allocator.alloc(mlx.mlx_array, want.len);
         defer self.allocator.free(cap_arrs);
-        for (caps, 0..) |cp, i| cap_arrs[i] = cp.?;
+        for (caps, 0..) |cp, i| cap_arrs[i] = cp orelse return error.MissingWeight;
         const stacked = try concat(cap_arrs, 0, s); // [T, seq, H]
         for (caps) |cp| _ = mlx.mlx_array_free(cp.?);
         defer _ = mlx.mlx_array_free(stacked);
@@ -608,6 +623,13 @@ pub fn loadTextEncoderWith(io: std.Io, allocator: std.mem.Allocator, s: S, model
     te.cfg.te_tap_inner = ov.tap_inner;
     if (ov.rope_theta != 0) te.cfg.te_rope_theta = ov.rope_theta;
     if (ov.rms_eps != 0) te.cfg.te_rms_eps = ov.rms_eps;
+    // A tap past the last layer never fills its capture slot. Refuse at LOAD,
+    // by name, rather than letting `encode` discover it on the first request
+    // (#217: a missing weight is a load error, never `unreachable`).
+    if (!tapsFitLayers(te.cfg.te_taps, te.cfg.te_layers)) {
+        log.err("[{s}] text encoder has {d} layers but the tap list reaches past it — wrong text_encoder for this pack?\n", .{ ov.tag, te.cfg.te_layers });
+        return error.MissingWeight;
+    }
     log.info("[{s}] text encoder: hidden={d} layers={d} heads={d}/{d} inter={d} taps={d}\n", .{
         ov.tag, te.cfg.te_hidden, te.cfg.te_layers, te.cfg.te_heads, te.cfg.te_kv, te.cfg.te_inter, te.cfg.te_taps.len,
     });
@@ -1576,6 +1598,7 @@ pub const VaeEncoder = struct {
         const centered = try subA(packed_lat, bnmf, s);
         defer _ = mlx.mlx_array_free(centered);
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_divide(&out, centered, stdf, s));
         return out;
     }
@@ -1653,6 +1676,7 @@ pub const VaeEncoder = struct {
         defer _ = mlx.mlx_array_free(nchw);
         // Owned by the caller: the two consumers pack it differently.
         var nf = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(nf);
         try mlx.check(mlx.mlx_astype(&nf, nchw, .float32, s));
         return nf;
     }
@@ -2014,6 +2038,24 @@ test "flux reference-image conditioning engages and changes the output" {
     diff /= @floatFromInt(n);
     std.debug.print("[flux-edit] mean|base-edited|={d:.4}\n", .{diff});
     try testing.expect(diff > 0.01);
+}
+
+test "a tap list is refused when it reaches past the encoder's layers" {
+    // The taps are CONFIG now and cross-checkpoint: FLUX pins 3 of a klein
+    // encoder, Ideogram 13 of a Qwen3-VL-8B. A pack whose text_encoder is
+    // shorter than the list leaves a capture slot unfilled, which used to be
+    // discovered by unwrapping a null — a panic, not a load error (#217).
+    try std.testing.expect(tapsFitLayers(&[_]u32{ 9, 18, 27 }, 32));
+    try std.testing.expect(tapsFitLayers(&[_]u32{ 9, 18, 27 }, 27)); // last layer is in range
+    try std.testing.expect(!tapsFitLayers(&[_]u32{ 9, 18, 27 }, 26));
+    // Ideogram's own list against the encoder it ships with, and against one
+    // that is a single layer short.
+    try std.testing.expect(tapsFitLayers(&[_]u32{ 1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 36 }, 36));
+    try std.testing.expect(!tapsFitLayers(&[_]u32{ 1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 36 }, 35));
+    // Index 0 is the embedding, not a layer output — the capture loop only
+    // ever writes indices 1..layers, so a 0 would never be filled either.
+    try std.testing.expect(!tapsFitLayers(&[_]u32{0}, 32));
+    try std.testing.expect(tapsFitLayers(&.{}, 0));
 }
 
 test "flux applyCondRebalance scales tap thirds and global gain" {

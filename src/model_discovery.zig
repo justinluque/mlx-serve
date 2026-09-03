@@ -205,17 +205,12 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
 }
 
-/// True when `sub/model_index.json` marks a MageFlow pipeline (`_class_name` ==
-/// "MageFlowPipeline", or a `_mage_flow_version` tag). Same signature as
-/// gen.isMageFlowRepo, over an already-open Dir.
-/// True when `sub/model_index.json` marks an Ideogram 4 pipeline. Same shape
-/// as `peekMageFlowIndex`; twin of `gen.isIdeogram4Repo`.
-pub fn peekIdeogram4Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    return indexClassNameIs(io, allocator, sub, "Ideogram4Pipeline");
-}
-
-/// `model_index.json`'s `_class_name`, compared to `want`.
-fn indexClassNameIs(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, want: []const u8) bool {
+/// `model_index.json`'s pipeline identity: true when `_class_name` equals
+/// `want`, or when `tag` names a key the document carries at all. ONE reader
+/// for every diffusers-shaped repo — the 1 MiB read cap, the buffer size and
+/// the swallow-every-error policy live here once, so raising any of them
+/// cannot apply to some pipelines and not others.
+fn indexMarksPipeline(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, want: []const u8, tag: ?[]const u8) bool {
     var file = sub.openFile(io, "model_index.json", .{}) catch return false;
     defer file.close(io);
     var rbuf: [4096]u8 = undefined;
@@ -225,23 +220,24 @@ fn indexClassNameIs(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, w
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
+    if (tag) |t| {
+        if (parsed.value.object.get(t) != null) return true;
+    }
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, want);
 }
 
+/// True when `sub/model_index.json` marks an Ideogram 4 pipeline. Twin of
+/// `gen.isIdeogram4Repo`, which is a path→Dir wrapper over this.
+pub fn peekIdeogram4Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return indexMarksPipeline(io, allocator, sub, "Ideogram4Pipeline", null);
+}
+
+/// True when `sub/model_index.json` marks a MageFlow pipeline (`_class_name` ==
+/// "MageFlowPipeline", or a `_mage_flow_version` tag). Twin of
+/// `gen.isMageFlowRepo`, which is a path→Dir wrapper over this.
 pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
-    defer file.close(io);
-    var rbuf: [4096]u8 = undefined;
-    var rs = file.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
-    defer allocator.free(bytes);
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    if (parsed.value.object.get("_mage_flow_version") != null) return true;
-    const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+    return indexMarksPipeline(io, allocator, sub, "MageFlowPipeline", "_mage_flow_version");
 }
 
 /// The FLUX.2 DiT's shared-modulation tensor. Unique to this architecture —

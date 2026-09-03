@@ -1873,40 +1873,34 @@ fn handleConnection(
     // The generic `ensureLoaded` right below holds a refcount on the TARGET
     // model for the rest of this request, including through generation —
     // that's necessary, but it also makes the target non-evictable from the
-    // moment it loads. `handleGen`'s own magic-prompt block (further down
-    // the call chain) runs its OWN separate rewriter model via its OWN
-    // `ensureLoaded` call — and by the time it runs, the target image model
-    // is already loaded AND pinned. On a machine that can't fit both
-    // resident at once, the rewriter's `ensureLoaded` starves for memory
-    // (nothing is evictable) and fails; magic-prompt then does exactly what
-    // it's designed to do on failure — falls back to the raw, un-rewritten
-    // prompt — silently, which is what this looked like from the outside.
+    // moment it loads. The rewriter is a SECOND model with its own
+    // `ensureLoaded`, so running it after the target is resident means it
+    // starves for memory on a machine that can't hold both — and magic-prompt
+    // then does what it is designed to do on failure: fall back to the raw
+    // prompt, silently.
     //
-    // Fix: for a plausibly-Ideogram-4 target, run the ENTIRE magic-prompt
-    // rewrite (load rewriter, generate, release rewriter) BEFORE the target
-    // model is ever resolved here, so there's nothing pinned yet to starve
-    // it. `arch_hint` is Discovery's own classification (`model_type` off
-    // the checkpoint's config.json — see `model_discovery.zig`), cheap to
-    // peek via `resolveEntry` (no weights touched, same call `ensureLoaded`
-    // uses internally). This is used ONLY to decide ORDERING: the real
-    // "does this engine want a rewrite" gate is still
-    // `eng.wantsStructuredCaption()` against the actually-loaded engine,
-    // unchanged, inside `handleGen`. A stale/wrong peek here (checkpoint
-    // reports `ideogram4` but the real engine ends up different, or vice
-    // versa) can only ever cost wasted rewriter work — it never changes
-    // what gets generated.
+    // Fix: for a plausibly-Ideogram-4 target, run the ENTIRE rewrite (load
+    // rewriter, generate, release rewriter) BEFORE the target is resolved, so
+    // there is nothing pinned yet to starve it. `arch_hint` is discovery's own
+    // classification, peeked without touching weights. It decides ORDERING
+    // ONLY — whether a rewrite happens at all is still the engine's own
+    // `wantsStructuredCaption()` in `handleGen`, so a stale peek can cost
+    // wasted work but never changes what gets generated.
     //
-    // Covers both image routes. `/v1/images/edits` carries its fields in a
-    // multipart form, so it needs converting to our JSON edit body
-    // (`openaiEditFormToJson`) before any of this can read `prompt`/
-    // `magic_prompt`/`image` — done once here and reused verbatim as
-    // `precomputed_body` below (rewritten or not), so the dispatch branch
-    // never re-parses the same multipart body a second time. If the
-    // conversion fails here, it's simply skipped (not surfaced) — the
-    // existing dispatch branch runs the identical conversion again and
-    // reports the real 400, unchanged.
+    // `/v1/images/edits` carries its fields in a multipart form, so it is
+    // converted to our JSON edit body once here and handed down verbatim
+    // (rewritten or not) rather than parsed twice. A conversion failure here
+    // is simply skipped — the dispatch branch runs the same conversion and
+    // reports the real 400.
     var precomputed_body: ?[]u8 = null;
     defer if (precomputed_body) |b| allocator.free(b);
+    // Set when the rewrite above already ran, so `handleGen` does not run a
+    // second one. This is an explicit flag and NOT a re-sniff of the body:
+    // `magicPromptRewrite` accepts any caption that parses as JSON, but
+    // `looksLikeCaption` additionally demands one of three known keys, so a
+    // valid-JSON caption without them would have been rewritten twice — a
+    // second rewriter load and generation, fed its own first output.
+    var already_rewritten = false;
     const is_images_gen = std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/generations");
     const is_images_edit = std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/edits");
     if (is_images_gen or is_images_edit) {
@@ -1922,42 +1916,17 @@ fn handleConnection(
                 } else request_body;
 
                 if (body_for_check.len != 0) {
-                    var mp_model_owned: []u8 = &.{};
-                    defer if (mp_model_owned.len != 0) allocator.free(mp_model_owned);
-                    const mp = media_mod.parseMagicPromptFields(allocator, body_for_check, &mp_model_owned);
-                    // `.auto` resolves to `true` here without waiting for the real
-                    // engine: `arch_hint` already says `ideogram4`, and Ideogram
-                    // 4's `wantsStructuredCaption()` is unconditionally true for
-                    // that backend — see its doc comment in `gen.zig`.
-                    const wanted = mp.mode != .off;
-                    var rewrote = false;
-                    if (wanted) {
-                        const bp = media_mod.promptAndSizeFromGenBody(body_for_check);
-                        if (bp.prompt.len != 0 and !ideogram_prompt.looksLikeCaption(bp.prompt)) {
-                            const gen_img = media_mod.decodeGenBodyImage(allocator, body_for_check);
-                            defer if (gen_img) |gi| allocator.free(gi.bytes);
-                            const src_for_rewrite: ?[]const u8 = if (gen_img) |gi| (if (gi.is_variation) gi.bytes else null) else null;
-                            const res = magicPromptRewrite(allocator, stream.io, bp.prompt, bp.width, bp.height, mp.model, src_for_rewrite);
-                            if (res.caption) |cap| {
-                                defer allocator.free(cap);
-                                if (media_mod.withRewrittenPrompt(allocator, body_for_check, cap)) |nb| {
-                                    precomputed_body = nb;
-                                    rewrote = true;
-                                } else |err| {
-                                    log.warn("[ideogram4] magic prompt: body rewrite failed ({s}); using the raw prompt\n", .{@errorName(err)});
-                                }
-                            } else if (res.skipped) |why| {
-                                log.info("[ideogram4] magic prompt skipped: {s}\n", .{why});
-                            }
-                        }
-                    }
-                    // No rewrite happened, but the multipart body is already
-                    // converted — hand that down instead of converting again.
-                    if (!rewrote and is_images_edit) {
-                        if (converted_edit_json) |j| {
-                            precomputed_body = j;
-                            converted_edit_json = null; // ownership moved to precomputed_body
-                        }
+                    // `.auto` resolves to true without waiting for the real
+                    // engine: `arch_hint` already says `ideogram4`, whose
+                    // `wantsStructuredCaption()` is unconditionally true.
+                    if (tryMagicPromptRewrite(allocator, stream.io, body_for_check, true)) |nb| {
+                        precomputed_body = nb;
+                        already_rewritten = true;
+                    } else if (converted_edit_json) |j| {
+                        // No rewrite, but the multipart body is already
+                        // converted — hand that down instead of converting again.
+                        precomputed_body = j;
+                        converted_edit_json = null; // ownership moved
                     }
                 }
             }
@@ -2099,7 +2068,7 @@ fn handleConnection(
         // will see a prompt that already looks like a structured caption
         // (`ideogram_prompt.looksLikeCaption`) and no-op cleanly, so this
         // never double-rewrites.
-        try handleGen(allocator, stream, precomputed_body orelse body, lm, .image);
+        try handleGen(allocator, stream, precomputed_body orelse body, lm, .image, already_rewritten);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/edits")) {
         // OpenAI's image-EDIT surface: multipart/form-data, not JSON. Translated
         // into the `/v1/images/generations` edit body (gen.openaiEditFormToJson)
@@ -2109,7 +2078,7 @@ fn handleConnection(
         // set, is already this exact conversion (rewritten or not) —
         // reuse it instead of re-parsing the same multipart body.
         if (precomputed_body) |pb| {
-            try handleGen(allocator, stream, pb, lm, .image);
+            try handleGen(allocator, stream, pb, lm, .image, already_rewritten);
         } else {
             const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
             const ct = findHeaderValue(request[0..header_end], "content-type") orelse "";
@@ -2119,24 +2088,24 @@ fn handleConnection(
                 return;
             };
             defer allocator.free(json);
-            try handleGen(allocator, stream, json, lm, .image);
+            try handleGen(allocator, stream, json, lm, .image, already_rewritten);
         }
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/speech")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleGen(allocator, stream, body, lm, .speech);
+        try handleGen(allocator, stream, body, lm, .speech, false);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/music-generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleGen(allocator, stream, body, lm, .music);
+        try handleGen(allocator, stream, body, lm, .music, false);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/video/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleGen(allocator, stream, body, lm, .video);
+        try handleGen(allocator, stream, body, lm, .video, false);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/3d/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleGen(allocator, stream, body, lm, .mesh);
+        try handleGen(allocator, stream, body, lm, .mesh, false);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/chat")) {
         if (text_gen_reject) |reason| {
             try sendOllamaError(allocator, stream, "400 Bad Request", reason);
@@ -4277,6 +4246,17 @@ fn magicPromptRewrite(
     }
     defer allocator.free(prompt_ids);
 
+    // Every other submit site checks this before handing a prompt to the
+    // scheduler, and this one has a large fixed floor: the vendored system
+    // prompt alone is ~28 KB, and a grounded rewrite splices a whole image's
+    // worth of vision rows on top. A rewriter model with a modest context
+    // window would otherwise be handed an over-length prompt unchecked.
+    const rewriter_ctx = getEffectiveContextLength(config);
+    if (prompt_ids.len >= rewriter_ctx) {
+        log.warn("[ideogram4] magic prompt: {d} tokens exceeds the rewriter's {d}-token context; using the raw prompt\n", .{ prompt_ids.len, rewriter_ctx });
+        return .{ .skipped = "prompt exceeds the rewriter's context" };
+    }
+
     // Qwen3-VL interleaved M-RoPE: no-op (empty bundle) for non-Qwen-vision
     // rewriter models or when this isn't a grounded request.
     const local_mrope: MropeData = if (grounded) (computeQwenMrope(allocator, prompt_ids, &messages, config) catch MropeData{}) else MropeData{};
@@ -4349,7 +4329,62 @@ fn magicPromptRewrite(
     return .{ .caption = owned };
 }
 
-fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute) !void {
+/// One magic-prompt rewrite of an image-generation body: read the fields,
+/// decide, decode an img2img source, run the rewriter, splice the caption
+/// back in. Returns a FRESH body (caller frees) or null when nothing was
+/// rewritten — field off, no prompt, the prompt is already a caption, the
+/// rewriter was unavailable, the output was unusable. Every one of those is
+/// non-fatal by design: a rewriter is a quality lever, and no image is a
+/// worse answer than a slightly worse image.
+///
+/// The ONE implementation of that sequence. Both callers need it at different
+/// moments — `handleConnection` before the target model is pinned (so the
+/// rewriter has memory to load into), `handleGen` as the fallback for a
+/// backend discovery did not flag — and they differ only in what `.auto`
+/// resolves to, which is why `want_auto` is a parameter: the pre-load site has
+/// only discovery's `arch_hint`, `handleGen` has the real engine.
+fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const u8, want_auto: bool) ?[]u8 {
+    var mp_model_owned: []u8 = &.{};
+    defer if (mp_model_owned.len != 0) allocator.free(mp_model_owned);
+    const mp = media_mod.parseMagicPromptFields(allocator, body, &mp_model_owned);
+    const wanted = switch (mp.mode) {
+        .off => false,
+        .on => true,
+        .auto => want_auto,
+    };
+    if (!wanted) return null;
+
+    const bp = media_mod.promptAndSizeFromGenBody(body);
+    if (bp.prompt.len == 0) return null;
+    if (ideogram_prompt.looksLikeCaption(bp.prompt)) {
+        log.info("[ideogram4] magic prompt skipped: prompt is already a structured caption\n", .{});
+        return null;
+    }
+
+    // img2img source, so the rewriter can ground `compositional_deconstruction`
+    // on what is actually in the frame instead of inventing a fresh
+    // composition. Read once here — `genJobRun` re-reads `image`/`mode` off the
+    // same body when it builds `ImageGenOpts`; see `GenBodyImage`'s doc comment
+    // for why that duplication is fine. Edit mode (FLUX.2 in-context reference)
+    // is a different conditioning mechanism with its own concerns, so only
+    // "variation" hands a source to the rewriter.
+    const gen_img = media_mod.decodeGenBodyImage(allocator, body);
+    defer if (gen_img) |gi| allocator.free(gi.bytes);
+    const src_for_rewrite: ?[]const u8 = if (gen_img) |gi| (if (gi.is_variation) gi.bytes else null) else null;
+
+    const res = magicPromptRewrite(allocator, io, bp.prompt, bp.width, bp.height, mp.model, src_for_rewrite);
+    const cap = res.caption orelse {
+        if (res.skipped) |why| log.info("[ideogram4] magic prompt skipped: {s}\n", .{why});
+        return null;
+    };
+    defer allocator.free(cap);
+    return media_mod.withRewrittenPrompt(allocator, body, cap) catch |err| {
+        log.warn("[ideogram4] magic prompt: body rewrite failed ({s}); using the raw prompt\n", .{@errorName(err)});
+        return null;
+    };
+}
+
+fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute, already_rewritten: bool) !void {
     const scheduler = global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
@@ -4367,49 +4402,18 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     // Ideogram 4's magic prompt. Runs HERE — on the connection thread, before
     // the job is handed to the inference thread — because the rewriter is
     // itself a generation, and the inference thread is single-threaded.
+    //
+    // `already_rewritten` means `handleConnection` ran it before the target
+    // model was pinned (the memory-ordering path); this is the only gate, so
+    // the rewrite can never run twice regardless of what the caption looks like.
     var rewritten_body: ?[]u8 = null;
     defer if (rewritten_body) |b| allocator.free(b);
     var effective_body = body;
-    if (route.modality() == .image) {
+    if (!already_rewritten and route.modality() == .image) {
         if (lm.image_engine) |eng| {
-            var mp_model_owned: []u8 = &.{};
-            defer if (mp_model_owned.len != 0) allocator.free(mp_model_owned);
-            const mp = media_mod.parseMagicPromptFields(allocator, body, &mp_model_owned);
-            const wanted = switch (mp.mode) {
-                .off => false,
-                .on => true,
-                .auto => eng.wantsStructuredCaption(),
-            };
-            if (wanted) {
-                const bp = media_mod.promptAndSizeFromGenBody(body);
-                if (bp.prompt.len != 0) {
-                    // img2img source, so the rewriter can ground
-                    // `compositional_deconstruction` on what is actually in
-                    // the frame instead of inventing a fresh composition.
-                    // Read once here — `genJobRun` re-reads `image`/`mode`
-                    // off the same body on its own when it builds
-                    // `ImageGenOpts`; see `GenBodyImage`'s doc comment for
-                    // why that duplication is fine. Edit mode (FLUX.2
-                    // in-context reference) is a different conditioning
-                    // mechanism with its own concerns — out of scope here,
-                    // so only "variation" gets a source passed to the
-                    // rewriter.
-                    const gen_img = media_mod.decodeGenBodyImage(allocator, body);
-                    defer if (gen_img) |gi| allocator.free(gi.bytes);
-                    const src_for_rewrite: ?[]const u8 = if (gen_img) |gi| (if (gi.is_variation) gi.bytes else null) else null;
-                    const res = magicPromptRewrite(allocator, stream.io, bp.prompt, bp.width, bp.height, mp.model, src_for_rewrite);
-                    if (res.caption) |cap| {
-                        defer allocator.free(cap);
-                        if (media_mod.withRewrittenPrompt(allocator, body, cap)) |nb| {
-                            rewritten_body = nb;
-                            effective_body = nb;
-                        } else |err| {
-                            log.warn("[ideogram4] magic prompt: body rewrite failed ({s}); using the raw prompt\n", .{@errorName(err)});
-                        }
-                    } else if (res.skipped) |why| {
-                        log.info("[ideogram4] magic prompt skipped: {s}\n", .{why});
-                    }
-                }
+            if (tryMagicPromptRewrite(allocator, stream.io, body, eng.wantsStructuredCaption())) |nb| {
+                rewritten_body = nb;
+                effective_body = nb;
             }
         }
     }

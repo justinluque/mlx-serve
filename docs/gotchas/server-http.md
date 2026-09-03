@@ -1680,3 +1680,36 @@ contract.
 Guards: `tests/test_json_schema_thinking.sh` (all three surfaces + stream arm
 + mask-engagement count) and the server.zig source scan pairing every
 `[grammar] enforcing` site with a gate call.
+## A parsed JSON map must grow with the arena that owns it
+
+`gen.withRewrittenPrompt` splices the magic-prompt caption back into an image
+body: parse the body, `put` the new `prompt`/`revised_prompt`, re-stringify.
+It parsed with the caller's allocator and then mutated with the caller's
+allocator too, which reads as obviously consistent and is exactly wrong.
+
+`std.json.parseFromSlice` hands back a `Parsed(T)` whose every allocation —
+including the `ObjectMap`'s backing `MultiArrayList` — comes from its OWN
+arena. `obj.put(allocator, …)` calls `ensureTotalCapacity(allocator, …)`, so
+the moment the map has to grow it allocates the new storage with the caller's
+allocator and frees the ARENA's old storage with it. Under a checking
+allocator that aborts with `free after resize`; under the general-purpose
+allocator it is heap corruption with no diagnostic at all.
+
+The trap is that it hides at small sizes. The shipped unit test used a
+four-key body and passed, because a four-entry map still fits its initial
+capacity. Sweeping key counts under `std.testing.allocator` aborts at
+**three** top-level keys — and the cheapest real request,
+`{"model":…,"prompt":…,"size":…}`, already has three. Every Ideogram 4
+generation with `magic_prompt` at its default `auto` went through this path.
+
+Two things make it a class and not an incident. First, the codebase already
+knew: `chat.fillOptionalToolDefKeys` carries a comment spelling out the exact
+hazard, and `chat.zig` and `lan.zig` pass an arena at every mutation site.
+Second, the defect is invisible at the type level — both values are
+`std.mem.Allocator`, so nothing but a reader catches the mismatch.
+
+Fix is one line (`parsed.arena.allocator()`). The guards are the sweep test
+(`a rewritten body survives a hash-map grow at any key count`) and a textual
+class scan (`no parsed JSON object is mutated with a non-arena allocator`)
+over gen/chat/lan/server, which is red on revert.
+
