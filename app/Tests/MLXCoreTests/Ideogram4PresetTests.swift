@@ -76,8 +76,11 @@ final class Ideogram4PresetTests: XCTestCase {
     /// Capabilities, each against the matching arm in `gen.ImageEngine`.
     func testCapabilityFlagsMatchTheBackend() {
         for p in presets {
-            // The pack ships the VAE DECODER only.
-            XCTAssertFalse(p.supportsImg2Img, "\(p.id)")
+            // The Flux2 autoencoder ships BOTH halves and `convert_ideogram4.py`
+            // carries them both into the pack, so `mode:"variation"` is a real
+            // path (#9eed64d) — not the decoder-only pack this test first
+            // assumed.
+            XCTAssertTrue(p.supportsImg2Img, "\(p.id)")
             // No edit training, and no in-context reference conditioning.
             XCTAssertFalse(p.supportsReferenceEdit, "\(p.id)")
             // Runtime LoRA attaches to the conditional transformer.
