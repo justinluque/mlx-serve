@@ -40,6 +40,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `krea.zig` / `flux.zig` | Image backends (Krea-2-Turbo / FLUX.2 klein 4B+9B); `MixedLinear` infers quant geometry |
 | `multipart.zig` | RFC 7578 form parsing, zero-copy `Part` (only non-JSON shape: `POST /v1/images/edits`) |
 | `mage_flow.zig` | MageFlow Turbo/Edit: flow DiT + DiCo VAE + Qwen3-VL TE; `MfLinear` shared with H3; DiT/TE bf16, VAE f32 (load-bearing) |
+| `z_image.zig` | Z-Image/Turbo S3-DiT: Qwen3 TE, flux-dev VAE |
 | `hunyuan3d.zig` / `hunyuan3d_paint*.zig` | 3D shape + texture paint; converted layouts BAKE OUT per-head QKV interleaves — never "fix" it |
 | `acestep.zig` | ACE-Step music (Qwen3 encoder, AdaLN DiT, Euler flow-match, Oobleck VAE 48 kHz; Snake/encode f32) |
 | `music3.zig` | MiniMax Music 3: Qwen3-8B global LLM (batch-2 CFG) + depth decoder → hidden states condition a flow DiT (temb as TOKEN) + Snake/DAC vocoder 44.1 kHz |
@@ -132,7 +133,7 @@ Dispatch on `config.json` `model_type`. GGUF bypasses MLX → embedded engine by
 | `bailing_hybrid` | Ling 3.0 (BailingMoeV3): KDA + MLA hybrid MoE, `layer_group_size` → `full_attention_interval`; KDA = GDN with PER-CHANNEL gate (`_vec` kernel), BOUNDED-SIGMOID gate (`kda_lower_bound` REPLACES softplus), sigmoid out-gate; MLA = naive DeepSeek-V3 (ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` ok, turbo refused); `noaux_tc` routing. Thinking ON; GLM tool tags. Mirror `rapid-mlx/Ling-3.0-tiny-MLX-4bit` |
 | `*.gguf` | ds4/llama.cpp; GGUF presence WINS over stray config.json. ds4 DSpark: `--dspark` arms when a `-DSpark-` GGUF sits beside the model (gate keys on `mtpDraftTokens()>1` NOT `hasMtp()`); ~0 net on 0731 |
 | `minimax_h3` | MiniMax-H3 text-to-audio-video: joint denoise, 17k+5 frame ladder, 24 fps, two partitions (fl2va/ref2va — `tasks` is the ONLY discriminator), Turbo LoRA, chained windows, fast recipe default-on |
-| media types | `flux2*`/`krea*`/`mage_flow*`/`qwen3_tts`/`acestep`/`minimax_music3`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` has NO root config.json — classified from `model_index.json` by `gen.peekModelType` + `model_discovery.peekMageFlowIndex`, kept in sync) |
+| media types | `flux2*`/`krea*`/`mage_flow*`/`zimage*`/`qwen3_tts`/`acestep`/`minimax_music3`/`AudioVideo` (LTX 2.3+2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
 
@@ -394,6 +395,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 
 ### Model loading, configs, converters, media parity (→ docs/gotchas/models-media.md)
 
+- **A `Weights` map must outlive its `Transformer`.**
 - **A qwen4_exp checkpoint is NOT a qwen3_5 pack** (model_type `qwen4_exp`): three new blocks (hyper-connections, n-gram PLE, QSA) around the qwen3_5 trunk. The HF fixture's `hidden_states[i]` is the INPUT of layer i (stream_0 = tiled embeddings) — compare layer-i output with stream_{i+1}.
 - **A random tiny MoE oracle ties everywhere, and the tie RATE is scale-invariant** (relu leaves EXACT-ZERO block scores; bf16 noise flips one top-k expert or QSA block per prompt at any router scale or seed): `dump_qwen4_exp_fixtures.py` runs every expert (`num_experts_per_tok = num_experts`) and dumps the reference's OWN margins (`qsa_gap`, `logit_margin`); `Qwen4Ties` acquits rows under 3% by those, never by our output; the chunked arm's bar is our full forward.
 - **A k < E tiny fixture ties in most trunk rows across every MoE layer, so its top-k SELECTION coverage is the MTP head's ONE MoE layer** (`dump_qwen4_exp_fixtures.py build --topk 2`; `route_gap`/`mtp_route_gap` = softmax margin at the top-k boundary, `QWEN4_TIE_REL_ROUTE` 5%; trunk decisive floors drop only when a routing table is present). The k = E fixture stays the CI one.

@@ -82,6 +82,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
+        std.mem.startsWith(u8, model_type, "zimage") or
         std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "kokoro") or
@@ -143,6 +144,10 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // gen.peekModelType's fallback (kept in sync — the routing side must agree).
         if (peekMageFlowIndex(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "mage_flow") catch return .missing_or_unparseable };
+        // …or a Z-Image (Tongyi-MAI) repo, same no-root-config shape
+        // (`_class_name`=="ZImagePipeline").
+        if (peekZImageIndex(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "zimage") catch return .missing_or_unparseable };
         // …and an mflux FLUX.2 conversion may carry nothing at all (the only
         // MLX build of klein 9B ships no config.json). Same fallback, keyed on
         // the DiT's own weight names.
@@ -207,6 +212,22 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
     if (parsed.value.object.get("_mage_flow_version") != null) return true;
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+}
+
+/// True when `sub/model_index.json` marks a Z-Image (Tongyi-MAI) pipeline
+/// (`_class_name` == "ZImagePipeline"). Same shape as `peekMageFlowIndex`.
+pub fn peekZImageIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const cn = parsed.value.object.get("_class_name") orelse return false;
+    return cn == .string and std.mem.eql(u8, cn.string, "ZImagePipeline");
 }
 
 /// The FLUX.2 DiT's shared-modulation tensor. Unique to this architecture —
@@ -470,7 +491,8 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
-        std.mem.eql(u8, model_type, "mageflow")) return .image;
+        std.mem.eql(u8, model_type, "mageflow") or
+        std.mem.startsWith(u8, model_type, "zimage")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -829,6 +851,7 @@ fn tryAddModel(
         const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
         if (!has_config and
             !peekMageFlowIndex(io, allocator, sub) and
+            !peekZImageIndex(io, allocator, sub) and
             !peekMfluxFlux2(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
@@ -1203,6 +1226,38 @@ test "mage_flow classifies as image media (modelKind + isMediaModelType)" {
     try testing.expectEqual(ModelKind.image, modelKindFromType("mageflow"));
     // Guardrail: a regular LM must not be swept up by the prefix match.
     try testing.expect(!isMediaModelType("gemma4"));
+}
+
+test "zimage classifies as image media (modelKind + isMediaModelType)" {
+    try testing.expect(isMediaModelType("zimage"));
+    try testing.expect(isMediaModelType("zimage-turbo"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("zimage"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("zimage-turbo"));
+}
+
+test "discoverModels finds a Z-Image repo (model_index.json, no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Same no-root-config shape as MageFlow: `model_index.json` alone is the
+    // classification signal.
+    try tmp.dir.createDirPath(io, "Tongyi-MAI/Z-Image-Turbo/transformer");
+    try tmp.dir.createDirPath(io, "Tongyi-MAI/Z-Image-Turbo/vae");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "Tongyi-MAI/Z-Image-Turbo/model_index.json",
+        .data = "{\"_class_name\":\"ZImagePipeline\"}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Tongyi-MAI/Z-Image-Turbo/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Tongyi-MAI/Z-Image-Turbo/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("Tongyi-MAI/Z-Image-Turbo", result.models[0].id);
+    try testing.expectEqualStrings("zimage", result.models[0].model_type);
 }
 
 test "minimax_music3 classifies as audio media with the vocoder marker" {
