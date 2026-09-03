@@ -182,10 +182,19 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     return null;
 }
 
+/// Open an absolute model dir for one of discovery's Dir-based predicates.
+/// `openDirAbsolute` on an empty or relative path is ReleaseFast UB that
+/// miscompiles the CALLER, so the guard lives here once instead of at each
+/// predicate.
+fn openModelDir(io: std.Io, model_dir: []const u8) ?std.Io.Dir {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
+    return std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch null;
+}
+
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
 /// Thin path→Dir wrapper over `model_discovery.peekMfluxFlux2`.
 fn isMfluxFlux2Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    var dir = openModelDir(io, model_dir) orelse return false;
     defer dir.close(io);
     return discovery.peekMfluxFlux2(io, allocator, dir);
 }
@@ -209,40 +218,21 @@ fn readConfigModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []co
     return allocator.dupe(u8, mt.string) catch null;
 }
 
-/// True when `model_dir/model_index.json` marks a MageFlow pipeline (its
-/// `_class_name` is "MageFlowPipeline", or the `_mage_flow_version` tag exists).
+/// True when `model_dir/model_index.json` marks a MageFlow pipeline.
+/// Thin path→Dir wrapper over `model_discovery.peekMageFlowIndex` — the ONE
+/// reader, so `list` and the loader can never disagree about the shape.
 fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
-    defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    defer file.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
-    defer allocator.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    if (parsed.value.object.get("_mage_flow_version") != null) return true;
-    const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+    var dir = openModelDir(io, model_dir) orelse return false;
+    defer dir.close(io);
+    return discovery.peekMageFlowIndex(io, allocator, dir);
 }
 
 /// True when `model_dir/model_index.json` marks an Ideogram 4 pipeline.
+/// Thin path→Dir wrapper over `model_discovery.peekIdeogram4Index`.
 fn isIdeogram4Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
-    defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    defer file.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
-    defer allocator.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "Ideogram4Pipeline");
+    var dir = openModelDir(io, model_dir) orelse return false;
+    defer dir.close(io);
+    return discovery.peekIdeogram4Index(io, allocator, dir);
 }
 
 /// Classify a model dir into a media modality (reads its `model_type`), or null
@@ -727,11 +717,17 @@ pub fn withRewrittenPrompt(allocator: std.mem.Allocator, body: []const u8, capti
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.NotAnObject;
+    // The map is the PARSE ARENA's, so it grows with the ARENA's allocator.
+    // Putting with the caller's allocator instead frees arena-owned storage
+    // through the wrong allocator the moment the map has to grow — three
+    // top-level keys was enough to abort under a checking allocator, and every
+    // real image body carries more than that.
+    const arena = parsed.arena.allocator();
     var obj = parsed.value.object;
-    try obj.put(allocator, "prompt", .{ .string = caption });
+    try obj.put(arena, "prompt", .{ .string = caption });
     // Echoed back so a client can see what was actually rendered — the whole
     // point of a rewriter is that the caption is not what the user typed.
-    try obj.put(allocator, "revised_prompt", .{ .string = caption });
+    try obj.put(arena, "revised_prompt", .{ .string = caption });
     return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = obj }, .{});
 }
 
@@ -5540,6 +5536,46 @@ test "paint stage dir resolves from the combined single-repo layout (subdir firs
     try testing.expect(findPaintDir(allocator, bare) == null);
 }
 
+test "no parsed JSON object is mutated with a non-arena allocator" {
+    // CLASS GUARD. `std.json` allocates a parsed `ObjectMap` from the parse's
+    // OWN arena, so growing that map with the caller's general-purpose
+    // allocator frees arena-owned storage through the wrong allocator. Under a
+    // checking allocator that is `free after resize`; in production it is heap
+    // corruption. `withRewrittenPrompt` shipped this way and needed only three
+    // top-level keys to trip it — every real image body carries more.
+    //
+    // `chat.fillOptionalToolDefKeys` already documents the hazard, and
+    // `chat.zig`/`lan.zig` already pass an arena at every mutation site, so
+    // the rule is house style; this pins it. The scan is textual on purpose:
+    // the bug is invisible at the type level, since both allocators are
+    // `std.mem.Allocator`.
+    inline for (.{ "gen.zig", "chat.zig", "lan.zig", "server.zig" }) |file| {
+        const src = @embedFile(file);
+        var it = std.mem.splitScalar(u8, src, '\n');
+        var line_no: usize = 0;
+        while (it.next()) |line| {
+            line_no += 1;
+            const code = std.mem.trimStart(u8, line, " \t");
+            if (std.mem.startsWith(u8, code, "//")) continue; // prose, incl. this test's own
+            const put = std.mem.indexOf(u8, line, ".put(") orelse continue;
+            // Only calls on a JSON value's map: `obj.put(`, `x.object.put(`.
+            const recv = std.mem.trimStart(u8, line[0..put], " \t}{|)(=,");
+            const is_json_map = std.mem.endsWith(u8, recv, ".object") or
+                std.mem.endsWith(u8, recv, "obj") or
+                std.mem.endsWith(u8, recv, "params");
+            if (!is_json_map) continue;
+            const arg = line[put + ".put(".len ..];
+            const ok = std.mem.startsWith(u8, arg, "arena") or
+                std.mem.startsWith(u8, arg, "a,") or // a local arena allocator
+                std.mem.indexOf(u8, arg, "arena.allocator()") != null;
+            if (!ok) {
+                std.debug.print("{s}:{d}: parsed-map .put() with a non-arena allocator: {s}\n", .{ file, line_no, std.mem.trim(u8, line, " \t") });
+                return error.NonArenaJsonMapMutation;
+            }
+        }
+    }
+}
+
 test "media model types: discovery and modality dispatch agree" {
     // CLASS GUARD. `model_discovery.isMediaModelType` and `modalityFromType`
     // are documented duplication (discovery must not import mlx), and they
@@ -5828,6 +5864,33 @@ test "a rewritten body keeps every other field and echoes the caption back" {
     try std.testing.expectEqualStrings("ideogram4", o.get("model").?.string);
     try std.testing.expectEqualStrings("1024x768", o.get("size").?.string);
     try std.testing.expectEqual(@as(i64, 7), o.get("seed").?.integer);
+}
+
+test "a rewritten body survives a hash-map grow at any key count" {
+    // `withRewrittenPrompt` mutates the map `std.json` allocated from its OWN
+    // parse arena. Growing that map with the CALLER's allocator frees
+    // arena-owned storage through the wrong allocator — heap corruption, and
+    // invisible until the body carries enough keys to force a grow (three was
+    // enough). Every field a real image body carries is another chance, so the
+    // bar is a SWEEP, not one hand-picked body.
+    const a = std.testing.allocator;
+    var n: usize = 0;
+    while (n <= 48) : (n += 1) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        try buf.appendSlice(a, "{\"prompt\":\"a red barn\"");
+        var i: usize = 0;
+        while (i < n) : (i += 1) try buf.print(a, ",\"k{d}\":{d}", .{ i, i });
+        try buf.appendSlice(a, "}");
+        const out = try withRewrittenPrompt(a, buf.items, "CAP");
+        defer a.free(out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("CAP", parsed.value.object.get("prompt").?.string);
+        try std.testing.expectEqualStrings("CAP", parsed.value.object.get("revised_prompt").?.string);
+        // Every original field survives the rewrite.
+        try std.testing.expectEqual(n + 2, parsed.value.object.count());
+    }
 }
 
 test "a non-object body is refused, not silently rewritten" {

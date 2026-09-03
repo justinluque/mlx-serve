@@ -88,15 +88,10 @@ pub fn aspectRatio(allocator: std.mem.Allocator, width: u32, height: u32) ![]u8 
     return std.fmt.allocPrint(allocator, "{d}:{d}", .{ width / g, height / g });
 }
 
-/// The user message: the `[USER]` template with `{{aspect_ratio}}` and
-/// `{{original_prompt}}` substituted. A template with no `{{original_prompt}}`
-/// placeholder (or no `[USER]` block at all) gets the prompt appended after a
-/// default framing line — the reference's own fallback. Caller frees.
-pub fn buildUserMessage(allocator: std.mem.Allocator, sections: Sections, prompt: []const u8, aspect: []const u8) ![]u8 {
-    const template = if (sections.user.len != 0)
-        sections.user
-    else
-        "TARGET IMAGE ASPECT RATIO: {{aspect_ratio}} (width:height).";
+/// Substitute `{{aspect_ratio}}` and `{{original_prompt}}` into one template.
+/// A template with no `{{original_prompt}}` placeholder gets the prompt
+/// appended after it instead — the reference's own fallback. Caller frees.
+fn fillTemplate(allocator: std.mem.Allocator, template: []const u8, prompt: []const u8, aspect: []const u8) ![]u8 {
     const with_aspect = try std.mem.replaceOwned(u8, allocator, template, "{{aspect_ratio}}", aspect);
     defer allocator.free(with_aspect);
     if (std.mem.indexOf(u8, with_aspect, "{{original_prompt}}") != null) {
@@ -105,20 +100,23 @@ pub fn buildUserMessage(allocator: std.mem.Allocator, sections: Sections, prompt
     return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ with_aspect, prompt });
 }
 
+/// The user message: the vendored `[USER]` template, filled. A file with no
+/// `[USER]` block falls back to a default framing line. Caller frees.
+pub fn buildUserMessage(allocator: std.mem.Allocator, sections: Sections, prompt: []const u8, aspect: []const u8) ![]u8 {
+    const template = if (sections.user.len != 0)
+        sections.user
+    else
+        "TARGET IMAGE ASPECT RATIO: {{aspect_ratio}} (width:height).";
+    return fillTemplate(allocator, template, prompt, aspect);
+}
+
 /// The user message for a GROUNDED img2img rewrite: `variation_addendum_v1`
-/// with `{{aspect_ratio}}`/`{{original_prompt}}` substituted, in place of the
-/// vendored `[USER]` template. Only call this once vision-encoding of the
-/// source actually succeeded — the addendum tells the model "an image is
-/// attached," so using it without one actually reaching the model produces a
-/// caption grounded in nothing. Caller frees.
+/// in place of the vendored `[USER]` template, same substitution. Only call
+/// this once vision-encoding of the source actually succeeded — the addendum
+/// tells the model "an image is attached," so using it without one reaching
+/// the model produces a caption grounded in nothing. Caller frees.
 pub fn buildUserMessageForVariation(allocator: std.mem.Allocator, prompt: []const u8, aspect: []const u8) ![]u8 {
-    const template = std.mem.trim(u8, variation_addendum_v1, " \t\r\n");
-    const with_aspect = try std.mem.replaceOwned(u8, allocator, template, "{{aspect_ratio}}", aspect);
-    defer allocator.free(with_aspect);
-    if (std.mem.indexOf(u8, with_aspect, "{{original_prompt}}") != null) {
-        return std.mem.replaceOwned(u8, allocator, with_aspect, "{{original_prompt}}", prompt);
-    }
-    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ with_aspect, prompt });
+    return fillTemplate(allocator, std.mem.trim(u8, variation_addendum_v1, " \t\r\n"), prompt, aspect);
 }
 
 // ── Rewriter output handling ──────────────────────────────────────────────
