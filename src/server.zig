@@ -4205,6 +4205,12 @@ fn magicPromptRewrite(
         .{ .role = "system", .content = sections.system },
         .{ .role = "user", .content = user_msg, .images = if (grounded) img_slice[0..] else null },
     };
+    // The vision path is driven by the SELECTED active-turn message, not the
+    // message list: `processVisionImages`, `insertMultimodalTokens` and
+    // `computeQwenMrope` all key on it (and on the user-marker count it
+    // carries) so the pad run lands under the right turn marker. Null here is
+    // exactly the ungrounded case — the lone user message has no images.
+    const active_media = activeTurnMediaMessage(&messages, false);
 
     // Vision-encode BEFORE templating: on failure this bails out entirely
     // (falls back to no rewrite) rather than templating a "an image is
@@ -4220,7 +4226,7 @@ fn magicPromptRewrite(
     if (grounded) {
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        vision_arr = processVisionImages(allocator, lm, lm.vision_encoder.?, &messages, &n_vis, &n_vid, &n_aud, &vision_key) catch |err| {
+        vision_arr = processVisionImages(allocator, lm, lm.vision_encoder.?, active_media, &n_vis, &n_vid, &n_aud, &vision_key) catch |err| {
             log.warn("[ideogram4] magic prompt: vision encode failed ({s}); skipping the rewrite\n", .{@errorName(err)});
             return .{ .skipped = "vision encode failed" };
         };
@@ -4236,7 +4242,7 @@ fn magicPromptRewrite(
     };
     var prompt_ids = prompt_ids_raw;
     if (grounded) {
-        const expanded = insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, 0, config.audio_token_id, 0, config, &messages) catch |err| {
+        const expanded = insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, 0, config.audio_token_id, 0, config, active_media) catch |err| {
             log.warn("[ideogram4] magic prompt: image-token insert failed ({s}); skipping the rewrite\n", .{@errorName(err)});
             allocator.free(prompt_ids_raw);
             return .{ .skipped = "image-token insert failed" };
@@ -4259,7 +4265,7 @@ fn magicPromptRewrite(
 
     // Qwen3-VL interleaved M-RoPE: no-op (empty bundle) for non-Qwen-vision
     // rewriter models or when this isn't a grounded request.
-    const local_mrope: MropeData = if (grounded) (computeQwenMrope(allocator, prompt_ids, &messages, config) catch MropeData{}) else MropeData{};
+    const local_mrope: MropeData = if (grounded) (computeQwenMrope(allocator, prompt_ids, if (active_media) |selected| selected.message else null, config) catch MropeData{}) else MropeData{};
     var mrope_pos = local_mrope.pos;
     defer if (mrope_pos) |p| allocator.free(p);
 
