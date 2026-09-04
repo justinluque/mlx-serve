@@ -110,6 +110,51 @@ final class CustomMediaRepoTests: XCTestCase {
         XCTAssertFalse(HFSearchService.mediaStructureSatisfied(markers: markers, files: raw))
     }
 
+    /// The disk check and this tree check read the SAME `readyMarkers`, so a
+    /// pattern only one of them understood would offer a community Krea pack in
+    /// search and then leave it permanently "incomplete" once downloaded (or
+    /// refuse to offer one the app would happily run). Krea's transformer is
+    /// matched by pattern because its filename carries the pack's quant width.
+    func testPatternMarkersMatchTheRepoRootAtAnyQuantWidth() {
+        let markers = CustomMediaModels.bundle(
+            arch: "krea2_turbo", repoId: "someone/Krea-2-Turbo-community")!.components[0].readyMarkers
+        func tree(_ transformer: String) -> [HFSearchService.TreeFileEntry] {
+            [.init(path: "config.json", size: 29),
+             .init(path: transformer, size: 9_382_954_530),
+             .init(path: "vae/diffusion_pytorch_model.safetensors", size: 9),
+             .init(path: "text_encoder/model.safetensors", size: 9),
+             .init(path: "tokenizer/tokenizer.json", size: 9)]
+        }
+        for name in ["transformer_mixed_3_8.safetensors", "transformer_mixed_4_8.safetensors",
+                     "transformer_8bit.safetensors", "turbo.safetensors"] {
+            XCTAssertTrue(HFSearchService.mediaStructureSatisfied(markers: markers, files: tree(name)),
+                          "\(name): a complete repo failed structure verification")
+        }
+        // The pattern proves a ROOT weights file: the subdir safetensors the
+        // other markers already cover must not stand in for the transformer.
+        XCTAssertFalse(HFSearchService.mediaStructureSatisfied(
+            markers: markers,
+            files: tree("transformer_mixed_3_8.safetensors").filter { !$0.path.hasSuffix("_3_8.safetensors") }))
+    }
+
+    /// The matcher itself: one `*`, one path component.
+    func testReadyMarkerPatternSemantics() {
+        XCTAssertTrue(MediaComponent.matches(marker: "*.safetensors", name: "turbo.safetensors"))
+        XCTAssertTrue(MediaComponent.matches(marker: "transformer*.safetensors",
+                                             name: "transformer_mixed_3_8.safetensors"))
+        // Never across a directory boundary — a weights file in `vae/` is not
+        // the transformer the marker is asking about.
+        XCTAssertFalse(MediaComponent.matches(marker: "*.safetensors", name: "vae/model.safetensors"))
+        XCTAssertFalse(MediaComponent.matches(marker: "*.safetensors", name: "config.json"))
+        // The `*` may match nothing, but the literal halves must both be there.
+        XCTAssertTrue(MediaComponent.matches(marker: "a*b", name: "ab"))
+        XCTAssertFalse(MediaComponent.matches(marker: "a*b", name: "a"))
+        // A marker with no `*` is an exact path, exactly as before.
+        XCTAssertFalse(MediaComponent.isPattern("config.json"))
+        XCTAssertTrue(MediaComponent.matches(marker: "config.json", name: "config.json"))
+        XCTAssertFalse(MediaComponent.matches(marker: "config.json", name: "config.json.partial"))
+    }
+
     func testDirectoryMarkersMatchByPathPrefix() {
         // FLUX markers name SUBDIRS ("vae", "tokenizer") — the tree only has
         // files, so a marker must match anything living under it.

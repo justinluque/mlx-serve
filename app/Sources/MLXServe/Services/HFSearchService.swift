@@ -274,13 +274,18 @@ class HFSearchService: ObservableObject {
         return model.estimatedSizeBytes == 0 && model.isCompatible
     }
 
-    /// Marker check against a repo TREE: a marker names a file (exact path)
-    /// or a directory (something must live under it). The markers are the
-    /// family bundle's own `readyMarkers` — the same contract a finished
-    /// download is checked against, applied before any bytes move.
+    /// Marker check against a repo TREE: a marker names a file (exact path),
+    /// a directory (something must live under it), or — carrying a `*` — a
+    /// pattern over the repo ROOT's own filenames. The markers are the family
+    /// bundle's own `readyMarkers` — the same contract a finished download is
+    /// checked against, applied before any bytes move, so the two must read a
+    /// pattern the same way or a repo is offered and then never completes.
     nonisolated static func mediaStructureSatisfied(markers: [String], files: [TreeFileEntry]) -> Bool {
         markers.allSatisfy { m in
-            files.contains { $0.path == m || $0.path.hasPrefix(m + "/") }
+            if MediaComponent.isPattern(m) {
+                return files.contains { MediaComponent.matches(marker: m, name: $0.path) }
+            }
+            return files.contains { $0.path == m || $0.path.hasPrefix(m + "/") }
         }
     }
 
