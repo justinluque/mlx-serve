@@ -48,9 +48,37 @@ struct MediaComponent: Equatable {
     /// Relative paths (file OR dir) that must exist for this component to be
     /// "ready". Combined with a generic "has at least one .safetensors" check
     /// so a config-only partial download never reads as ready.
+    ///
+    /// A marker carrying a `*` is a PATTERN over the component root's own
+    /// entries instead (`MediaComponent.matches`), for the case where a pack's
+    /// filename encodes something that is not part of the layout — see the
+    /// Krea factory.
     let readyMarkers: [String]
 
     static func == (l: MediaComponent, r: MediaComponent) -> Bool { l.repo == r.repo }
+
+    /// Whether `marker` is a pattern rather than an exact relative path.
+    static func isPattern(_ marker: String) -> Bool { marker.contains("*") }
+
+    /// A single `*` matched against ONE path component, so `*.safetensors`
+    /// answers for `turbo.safetensors` and `transformer_mixed_3_8.safetensors`
+    /// and never for `vae/model.safetensors` — a marker exists to prove a file
+    /// is at the place the engine reads it, and the weight subdirs already have
+    /// markers of their own.
+    ///
+    /// Shared by BOTH readers of `readyMarkers` — `DownloadManager` against the
+    /// disk and `HFSearchService` against a repo's HF tree — because a pattern
+    /// only one of them understood would make a pack downloadable and then
+    /// permanently incomplete, or the reverse.
+    static func matches(marker: String, name: String) -> Bool {
+        guard isPattern(marker) else { return marker == name }
+        guard !name.contains("/") else { return false }
+        let halves = marker.split(separator: "*", omittingEmptySubsequences: false)
+        guard halves.count == 2 else { return false }
+        let (prefix, suffix) = (String(halves[0]), String(halves[1]))
+        guard name.count >= prefix.count + suffix.count else { return false }
+        return name.hasPrefix(prefix) && name.hasSuffix(suffix)
+    }
 }
 
 /// A media model + its dependencies, downloaded as a unit. Today: FLUX/TTS are
@@ -306,6 +334,21 @@ extension MediaBundle {
     /// gated base repo); ready when the transformer file + three subdirs + config
     /// are present. Unlike FLUX the transformer is a top-level FILE, not a
     /// `transformer/` subdir — hence its own readyMarkers.
+    ///
+    /// **The transformer is matched by PATTERN, never by name** (live
+    /// 2026-09-04): the marker used to be `transformer_mixed_4_8.safetensors`,
+    /// the catalog pack's exact filename, so a locally built `…-mixed_3_8` pack
+    /// appeared in the picker — the server discovered it, loaded it and
+    /// generated from it — while this pane offered Download forever and kept
+    /// Generate disabled. A quant width is not part of the layout: `MixedLinear`
+    /// (`src/krea.zig`) solves (bits, group_size) from tensor geometry, so
+    /// 8bit / mixed-4-8 / mixed-3-8 / bf16 all load on one code path, and
+    /// `model.loadWeights` takes every root `*.safetensors` whatever it is
+    /// called (`turbo.safetensors` straight off upstream included). So the
+    /// marker states the thing that IS the contract — a weights file sitting at
+    /// the root, which is exactly what separates this layout from FLUX's — and
+    /// the pack is free to name it anything. Same class as the engine rule
+    /// "an engine that hardcodes its pack's quant WIDTH can only load that pack".
     static func krea(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
         MediaBundle(
             id: "krea:\(repo)",
@@ -314,7 +357,7 @@ extension MediaBundle {
                 MediaComponent(
                     repo: repo,
                     selection: FileSelection(recursive: true),
-                    readyMarkers: ["config.json", "transformer_mixed_4_8.safetensors", "vae", "text_encoder", "tokenizer"]
+                    readyMarkers: ["config.json", "*.safetensors", "vae", "text_encoder", "tokenizer"]
                 ),
             ],
             sizeEstimateGB: sizeGB

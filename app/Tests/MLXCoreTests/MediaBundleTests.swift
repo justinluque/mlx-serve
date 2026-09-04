@@ -555,12 +555,63 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(k.components[0].selection.recursive)
         XCTAssertNil(k.components[0].selection.keepSafetensors)
         // Transformer is a TOP-LEVEL FILE (not a `transformer/` subdir like FLUX),
-        // plus the three Qwen subdirs + config.
+        // plus the three Qwen subdirs + config. The file is matched by PATTERN,
+        // never by name: its name carries the pack's quant width, which is not
+        // a property of the layout (see the ready-at-any-width test below).
         let m = k.components[0].readyMarkers
-        XCTAssertTrue(m.contains("transformer_mixed_4_8.safetensors"))
+        XCTAssertTrue(m.contains("*.safetensors"))
         XCTAssertFalse(m.contains("transformer"))
         for marker in ["config.json", "vae", "text_encoder", "tokenizer"] {
             XCTAssertTrue(m.contains(marker), "missing readyMarker \(marker)")
+        }
+        // No marker may name a quant width — that is what made a mixed_3_8 pack
+        // read as permanently incomplete while the server served it happily.
+        for marker in m {
+            XCTAssertFalse(marker.contains("_4_8"), "readyMarker \(marker) pins one pack's quant width")
+        }
+    }
+
+    /// A Krea pack is READY at whatever width it was quantized to. The engine
+    /// solves (bits, group_size) from tensor geometry (`MixedLinear` in
+    /// `src/krea.zig`), so 8bit / mixed-4-8 / mixed-3-8 / bf16 all load on one
+    /// code path and the transformer's FILENAME is a naming convention, not a
+    /// contract — `model.loadWeights` takes every `*.safetensors` at the root
+    /// whatever it is called.
+    ///
+    /// Live 2026-09-04: a locally built `…-mixed_3_8` pack appeared in the
+    /// picker (the server discovered and served it — a generation ran end to
+    /// end) while the pane offered Download forever and kept Generate disabled,
+    /// because the marker demanded the 4-bit pack's exact filename.
+    func testKreaPackIsReadyAtAnyQuantWidth() throws {
+        let comp = ImageModelPreset.krea2Turbo.bundle.components[0]
+        let fm = FileManager.default
+
+        for transformerName in [
+            "transformer_mixed_3_8.safetensors",   // the pack this bug was found on
+            "transformer_mixed_4_8.safetensors",   // the catalog pack
+            "transformer_8bit.safetensors",        // the uniform-8bit build
+            "turbo.safetensors",                   // upstream's own filename
+        ] {
+            let root = NSTemporaryDirectory() + "kreawidth-\(UUID().uuidString)"
+            defer { try? fm.removeItem(atPath: root) }
+            let modelDir = (root as NSString).appendingPathComponent(comp.repo)
+            try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+            func path(_ name: String) -> String { (modelDir as NSString).appendingPathComponent(name) }
+
+            fm.createFile(atPath: path("config.json"), contents: Data(#"{"model_type":"krea2_turbo"}"#.utf8))
+            for sub in ["vae", "text_encoder", "tokenizer"] {
+                try fm.createDirectory(atPath: path(sub), withIntermediateDirectories: true)
+                fm.createFile(atPath: (path(sub) as NSString).appendingPathComponent("model.safetensors"),
+                              contents: Data([0, 1, 2]))
+            }
+            // Everything but the transformer: NOT ready. The transformer is the
+            // 9 GB file, so a pack missing it must not offer Generate.
+            XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root),
+                           "\(transformerName): ready with no top-level transformer")
+
+            fm.createFile(atPath: path(transformerName), contents: Data([0, 1, 2]))
+            XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root),
+                          "\(transformerName): a complete pack read as incomplete")
         }
     }
 

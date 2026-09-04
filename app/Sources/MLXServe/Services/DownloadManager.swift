@@ -1051,11 +1051,20 @@ class DownloadManager: ObservableObject {
     /// exist (file or dir), AND at least one `.safetensors` is present — so a
     /// config-only partial download isn't mistaken for ready. `nonisolated` +
     /// static so it's unit-testable against a temp dir.
+    ///
+    /// A marker carrying a `*` is matched against the dir's OWN entries
+    /// (`MediaComponent.matches`) rather than stat'd — see the Krea factory for
+    /// why a pack's filename is not always a contract.
     nonisolated static func componentReady(_ comp: MediaComponent, modelsRoot: String) -> Bool {
         guard let dir = existingModelDir(rootDir: modelsRoot, repoId: comp.repo) else { return false }
         let fm = FileManager.default
+        lazy var entries = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
         for marker in comp.readyMarkers {
-            guard fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) else { return false }
+            if MediaComponent.isPattern(marker) {
+                guard entries.contains(where: { MediaComponent.matches(marker: marker, name: $0) }) else { return false }
+            } else {
+                guard fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) else { return false }
+            }
         }
         return hasSafetensorsRecursive(dir)
     }
