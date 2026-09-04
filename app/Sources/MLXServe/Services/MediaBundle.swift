@@ -438,6 +438,29 @@ extension MediaBundle {
         )
     }
 
+    /// Z-Image / Z-Image-Turbo (diffusers layout): one repo with weight
+    /// subdirs (`transformer/`, `vae/`, `text_encoder/`, `tokenizer/`) and NO
+    /// root config.json — detection keys on `model_index.json`
+    /// (`_class_name == "ZImagePipeline"`), same shape as Mage-Flow. Recursive
+    /// download; ready when the index + all four component subdirs are
+    /// present. Turbo vs base is read from the DIRECTORY NAME
+    /// (`z_image.dirLooksTurbo`), so the repo id itself is the only signal —
+    /// no separate marker needed.
+    static func zImage(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "zimage:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["model_index.json", "transformer", "vae", "text_encoder", "tokenizer"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
     /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
     /// resolves the encoder from this exact path, so a rename here silently
@@ -463,6 +486,8 @@ extension ImageModelPreset {
             return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .mageFlowTurbo, .mageFlowEditTurbo:
             return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .zImage, .zImageTurbo:
+            return .zImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .flux2Klein9B:
             // The one MLX conversion of klein 9B ships no root config.json.
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB), hasRootConfig: false)

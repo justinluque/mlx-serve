@@ -129,7 +129,7 @@ enum GenExperiment: String, CaseIterable, Identifiable {
     /// Tooltip for the tile.
     var help: String {
         switch self {
-        case .image: "Image Generation (FLUX.2 / Krea-2)"
+        case .image: "Image Generation (FLUX.2 / Krea-2 / Z-Image)"
         case .video: "Video Generation (LTX-Video 2.3)"
         case .audio: "Audio Generation — voice cloning & music"
         case .model3d: "3D Generation — photo to mesh (Hunyuan3D 2.1)"
