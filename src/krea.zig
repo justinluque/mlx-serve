@@ -1419,9 +1419,70 @@ pub fn detachLora(dit: *Dit) void {
 const LATENTS_MEAN = [16]f32{ -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921 };
 const LATENTS_STD = [16]f32{ 2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.916 };
 
-/// Causal conv3d on NCTHW (T=1). weight [out,kt,kh,kw,in] MLX layout, f32.
+/// Causal conv3d on NCTHW. weight [out,kt,kh,kw,in] MLX layout, f32.
 /// Temporal pad is causal (2*pad_t before, 0 after); spatial pad symmetric.
+///
+/// At T=1 — every frame this decoder ever sees — the whole convolution collapses
+/// to its LAST temporal tap and runs as a plain conv2d. The causal pad puts only
+/// ZERO frames before x and none after, so taps 0..kt-2 convolve zeros and
+/// contribute exactly nothing; `causalConv3dVolume` is the reference the
+/// equivalence test pins this against.
+///
+/// The collapse is the decoder's whole memory story, not a micro-optimization.
+/// MLX splits an N=1, temporal-pad-0 conv3d into `kt` separate 2D convs and
+/// holds EVERY tap's winograd transform live until the command buffer completes
+/// (#321's class — but at T=1 there are no frames to chunk over, so LTX's
+/// `conv3dDepthChunked` has nothing to bite on). One 3x3x3 conv over a
+/// 1536x1024 f32 plane allocated 6+ GB for a 604 MB output; three planes of
+/// that in a row is what killed the process after a successful denoise.
 fn causalConv3d(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, pad: c_int, s: S) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    if (xsh[2] == 1 and conv3dT1Collapse()) {
+        const C = xsh[1];
+        const H = xsh[3];
+        const Wd = xsh[4];
+        const kt: c_int = mlx.getShape(w)[1];
+        const wsh = mlx.getShape(w);
+        const last = try sliceAxis(w, 1, kt - 1, kt, s); // [out,1,kh,kw,in]
+        defer _ = mlx.mlx_array_free(last);
+        const w4 = try reshape(last, &[_]c_int{ wsh[0], wsh[2], wsh[3], wsh[4] }, s);
+        defer _ = mlx.mlx_array_free(w4);
+        const w4c = try contig(w4, s);
+        defer _ = mlx.mlx_array_free(w4c);
+        const nchw = try reshape(x, &[_]c_int{ 1, C, H, Wd }, s);
+        defer _ = mlx.mlx_array_free(nchw);
+        const nhwc = try transpose(nchw, &[_]c_int{ 0, 2, 3, 1 }, s);
+        defer _ = mlx.mlx_array_free(nhwc);
+        const cv = try conv2d(nhwc, w4c, bias, pad, s); // (1,oH,oW,out)
+        defer _ = mlx.mlx_array_free(cv);
+        const osh = mlx.getShape(cv);
+        const back = try transpose(cv, &[_]c_int{ 0, 3, 1, 2 }, s); // NCHW
+        defer _ = mlx.mlx_array_free(back);
+        const five = try reshape(back, &[_]c_int{ 1, osh[3], 1, osh[1], osh[2] }, s);
+        defer _ = mlx.mlx_array_free(five);
+        // The volume arm hands back a materialized add; a strided view here
+        // would make every caller's raw read (and every downstream kernel's
+        // gather) pay for the transpose again.
+        return contig(five, s);
+    }
+    return causalConv3dVolume(x, w, bias, pad, s);
+}
+
+/// `MLX_SERVE_KREA_CONV3D_T1=0` restores the whole-volume conv3d (the A/B arm
+/// the equivalence test drives; the collapse is exact, so it is a debug lever).
+fn conv3dT1Collapse() bool {
+    return envDefaultOn("MLX_SERVE_KREA_CONV3D_T1");
+}
+
+/// A kill-switch env: absent or anything but "0" leaves the path ON.
+fn envDefaultOn(name: [*:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// The whole-volume causal conv3d — the reference `causalConv3d` collapses at
+/// T=1, and the arm any T>1 input still takes.
+fn causalConv3dVolume(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, pad: c_int, s: S) !mlx.mlx_array {
     var px = mlx.mlx_array{ .ctx = null };
     var padded = false;
     if (pad > 0) {
@@ -1455,8 +1516,40 @@ fn causalConv3d(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, pad: c_
     return addA(onc, b5, s);
 }
 
+/// `(rows + cols) x channels` a single conv band may span. MLX serves a 3x3
+/// stride-1 conv with >=256 combined channels by WINOGRAD, whose transform
+/// buffers are ~1.8x the plane's elements for input AND output together: the
+/// decoder's last 3x3 conv over a 1536x1536 plane allocated ~6.6 GB of them for
+/// a 0.9 GB output, and that single op was the decode's peak. `winograd_batch_step`
+/// only tiles over the BATCH axis, and this decoder's batch is always 1, so the
+/// bound has to come from us.
+pub const CONV_BAND_ELEMS: u64 = 64 << 20;
+
+/// Output rows per band under `CONV_BAND_ELEMS`; never 0.
+pub fn conv2dBandRows(w: u64, c: u64, o: u64, budget: u64) c_int {
+    const per_row = w * (c + o);
+    if (per_row == 0) return 1;
+    return @intCast(@max(1, @min(budget / per_row, std.math.maxInt(c_int))));
+}
+
 /// conv2d on NHWC, weight [out,kh,kw,in] f32, bias [out].
+///
+/// Split into row BANDS when the whole plane would exceed `CONV_BAND_ELEMS`.
+/// Exact: an output row reads only `kh` input rows, so a band computed from
+/// `[r, r + kh)` onward is the same band the whole-plane conv would produce.
+/// Height padding is applied ONCE up front so interior bands take none.
 fn conv2d(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, pad: c_int, s: S) !mlx.mlx_array {
+    const xsh = mlx.getShape(x); // NHWC
+    const wsh = mlx.getShape(w); // [out,kh,kw,in]
+    const kh = wsh[1];
+    const out_rows = xsh[1] + 2 * pad - kh + 1;
+    const band = conv2dBandRows(@intCast(xsh[2]), @intCast(xsh[3]), @intCast(wsh[0]), CONV_BAND_ELEMS);
+    if (out_rows <= band or !convBanded()) return conv2dWholePlane(x, w, bias, pad, s);
+    return conv2dBanded(x, w, bias, pad, band, s);
+}
+
+/// The unsplit conv2d — the reference `conv2dBanded` is pinned against.
+fn conv2dWholePlane(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, pad: c_int, s: S) !mlx.mlx_array {
     const xc = try contig(x, s);
     defer _ = mlx.mlx_array_free(xc);
     var o = mlx.mlx_array_new();
@@ -1465,15 +1558,77 @@ fn conv2d(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, pad: c_int, s
     return addA(o, bias, s);
 }
 
+fn conv2dBanded(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, pad: c_int, band: c_int, s: S) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    const H = xsh[1];
+    const kh = mlx.getShape(w)[1];
+    const out_rows = H + 2 * pad - kh + 1;
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var start: c_int = 0;
+    while (start < out_rows) : (start += band) {
+        const n = @min(band, out_rows - start);
+        // Rows this band reads, in the padded frame, clipped back to the real
+        // input. Only the missing edge rows are materialized — padding the
+        // whole plane up front would cost as much as the transform buffers
+        // this banding exists to avoid.
+        const want_lo = start - pad;
+        const want_hi = start + n + kh - 1 - pad;
+        const lo = @max(want_lo, 0);
+        const hi = @min(want_hi, H);
+        const rows = try sliceAxis(x, 1, lo, hi, s);
+        defer _ = mlx.mlx_array_free(rows);
+        const top = lo - want_lo;
+        const bot = want_hi - hi;
+        var fed = rows;
+        var owns_fed = false;
+        if (top > 0 or bot > 0) {
+            const axes = [_]c_int{1};
+            const low = [_]c_int{top};
+            const high = [_]c_int{bot};
+            const zero = scalarF(0.0);
+            defer _ = mlx.mlx_array_free(zero);
+            var pv = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_pad(&pv, rows, &axes, 1, &low, 1, &high, 1, zero, "constant", s));
+            fed = pv;
+            owns_fed = true;
+        }
+        defer if (owns_fed) {
+            _ = mlx.mlx_array_free(fed);
+        };
+        const rc = try contig(fed, s);
+        defer _ = mlx.mlx_array_free(rc);
+        var ob = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ob);
+        try mlx.check(mlx.mlx_conv2d(&ob, rc, w, 1, 1, 0, pad, 1, 1, 1, s));
+        const withb = try addA(ob, bias, s);
+        defer _ = mlx.mlx_array_free(withb);
+        _ = mlx.mlx_array_eval(withb); // bound the transient to this band
+        _ = mlx.mlx_vector_array_append_value(vec, withb);
+    }
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+    return out;
+}
+
+/// `MLX_SERVE_KREA_CONV_BAND=0` restores the whole-plane conv2d.
+fn convBanded() bool {
+    return envDefaultOn("MLX_SERVE_KREA_CONV_BAND");
+}
+
 /// Qwen-Image RMSNorm over the CHANNEL axis (axis 1) of NCTHW: x / max(||x||₂,eps)
 /// * sqrt(C) * weight. weight [C] f32.
 fn rmsChannels(x: mlx.mlx_array, weight: mlx.mlx_array, s: S) !mlx.mlx_array {
+    // Every full-size temporary is released the moment it is consumed rather
+    // than at scope exit. Same ops in the same order — but at the decoder's
+    // last stage one plane is ~0.9 GB, and holding six of them to the `return`
+    // is most of what made a 1536x1536 decode a 14 GB transient.
     const C: c_int = mlx.getShape(x)[1];
     const sq = try mulA(x, x, s);
-    defer _ = mlx.mlx_array_free(sq);
     var sumsq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sumsq);
     try mlx.check(mlx.mlx_sum_axis(&sumsq, sq, 1, true, s));
+    _ = mlx.mlx_array_free(sq);
     var l2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(l2);
     try mlx.check(mlx.mlx_sqrt(&l2, sumsq, s));
@@ -1483,14 +1638,17 @@ fn rmsChannels(x: mlx.mlx_array, weight: mlx.mlx_array, s: S) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(denom);
     try mlx.check(mlx.mlx_maximum(&denom, l2, eps, s));
     const xn = try divA(x, denom, s);
-    defer _ = mlx.mlx_array_free(xn);
+    boundTape(xn);
     const sc = scalarF(std.math.sqrt(@as(f32, @floatFromInt(C))));
     defer _ = mlx.mlx_array_free(sc);
     const xs = try mulA(xn, sc, s);
-    defer _ = mlx.mlx_array_free(xs);
+    _ = mlx.mlx_array_free(xn);
     const w5 = try reshape(weight, &[_]c_int{ 1, C, 1, 1, 1 }, s);
     defer _ = mlx.mlx_array_free(w5);
-    return mulA(xs, w5, s);
+    const out = try mulA(xs, w5, s);
+    boundTape(out);
+    _ = mlx.mlx_array_free(xs);
+    return out;
 }
 
 const ResBlock3D = struct {
@@ -1508,17 +1666,23 @@ const ResBlock3D = struct {
         if (self.skb) |x| _ = mlx.mlx_array_free(x);
     }
     fn forward(self: *const ResBlock3D, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        // Strictly sequential, so each stage is freed as soon as the next has
+        // consumed it: only `x` and the current tensor are ever live.
         const h0 = try rmsChannels(x, self.n1, s);
-        defer _ = mlx.mlx_array_free(h0);
         const a0 = try silu(h0, s);
-        defer _ = mlx.mlx_array_free(a0);
+        boundTape(a0);
+        _ = mlx.mlx_array_free(h0);
         const c1 = try causalConv3d(a0, self.c1w, self.c1b, 1, s);
-        defer _ = mlx.mlx_array_free(c1);
+        boundTape(c1);
+        _ = mlx.mlx_array_free(a0);
         const h1 = try rmsChannels(c1, self.n2, s);
-        defer _ = mlx.mlx_array_free(h1);
         const a1 = try silu(h1, s);
-        defer _ = mlx.mlx_array_free(a1);
+        boundTape(a1);
+        _ = mlx.mlx_array_free(c1);
+        _ = mlx.mlx_array_free(h1);
         const c2 = try causalConv3d(a1, self.c2w, self.c2b, 1, s);
+        boundTape(c2);
+        _ = mlx.mlx_array_free(a1);
         defer _ = mlx.mlx_array_free(c2);
         if (self.skw) |skw| {
             const sc = try causalConv3d(x, skw, self.skb.?, 0, s);
@@ -1528,6 +1692,58 @@ const ResBlock3D = struct {
         return addA(c2, x, s);
     }
 };
+
+/// Query rows per attention chunk. The mid block is ONE head of width `C`
+/// (384 here), and MLX has no fused kernel at that head dim — every head dim it
+/// serves is in {64, 72, 80, 96, 128, 192, 256} — so the whole block falls to
+/// the unfused arm, which MATERIALIZES a [HW, HW] f32 score matrix. HW is the
+/// latent grid, so that term is quadratic in PIXELS: 1.0 GB at 1024x1024,
+/// 5.4 GB at 1536x1536, 17 GB at 2048x2048, and each of matmul and softmax
+/// holds one. Chunking the QUERY rows is exact — a softmax row normalizes over
+/// keys alone, so each block's output is its own final answer — and it turns
+/// the term into `MID_ATTN_Q_CHUNK x HW` per step.
+pub const MID_ATTN_Q_CHUNK: c_int = 4096;
+
+/// `mlx_fast_scaled_dot_product_attention` over query blocks. Whole-tensor when
+/// it already fits in one block, so small images pay nothing.
+fn midAttention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: S) !mlx.mlx_array {
+    const rows: c_int = mlx.getShape(q)[2];
+    if (rows <= MID_ATTN_Q_CHUNK or !midAttnChunked()) {
+        const null_a = mlx.mlx_array{ .ctx = null };
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, false, s));
+        return o;
+    }
+    return midAttentionChunked(q, k, v, scale, MID_ATTN_Q_CHUNK, s);
+}
+
+fn midAttentionChunked(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, chunk: c_int, s: S) !mlx.mlx_array {
+    const rows: c_int = mlx.getShape(q)[2];
+    const null_a = mlx.mlx_array{ .ctx = null };
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var start: c_int = 0;
+    while (start < rows) : (start += chunk) {
+        const stop = @min(start + chunk, rows);
+        const qb = try sliceAxis(q, 2, start, stop, s);
+        defer _ = mlx.mlx_array_free(qb);
+        const qc = try contig(qb, s);
+        defer _ = mlx.mlx_array_free(qc);
+        var ob = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ob);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ob, qc, k, v, scale, "", null_a, null_a, false, s));
+        _ = mlx.mlx_array_eval(ob); // bound the transient to this block
+        _ = mlx.mlx_vector_array_append_value(vec, ob);
+    }
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
+    return out;
+}
+
+/// `MLX_SERVE_KREA_ATTN_CHUNK=0` restores the single whole-grid dispatch.
+fn midAttnChunked() bool {
+    return envDefaultOn("MLX_SERVE_KREA_ATTN_CHUNK");
+}
 
 const AttnBlock3D = struct {
     norm: mlx.mlx_array,
@@ -1562,10 +1778,8 @@ const AttnBlock3D = struct {
         const v = try sliceAxis(flat, 3, 2 * C, 3 * C, s);
         defer _ = mlx.mlx_array_free(v);
         const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(C)));
-        var attn = mlx.mlx_array_new();
+        const attn = try midAttention(q, k, v, scale, s); // (1,1,HW,C)
         defer _ = mlx.mlx_array_free(attn);
-        const null_a = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "", null_a, null_a, false, s)); // (1,1,HW,C)
         const ar = try reshape(attn, &[_]c_int{ 1, H, Wd, C }, s); // NHWC
         defer _ = mlx.mlx_array_free(ar);
         const pj = try conv2d(ar, self.proj_w, self.proj_b, 0, s); // (1,H,W,C)
@@ -1594,6 +1808,7 @@ const UpBlock3D = struct {
         var first = true;
         for (self.resnets) |*r| {
             const nh = try r.forward(if (first) x else h, s);
+            boundTape(nh);
             if (!first) _ = mlx.mlx_array_free(h);
             h = nh;
             first = false;
@@ -1618,18 +1833,36 @@ fn upsample(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx
     const nhwc = try transpose(nchw, &[_]c_int{ 0, 2, 3, 1 }, s); // NHWC
     defer _ = mlx.mlx_array_free(nhwc);
     var r1 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(r1);
     try mlx.check(mlx.mlx_repeat_axis(&r1, nhwc, 2, 1, s)); // H
     var r2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(r2);
     try mlx.check(mlx.mlx_repeat_axis(&r2, r1, 2, 2, s)); // W
+    boundTape(r2);
+    _ = mlx.mlx_array_free(r1); // the 2x intermediate; the 4x one is next
     const cv = try conv2d(r2, w, b, 1, s); // (1,2H,2W,outC)
     defer _ = mlx.mlx_array_free(cv);
+    boundTape(cv);
     const outc: c_int = mlx.getShape(cv)[3];
     const back = try transpose(cv, &[_]c_int{ 0, 3, 1, 2 }, s); // NCHW
     defer _ = mlx.mlx_array_free(back);
     return reshape(back, &[_]c_int{ 1, outc, 1, 2 * H, 2 * Wd }, s); // NCTHW
 }
+
+/// Materialize `x` so the decoder's tape stops here.
+///
+/// MLX is lazy: freeing an intermediate's handle releases NOTHING while the
+/// graph still needs it, so an unevaluated decoder holds EVERY stage's tensors
+/// until the single eval at the end. At the last up block one plane is ~0.9 GB
+/// at 1536x1536, and the whole decode was a 13 GB transient on top of a
+/// resident engine. Cutting the tape after each op that produces a full-size
+/// plane bounds the live set to the handful the next op actually reads; the
+/// result is bit-identical, since an eval only forces work already scheduled.
+/// `MLX_SERVE_KREA_VAE_STAGE_EVAL=0` restores the single end-of-decode eval.
+fn boundTape(x: mlx.mlx_array) void {
+    if (tape_bound == null) tape_bound = envDefaultOn("MLX_SERVE_KREA_VAE_STAGE_EVAL");
+    if (tape_bound.?) _ = mlx.mlx_array_eval(x);
+}
+var tape_bound: ?bool = null;
 
 pub const Vae = struct {
     allocator: std.mem.Allocator,
@@ -1693,11 +1926,18 @@ pub const Vae = struct {
             const nh = try self.mid_r1.forward(h, s);
             _ = mlx.mlx_array_free(h);
             h = nh;
+            boundTape(h);
         }
         for (&self.up_blocks) |*b| {
             const nh = try b.forward(h, s);
             _ = mlx.mlx_array_free(h);
             h = nh;
+            // Bound the tape. Unevaluated, the whole decoder is ONE graph and
+            // every stage's intermediates stay live for the single eval at the
+            // end; the up blocks are where the tensors are biggest, so the
+            // difference is GB. Bit-identical — an eval only forces work that
+            // was going to happen anyway.
+            boundTape(h);
         }
         {
             const nh = try rmsChannels(h, self.norm_out, s);
@@ -2873,4 +3113,202 @@ test "krea end-to-end pipeline matches reference image" {
 test "swigluDim matches reference roundup" {
     try testing.expectEqual(@as(u32, 16384), swigluDim(6144, 4));
     try testing.expectEqual(@as(u32, 6912), swigluDim(2560, 4));
+}
+
+// A causal conv3d over a SINGLE frame must be bit-identical to the whole-volume
+// 3D convolution it replaces: the causal pad puts only ZERO frames before x, so
+// every temporal tap but the last convolves zeros. Hermetic — random weights.
+test "krea causalConv3d at T=1 matches the whole-volume 3D convolution" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+    const C: c_int = 32;
+    const O: c_int = 48;
+    const H: c_int = 17;
+    const Wd: c_int = 13;
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+    const xn: usize = @intCast(C * H * Wd);
+    const xb = try a.alloc(f32, xn);
+    defer a.free(xb);
+    for (xb) |*v| v.* = rnd.float(f32) * 2 - 1;
+    const bb = try a.alloc(f32, @intCast(O));
+    defer a.free(bb);
+    for (bb) |*v| v.* = rnd.float(f32) * 0.1;
+    const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, C, 1, H, Wd }, 5, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const b = mlx.mlx_array_new_data(bb.ptr, &[_]c_int{O}, 1, .float32);
+    defer _ = mlx.mlx_array_free(b);
+    // The two (kernel, pad) shapes the decoder actually builds: 3x3x3 causal
+    // convs at pad 1, and the 1x1x1 post_quant / conv_shortcut at pad 0.
+    const cases = [_][2]c_int{ .{ 3, 1 }, .{ 1, 0 } };
+    for (cases) |cs| {
+        const kt = cs[0];
+        const pad = cs[1];
+        const wn: usize = @intCast(O * kt * kt * kt * C);
+        const wb = try a.alloc(f32, wn);
+        defer a.free(wb);
+        for (wb) |*v| v.* = rnd.float(f32) * 0.1 - 0.05;
+        const w = mlx.mlx_array_new_data(wb.ptr, &[_]c_int{ O, kt, kt, kt, C }, 5, .float32);
+        defer _ = mlx.mlx_array_free(w);
+        const ref = try causalConv3dVolume(x, w, b, pad, s);
+        defer _ = mlx.mlx_array_free(ref);
+        const got = try causalConv3d(x, w, b, pad, s);
+        defer _ = mlx.mlx_array_free(got);
+        _ = mlx.mlx_array_eval(ref);
+        _ = mlx.mlx_array_eval(got);
+        try testing.expectEqual(mlx.mlx_array_size(ref), mlx.mlx_array_size(got));
+        try testing.expectEqualSlices(c_int, mlx.getShape(ref)[0..5], mlx.getShape(got)[0..5]);
+        const rd = mlx.mlx_array_data_float32(ref) orelse return error.NoData;
+        const gd = mlx.mlx_array_data_float32(got) orelse return error.NoData;
+        const n: usize = @intCast(mlx.mlx_array_size(ref));
+        var worst: f32 = 0;
+        for (rd[0..n], gd[0..n]) |r, g| worst = @max(worst, @abs(r - g));
+        std.debug.print("[krea-conv3d-t1] kt={d} pad={d} worst_abs={e}\n", .{ kt, pad, worst });
+        try testing.expect(worst < 2e-5);
+    }
+}
+
+// Banding a conv2d over output ROWS is exact — each band is computed from the
+// `kh` input rows it reads, so it is the same band the whole-plane conv writes.
+// Hermetic; the band size is forced small so the split actually happens.
+test "krea banded conv2d matches the whole-plane conv2d" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+    const C: c_int = 32;
+    const O: c_int = 16;
+    const H: c_int = 37;
+    const Wd: c_int = 23;
+    var prng = std.Random.DefaultPrng.init(0xBA11D);
+    const rnd = prng.random();
+    const xb = try a.alloc(f32, @intCast(H * Wd * C));
+    defer a.free(xb);
+    for (xb) |*v| v.* = rnd.float(f32) * 2 - 1;
+    const bb = try a.alloc(f32, @intCast(O));
+    defer a.free(bb);
+    for (bb) |*v| v.* = rnd.float(f32);
+    const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, H, Wd, C }, 4, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const b = mlx.mlx_array_new_data(bb.ptr, &[_]c_int{O}, 1, .float32);
+    defer _ = mlx.mlx_array_free(b);
+    for ([_][2]c_int{ .{ 3, 1 }, .{ 3, 0 }, .{ 1, 0 } }) |cs| {
+        const kh = cs[0];
+        const pad = cs[1];
+        const wb = try a.alloc(f32, @intCast(O * kh * kh * C));
+        defer a.free(wb);
+        for (wb) |*v| v.* = rnd.float(f32) * 0.1;
+        const w = mlx.mlx_array_new_data(wb.ptr, &[_]c_int{ O, kh, kh, C }, 4, .float32);
+        defer _ = mlx.mlx_array_free(w);
+        const whole = try conv2dWholePlane(x, w, b, pad, s);
+        defer _ = mlx.mlx_array_free(whole);
+        const banded = try conv2dBanded(x, w, b, pad, 7, s);
+        defer _ = mlx.mlx_array_free(banded);
+        _ = mlx.mlx_array_eval(whole);
+        _ = mlx.mlx_array_eval(banded);
+        try testing.expectEqualSlices(c_int, mlx.getShape(whole), mlx.getShape(banded));
+        const n: usize = @intCast(mlx.mlx_array_size(whole));
+        const wd = mlx.mlx_array_data_float32(whole) orelse return error.NoData;
+        const bd = mlx.mlx_array_data_float32(banded) orelse return error.NoData;
+        var worst: f32 = 0;
+        for (wd[0..n], bd[0..n]) |p, q| worst = @max(worst, @abs(p - q));
+        std.debug.print("[krea-conv-band] kh={d} pad={d} worst_abs={e}\n", .{ kh, pad, worst });
+        try testing.expect(worst == 0);
+    }
+}
+
+// A band count must fall out of the budget, not a hand-picked constant.
+test "conv2dBandRows splits only past the budget" {
+    // 1536-wide plane, 192 in / 96 out: 442k elements a row, 64M budget.
+    try testing.expectEqual(@as(c_int, 151), conv2dBandRows(1536, 192, 96, 64 << 20));
+    // A small plane takes the whole thing in one band.
+    try testing.expect(conv2dBandRows(64, 96, 96, 64 << 20) >= 1024);
+    // Never zero, however wide the row.
+    try testing.expectEqual(@as(c_int, 1), conv2dBandRows(1 << 20, 4096, 4096, 1024));
+}
+
+// A softmax row normalizes over KEYS alone, so an attention output computed in
+// query blocks is the same output computed whole. Hermetic; the chunk is forced
+// small so the split actually happens.
+test "krea mid attention in query blocks matches the whole-grid dispatch" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+    const rows: c_int = 300;
+    const C: c_int = 96;
+    var prng = std.Random.DefaultPrng.init(0xA77);
+    const rnd = prng.random();
+    var arrs: [3]mlx.mlx_array = undefined;
+    for (&arrs) |*arr| {
+        const buf = try a.alloc(f32, @intCast(rows * C));
+        defer a.free(buf);
+        for (buf) |*v| v.* = rnd.float(f32) * 2 - 1;
+        arr.* = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, 1, rows, C }, 4, .float32);
+    }
+    defer for (&arrs) |*arr| {
+        _ = mlx.mlx_array_free(arr.*);
+    };
+    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(C)));
+    const null_a = mlx.mlx_array{ .ctx = null };
+    var whole = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(whole);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&whole, arrs[0], arrs[1], arrs[2], scale, "", null_a, null_a, false, s));
+    const blocked = try midAttentionChunked(arrs[0], arrs[1], arrs[2], scale, 64, s);
+    defer _ = mlx.mlx_array_free(blocked);
+    _ = mlx.mlx_array_eval(whole);
+    _ = mlx.mlx_array_eval(blocked);
+    try testing.expectEqualSlices(c_int, mlx.getShape(whole), mlx.getShape(blocked));
+    const n: usize = @intCast(mlx.mlx_array_size(whole));
+    const wd = mlx.mlx_array_data_float32(whole) orelse return error.NoData;
+    const bd = mlx.mlx_array_data_float32(blocked) orelse return error.NoData;
+    var worst: f32 = 0;
+    for (wd[0..n], bd[0..n]) |p, q| worst = @max(worst, @abs(p - q));
+    std.debug.print("[krea-attn-block] worst_abs={e}\n", .{worst});
+    try testing.expect(worst < 1e-6);
+}
+
+// The class guard for the higher-resolution decode crash (#krea-vae-decode):
+// the DiT finished, the VAE decode allocated more than the machine had left,
+// and Metal aborted the process. Measured peaks on an M-series 32 GB Mac with
+// nothing else resident, before -> after: 1024x1024 10.25 -> 3.72 GB,
+// 1024x1536 11.17 -> 5.01, 1536x1536 20.72 -> 6.96, 2048x2048 died -> 11.64.
+// The bar is set above the measured number with room for kernel-selection
+// drift; it is an order-of-magnitude guard, not a benchmark.
+// KREA_TEST_MODEL, optional KREA_MEM_SIZES ("WxH,...").
+test "krea VAE decode transient stays bounded at high resolution" {
+    const model_dir = std.mem.span(std.c.getenv("KREA_TEST_MODEL") orelse return error.SkipZigTest);
+    const sizes = if (std.c.getenv("KREA_MEM_SIZES")) |v| std.mem.span(v) else "1024x1536";
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var vae = try loadVae(io, a, s, model_dir);
+    defer vae.deinit();
+    var it = std.mem.splitScalar(u8, sizes, ',');
+    while (it.next()) |tok| {
+        var xy = std.mem.splitScalar(u8, tok, 'x');
+        const w = try std.fmt.parseInt(c_int, std.mem.trim(u8, xy.next().?, " "), 10);
+        const h = try std.fmt.parseInt(c_int, std.mem.trim(u8, xy.next().?, " "), 10);
+        const lw = @divExact(w, 8);
+        const lh = @divExact(h, 8);
+        const n: usize = @intCast(16 * lh * lw);
+        const buf = try a.alloc(f32, n);
+        defer a.free(buf);
+        for (buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 97)) / 97.0 - 0.5;
+        const lat = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, 16, lh, lw }, 4, .float32);
+        defer _ = mlx.mlx_array_free(lat);
+        _ = mlx.mlx_reset_peak_memory();
+        const dec = try vae.decode(lat);
+        _ = mlx.mlx_array_eval(dec);
+        var peak: usize = 0;
+        _ = mlx.mlx_get_peak_memory(&peak);
+        _ = mlx.mlx_array_free(dec);
+        // The decoded image itself, f32 RGB.
+        const image_bytes: u64 = @as(u64, @intCast(w)) * @as(u64, @intCast(h)) * 3 * 4;
+        const ratio = @as(f64, @floatFromInt(peak)) / @as(f64, @floatFromInt(image_bytes));
+        std.debug.print("[krea-mem] {d}x{d}: peak={d:.2} GB ({d:.1}x the decoded image)\n", .{ w, h, @as(f64, @floatFromInt(peak)) / 1073741824.0, ratio });
+        // 1024x1536 measures 3.65 GB; 5 leaves room for kernel-selection drift
+        // without letting the 11 GB regression back through.
+        try testing.expect(peak < 5 * 1024 * 1024 * 1024);
+    }
 }
