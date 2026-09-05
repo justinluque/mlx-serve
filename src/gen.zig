@@ -652,7 +652,15 @@ pub fn videoRgbTransportReason(delivered_frames: u32, width: u32, height: u32) ?
 /// The magic-prompt rewriter needs both before the job is built: the caption's
 /// `aspect_ratio` field is the first thing the system prompt asks for, and it
 /// drives every bbox in the caption that follows.
-pub const GenBodyPrompt = struct { prompt: []const u8, width: u32, height: u32 };
+pub const GenBodyPrompt = struct {
+    prompt: []const u8,
+    width: u32,
+    height: u32,
+    /// Whether the CLIENT chose the size. `handleImage` tracks the same bit
+    /// for the same reason: an edit with no size means "keep the source's
+    /// resolution", which is indistinguishable from an explicit 1024x1024.
+    size_given: bool = false,
+};
 
 pub fn promptAndSizeFromGenBody(body: []const u8) GenBodyPrompt {
     var out = GenBodyPrompt{ .prompt = "", .width = 1024, .height = 1024 };
@@ -661,9 +669,31 @@ pub fn promptAndSizeFromGenBody(body: []const u8) GenBodyPrompt {
         if (parseSize(size)) |wh| {
             out.width = wh.w;
             out.height = wh.h;
+            out.size_given = true;
         }
     }
     return out;
+}
+
+/// The canvas a caption should be composed for.
+///
+/// The magic-prompt rewrite runs before the image model is even resolved, so
+/// it cannot ask the engine what it will render at — it has to predict, and
+/// the aspect ratio it commits to drives every bbox in the caption. The body's
+/// `size` is that answer until the body has no size: an EDIT with no size
+/// means "match the source" (the reference's `max_size = source size`, which
+/// `handleImage` honors through `resolveEditTargetSize`), and the caption was
+/// being composed for a 1:1 canvas the render never used.
+///
+/// Only the RATIO matters here, so the engine's own per-backend clamping (a
+/// multiple of 16, a max dimension) is deliberately not modelled: both are
+/// aspect-preserving to within a rounding step.
+pub fn captionCanvasFor(size_given: bool, req: Dims, src_native: ?Dims, is_variation: bool) Dims {
+    if (size_given) return req;
+    // Variation shares the OUTPUT grid — the source is cover-cropped into it,
+    // so the requested (or default) size still rules.
+    if (is_variation) return req;
+    return src_native orelse req;
 }
 
 /// How a request wants its prompt handled before it reaches the model.
@@ -1810,7 +1840,7 @@ fn fitAspect(src_w: u32, src_h: u32, budget_w: u32, budget_h: u32) struct { w: u
 /// squaring the image off.
 /// Named so the two geometry helpers below can hand results to each other —
 /// Zig treats each anonymous `struct { w, h }` as a distinct type.
-const Dims = struct { w: u32, h: u32 };
+pub const Dims = struct { w: u32, h: u32 };
 
 fn fitWithinCap(w: u32, h: u32, cap: u32) Dims {
     const longest = @max(w, h);
@@ -1835,7 +1865,7 @@ fn resolveEditTargetSize(src_w: u32, src_h: u32, budget_w: u32, budget_h: u32, c
 }
 
 /// Native pixel dims of an encoded PNG/JPEG, without decoding the pixels.
-fn imageNativeSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
+pub fn imageNativeSize(encoded: []const u8) ?Dims {
     var w: c_int = 0;
     var h: c_int = 0;
     var ch: c_int = 0;
@@ -2323,17 +2353,46 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     defer allocator.free(b64);
     _ = std.base64.standard.Encoder.encode(b64, png_bytes);
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    try out.appendSlice(allocator, if (want_stream) "data: {\"type\":\"complete\",\"data\":[{\"b64_json\":\"" else "{\"created\":0,\"data\":[{\"b64_json\":\"");
-    try out.appendSlice(allocator, b64);
-    try out.appendSlice(allocator, if (want_stream) "\"}]}\n\n" else "\"}]}");
+    // `revised_prompt`: the caption the renderer actually saw, echoed back the
+    // way OpenAI's own images API does it. `withRewrittenPrompt` put it on the
+    // body, so it arrives here already JSON-escaped — pass the RAW span
+    // through rather than unescaping and re-escaping it.
+    const revised_raw = extractJsonString(body, "revised_prompt");
+    const out = try imageResponseJson(allocator, b64, revised_raw, want_stream);
+    defer allocator.free(out);
     log.info("[image] -> {d} PNG bytes ({d} b64)\n", .{ png_bytes.len, b64.len });
     if (want_stream) {
-        try conn.writeAll(out.items);
+        try conn.writeAll(out);
         return;
     }
-    return sendBytesJson(conn, allocator, out.items);
+    return sendBytesJson(conn, allocator, out);
+}
+
+/// The image response body: one `data` row carrying the PNG, plus the caption
+/// the renderer saw when a rewriter replaced the caller's prompt.
+///
+/// `revised_prompt_raw` is the RAW (still JSON-escaped) span from the request
+/// body, so it splices in byte-exact; null omits the key entirely — an absent
+/// field says "your prompt is what was rendered", which an empty string does
+/// not. Streaming wraps the same object in the SSE `complete` event.
+fn imageResponseJson(
+    allocator: std.mem.Allocator,
+    b64: []const u8,
+    revised_prompt_raw: ?[]const u8,
+    want_stream: bool,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, if (want_stream) "data: {\"type\":\"complete\",\"data\":[{\"b64_json\":\"" else "{\"created\":0,\"data\":[{\"b64_json\":\"");
+    try out.appendSlice(allocator, b64);
+    try out.appendSlice(allocator, "\"");
+    if (revised_prompt_raw) |r| {
+        try out.appendSlice(allocator, ",\"revised_prompt\":\"");
+        try out.appendSlice(allocator, r);
+        try out.appendSlice(allocator, "\"");
+    }
+    try out.appendSlice(allocator, if (want_stream) "}]}\n\n" else "}]}");
+    return out.toOwnedSlice(allocator);
 }
 
 /// POST /v1/audio/speech — WAV bytes (or SSE progress + base64-WAV complete).
@@ -5923,4 +5982,61 @@ test "ideogram4 classifies as image media on both sides of the duplicated predic
         "unconditional_transformer/config.json",
         discovery.requiredMediaMarker("ideogram4").?,
     );
+}
+
+test "the caption is composed for the canvas that will actually render" {
+    // The rewriter runs before the image model is even resolved, so it has to
+    // PREDICT the render's canvas — and the aspect ratio it commits to drives
+    // every bbox in the caption. Reading the body's `size` is right until the
+    // body has no size: an edit with no size means "match the source" (the
+    // reference's `max_size = source size`), and the caption was being told
+    // 1:1 for a render that came back at the source's shape.
+    const req = Dims{ .w = 512, .h = 800 };
+    const src = Dims{ .w = 1600, .h = 900 };
+
+    // An explicit size is the canvas, source or no source.
+    try std.testing.expectEqual(req, captionCanvasFor(true, req, null, false));
+    try std.testing.expectEqual(req, captionCanvasFor(true, req, src, false));
+    try std.testing.expectEqual(req, captionCanvasFor(true, req, src, true));
+
+    // No size + an EDIT source: the source's own shape is the canvas.
+    try std.testing.expectEqual(src, captionCanvasFor(false, req, src, false));
+
+    // No size + a VARIATION source: variation shares the OUTPUT grid and
+    // cover-crops the source into it, so the requested size still rules.
+    try std.testing.expectEqual(req, captionCanvasFor(false, req, src, true));
+
+    // No size, no source: whatever the body defaulted to.
+    try std.testing.expectEqual(req, captionCanvasFor(false, req, null, false));
+}
+
+test "an image response echoes the caption the renderer actually saw" {
+    // A rewriter is only honest if the caller can see what it produced —
+    // OpenAI's own images API answers with `revised_prompt` for exactly this
+    // reason. `withRewrittenPrompt` had been setting the field on the internal
+    // body since it landed, and the response dropped it on the floor.
+    const a = std.testing.allocator;
+
+    // The caption rides through as the body's RAW (already-escaped) span, so
+    // a caption full of quotes round-trips without a second escape pass.
+    const with = try imageResponseJson(a, "QUJD", "{\\\"a\\\":\\\"b\\\"}", false);
+    defer a.free(with);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, with, .{});
+    defer parsed.deinit();
+    const row = parsed.value.object.get("data").?.array.items[0].object;
+    try std.testing.expectEqualStrings("QUJD", row.get("b64_json").?.string);
+    try std.testing.expectEqualStrings("{\"a\":\"b\"}", row.get("revised_prompt").?.string);
+
+    // No rewrite = no field, not an empty one: the prompt WAS what was sent.
+    const without = try imageResponseJson(a, "QUJD", null, false);
+    defer a.free(without);
+    var p2 = try std.json.parseFromSlice(std.json.Value, a, without, .{});
+    defer p2.deinit();
+    try std.testing.expect(p2.value.object.get("data").?.array.items[0].object.get("revised_prompt") == null);
+
+    // The streaming shape is the same object under an SSE `complete` event.
+    const streamed = try imageResponseJson(a, "QUJD", "cap", true);
+    defer a.free(streamed);
+    try std.testing.expect(std.mem.startsWith(u8, streamed, "data: {\"type\":\"complete\","));
+    try std.testing.expect(std.mem.endsWith(u8, streamed, "\n\n"));
 }

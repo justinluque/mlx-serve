@@ -1940,3 +1940,39 @@ the caption verifier and every single rewrite failed as "output is not JSON".
 `stripCodeFences`. The general form is already a rule for the chat surfaces —
 what this adds is that *reading* the model's answer is a delivery site too,
 wherever the tokens are decoded.
+
+**The caption is composed for the canvas that will render, not the one the
+body asked for.** The vendored prompt takes the aspect ratio as an input and
+says so in as many words: *"The aspect ratio you commit to drives every bbox
+decision. Pick it first."* Reading `size` off the request body is that answer
+until the body has no size — an EDIT with no size means "match the source"
+(the reference's `max_size = source size`, which `handleImage` resolves
+through `resolveEditTargetSize`), and the caption was being composed for the
+1024² default while the render came back at the source's shape: every bbox in
+it laid out for a frame that never existed. `gen.captionCanvasFor` is the one
+prediction, and it stays a prediction on purpose — the rewrite runs before the
+image model is resolved, so it cannot ask the engine. Only the RATIO matters,
+so per-backend clamping (multiples of 16, a max dimension) is deliberately not
+modelled: both are aspect-preserving to within a rounding step. A variation is
+NOT this case — it shares the output grid and cover-crops the source into it.
+
+**A verifier and the prompt it verifies drift apart silently.** Both are
+vendored from the same upstream, at different revisions: the prompt's output
+contract is *"exactly three top-level keys, in this order"* —
+`aspect_ratio`, `high_level_description`, `compositional_deconstruction` — and
+`aspect_ratio` was not in the verifier's `top_level_known`. So every correct
+caption logged `root: unknown top-level key`, and the success line's warning
+count was never zero, which is the number a reader uses to decide whether a
+rewrite is healthy. `style_description` is the mirror image: the verifier
+knows it, this revision of the prompt never asks for it, and it stays accepted
+because other revisions emit it. When you re-vendor either file, diff the key
+list against the other one.
+
+**A rewriter that replaces the user's words owes them the words it used.**
+`withRewrittenPrompt` had been setting `revised_prompt` on the internal body
+since it landed — the field OpenAI's own images API uses for exactly this —
+and `handleImage` built its response by hand and dropped it. From the outside
+a bad caption and a bad model are the same picture. The response carries it
+now (spliced through as the body's RAW, already-escaped span — no second
+escape pass), the app shows it collapsed under the image, and copying it out
+is how you hand-edit one and re-run with the rewrite off.

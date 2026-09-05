@@ -248,3 +248,22 @@ final class MagicPromptStickinessTests: XCTestCase {
         XCTAssertEqual(s.magicPromptModel, "")
     }
 }
+
+/// The rewriter replaces what the user typed, so the caption it produced is
+/// the only way to tell a bad rewrite from a bad model. The server echoes it
+/// as `revised_prompt` (OpenAI's own field); nothing showed it.
+@MainActor
+final class RevisedPromptTests: XCTestCase {
+    func testTheRevisedPromptIsReadFromTheResponse() {
+        let obj: [String: Any] = ["data": [["b64_json": "QUJD", "revised_prompt": "{\"a\":1}"]]]
+        XCTAssertEqual(ImageGenService.decodeRevisedPrompt(obj), "{\"a\":1}")
+    }
+
+    /// No rewrite = no field. Nil, not "", so the UI can hide the row rather
+    /// than render an empty disclosure.
+    func testNoRewriteMeansNoCaption() {
+        XCTAssertNil(ImageGenService.decodeRevisedPrompt(["data": [["b64_json": "QUJD"]]]))
+        XCTAssertNil(ImageGenService.decodeRevisedPrompt([:]))
+        XCTAssertNil(ImageGenService.decodeRevisedPrompt(["data": [["b64_json": "QUJD", "revised_prompt": "  "]]]))
+    }
+}

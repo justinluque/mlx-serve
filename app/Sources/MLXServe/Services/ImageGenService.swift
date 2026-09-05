@@ -19,6 +19,11 @@ final class ImageGenService: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .idle
+    /// The structured caption a magic-prompt rewrite produced for the last
+    /// generation, or nil when the prompt travelled as typed. The rewriter
+    /// REPLACES what the user wrote, so without this a bad caption and a bad
+    /// model look identical from the outside.
+    @Published private(set) var revisedPrompt: String? = nil
     @Published private(set) var recent: [String] = []  // recent output paths, newest first
     @Published private(set) var log: [String] = []
 
@@ -53,6 +58,9 @@ final class ImageGenService: ObservableObject {
         task?.cancel()
         phase = .running(step: 0, total: request.steps, message: "Loading model…")
         log = []
+        // Belongs to the run that produced it — a stale caption under a new
+        // image is worse than none.
+        revisedPrompt = nil
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
         let steps = request.steps
@@ -86,6 +94,7 @@ final class ImageGenService: ObservableObject {
                         phase = .running(step: step, total: max(total, 1), message: "\(stage)…")
                     case "complete":
                         png = Self.decodePngB64(ev)
+                        revisedPrompt = Self.decodeRevisedPrompt(ev)
                     case "error":
                         await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? "Generation failed.")
@@ -258,6 +267,22 @@ final class ImageGenService: ObservableObject {
               let png = Data(base64Encoded: b64)
         else { return nil }
         return png
+    }
+
+    /// The caption the renderer actually saw (`revised_prompt`, OpenAI's own
+    /// field). Nil when the server sent none — the prompt was rendered as
+    /// typed — so the UI can hide the row instead of showing an empty one.
+    static func decodeRevisedPrompt(_ body: Data) -> String? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
+        return decodeRevisedPrompt(obj)
+    }
+
+    static func decodeRevisedPrompt(_ obj: [String: Any]) -> String? {
+        guard let arr = obj["data"] as? [[String: Any]],
+              let raw = arr.first?["revised_prompt"] as? String
+        else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     func cancel() {

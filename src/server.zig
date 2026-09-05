@@ -6736,7 +6736,20 @@ fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const
     defer if (gen_img) |gi| allocator.free(gi.bytes);
     const src_for_rewrite: ?[]const u8 = if (gen_img) |gi| (if (gi.is_variation) gi.bytes else null) else null;
 
-    const res = magicPromptRewrite(allocator, io, bp.prompt, bp.width, bp.height, mp.model, src_for_rewrite);
+    // The caption is composed for the canvas that will RENDER, not the one the
+    // body asked for: the vendored prompt takes the aspect ratio as an input
+    // and says "the aspect ratio you commit to drives every bbox decision", so
+    // an edit with no `size` — which renders at the SOURCE's shape — must not
+    // be captioned for the 1024x1024 default. Header peek only, no decode.
+    const src_native: ?media_mod.Dims = if (gen_img) |gi| media_mod.imageNativeSize(gi.bytes) else null;
+    const canvas = media_mod.captionCanvasFor(
+        bp.size_given,
+        .{ .w = bp.width, .h = bp.height },
+        src_native,
+        if (gen_img) |gi| gi.is_variation else false,
+    );
+
+    const res = magicPromptRewrite(allocator, io, bp.prompt, canvas.w, canvas.h, mp.model, src_for_rewrite);
     const cap = res.caption orelse {
         if (res.skipped) |why| log.info("[ideogram4] magic prompt skipped: {s}\n", .{why});
         return .{ .attempted = true };

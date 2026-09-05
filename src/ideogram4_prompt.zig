@@ -222,7 +222,10 @@ pub const Report = struct {
     }
 };
 
-const top_level_known = [_][]const u8{ "high_level_description", "style_description", "compositional_deconstruction" };
+// `aspect_ratio` is the vendored prompt's FIRST required key ("exactly three
+// top-level keys, in this order"); `style_description` is not in that contract
+// but other revisions of the caption schema carry it, so it stays accepted.
+const top_level_known = [_][]const u8{ "aspect_ratio", "high_level_description", "style_description", "compositional_deconstruction" };
 const style_known = [_][]const u8{ "aesthetics", "lighting", "photo", "art_style", "medium", "color_palette" };
 const element_known = [_][]const u8{ "type", "bbox", "text", "desc", "color_palette" };
 const style_order_photo = [_][]const u8{ "aesthetics", "lighting", "photo", "medium", "color_palette" };
@@ -253,6 +256,9 @@ pub fn verify(allocator: std.mem.Allocator, raw: []const u8) Report {
     const root = parsed.value.object;
     checkUnknown(&rep, root, &top_level_known, "root: unknown top-level key");
 
+    if (root.get("aspect_ratio")) |v| {
+        if (v != .string) rep.add("aspect_ratio: expected a 'W:H' string");
+    }
     if (root.get("high_level_description")) |v| {
         if (v != .string) rep.add("high_level_description: expected a string");
     }
@@ -669,4 +675,26 @@ test "a rewriter model named by its UI label falls back to candidates a registry
     // is ever offered.
     const trailing = rewriterIdCandidates("model · ", &buf);
     for (trailing) |c| try testing.expect(c.len != 0);
+}
+
+test "aspect_ratio is a key the vendored prompt asks for, not an unknown one" {
+    // The vendored `[SYSTEM]` block's output contract is exactly three keys —
+    // `aspect_ratio`, `high_level_description`, `compositional_deconstruction`
+    // — and `aspect_ratio` was missing from `top_level_known`, so EVERY
+    // correct caption logged "root: unknown top-level key" and the success
+    // line reported a warning count that was never zero.
+    const a = testing.allocator;
+    const caption =
+        \\{"aspect_ratio":"16:9","high_level_description":"a red barn",
+        \\ "compositional_deconstruction":{"background":"a field","elements":[
+        \\  {"type":"obj","bbox":[100,100,900,900],"desc":"a red barn"}]}}
+    ;
+    const rep = verify(a, caption);
+    try testing.expect(!rep.invalid_json);
+    for (rep.items()) |w| std.debug.print("unexpected warning: {s}\n", .{w});
+    try testing.expectEqual(@as(usize, 0), rep.count);
+
+    // A non-string aspect ratio is still worth saying out loud.
+    const bad = verify(a, "{\"aspect_ratio\":169,\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}");
+    try testing.expect(bad.count >= 1);
 }

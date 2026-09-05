@@ -36,6 +36,9 @@ struct ImageGenView: View {
     /// Ideogram 4 only — see `ImageModelPreset.supportsMagicPrompt`.
     @State private var magicPrompt: Bool = true
     @State private var magicPromptModel: String = ""
+    /// Whether the caption the rewriter produced is expanded under the image.
+    /// Collapsed by default — it is long, and the image is the answer.
+    @State private var showRevisedPrompt: Bool = false
     /// Image-to-image source (transient — not persisted, like video's first frame).
     @State private var initImageURL: URL? = nil
     /// Extra in-context references for edit mode (FLUX.2 multi-reference):
@@ -817,6 +820,33 @@ struct ImageGenView: View {
                 } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
                 .buttonStyle(.borderless)
                 .help("Send to Chat — opens a new conversation with this attached")
+            }
+            // The magic prompt REPLACED what the user typed, so the caption is
+            // the only way to tell a bad rewrite from a bad model — and it is
+            // worth reading on its own: hand-editing one and re-running with
+            // the rewrite off is the documented way to drive bbox and palette.
+            if let caption = service.revisedPrompt {
+                DisclosureGroup(isExpanded: $showRevisedPrompt) {
+                    HStack(alignment: .top, spacing: 6) {
+                        ScrollView {
+                            Text(caption)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 160)
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(caption, forType: .string)
+                        } label: { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.borderless)
+                        .help("Copy the caption — paste it back with magic prompt off to edit it by hand")
+                    }
+                } label: {
+                    Text("Magic prompt caption")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .padding(8)
