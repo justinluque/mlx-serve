@@ -523,6 +523,13 @@ struct ImageGenView: View {
                         // becoming the default.
                         Picker("", selection: $magicPromptModel) {
                             Text("Server default").tag("")
+                            // An EMPTY list and a list without the model you
+                            // wanted look identical in a menu, so say which:
+                            // the rows come from `/v1/models`, which the app
+                            // refreshes on load events, not on a timer.
+                            if MagicPromptRewriter.choices(server.allModels).isEmpty {
+                                Text("No chat model discovered yet").tag("__none__").disabled(true)
+                            }
                             ForEach(MagicPromptRewriter.choices(server.allModels), id: \.name) { m in
                                 Text(m.name).tag(m.name)
                             }

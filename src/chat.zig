@@ -5352,7 +5352,7 @@ fn parseXmlElementToolCall(allocator: std.mem.Allocator, body: []const u8) ?Pars
 /// when the text doesn't start with `{`, is already balanced (trailing
 /// garbage is someone else's problem), ends mid-string, or nests deeper
 /// than the stack (not worth guessing).
-fn completeUnbalancedJsonObject(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
+pub fn completeUnbalancedJsonObject(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
     const trimmed = std.mem.trim(u8, content, " \t\n\r");
     if (trimmed.len == 0 or trimmed[0] != '{') return null;
     var stack: [16]u8 = undefined;

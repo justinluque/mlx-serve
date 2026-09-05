@@ -1976,3 +1976,43 @@ a bad caption and a bad model are the same picture. The response carries it
 now (spliced through as the body's RAW, already-escaped span — no second
 escape pass), the app shows it collapsed under the image, and copying it out
 is how you hand-edit one and re-run with the rewrite off.
+
+**The caption was one `}` short, every single time.** `[ideogram4] magic
+prompt: rewriter output is not JSON` with nothing else next to it is
+unactionable, and it hid a one-character bug for a whole session. Driving the
+vendored prompt through `/v1/chat/completions` on the same checkpoint the
+server was using (Qwen3.5-9B-Distilled-OPUS-Heretic, 5 samples at the
+rewriter's own sampling) answered it in a minute:
+
+```
+[0] finish=stop tokens=257 len=1018 valid_json=False
+    ERR=Expecting ',' delimiter: line 1 column 1019 (char 1018)
+    tail: '...positioned in the upper right portion of the image."}]}'
+```
+
+Five for five: `finish_reason: stop`, a well-formed caption, and `}]}` at the
+end - element, elements array, compositional deconstruction - with the ROOT
+object never closed. Not truncation (the cap was never reached, and the error
+column is always the last byte), just how this checkpoint ends. The tool-call
+chain has repaired exactly this shape since it shipped, so the rewrite now
+runs the same order it does: strict, then ONE tolerant repair
+(`chat.completeUnbalancedJsonObject`), then re-verify, so a bad guess still
+falls back to the raw prompt.
+
+The lesson that outlives the checkpoint: **a parse failure has to quote what
+it could not parse.** The failure line now carries the token and byte counts,
+the first 240 bytes of the answer and its last 120 (cut on UTF-8 boundaries -
+captions are non-ASCII by design), and says so explicitly when the token cap
+was hit. A probe against the chat surface with the same prompt is the fastest
+way to separate "the model cannot" from "we cannot read it": here the model
+could, all along.
+
+**A picker filters a payload that arrives later than the view does.** The
+magic-prompt rewriter list comes from `/v1/models`, which the app refreshes on
+load events rather than on a timer, so a pane can render before `allModels` is
+populated - and an empty menu looks exactly like a menu missing the one model
+you wanted. The filter itself is pinned against a REAL idle-server payload
+(`MagicPromptChoicesFromServerTests`): an unloaded chat model advertises
+`capabilities:["chat", ...]` and is offerable before anything is resident,
+which is the property that makes the picker usable at all. The empty case now
+says "No chat model discovered yet" instead of quietly showing one row.

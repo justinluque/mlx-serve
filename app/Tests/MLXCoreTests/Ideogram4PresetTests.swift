@@ -267,3 +267,43 @@ final class RevisedPromptTests: XCTestCase {
         XCTAssertNil(ImageGenService.decodeRevisedPrompt(["data": [["b64_json": "QUJD", "revised_prompt": "  "]]]))
     }
 }
+
+/// The picker filters the LIVE `/v1/models` payload, so the guard uses the
+/// real rows an idle server emits — an UNLOADED chat model still advertises
+/// `capabilities:["chat", …]`, which is exactly what makes it offerable
+/// before anything is resident.
+@MainActor
+final class MagicPromptChoicesFromServerTests: XCTestCase {
+    /// Captured from `GET /v1/models` on an idle server with two model roots.
+    private func liveRows() -> [ModelInfo] {
+        let json = """
+        {"data":[
+         {"id":"andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-4bit","object":"model","loaded":false,
+          "state":"unloaded","bytes_resident":0,"bytes_on_disk":5950219560,"context_length":262144,
+          "max_model_len":262144,"capabilities":["chat","tool_use","streaming","json_schema","vision"],
+          "input_modalities":["text","image","video"],"meta":{"architecture":"qwen3_5","engine":"mlx"}},
+         {"id":"justintime47/Ideogram-4-MLX-Serve-mixed_3_8","object":"model","loaded":false,
+          "state":"unloaded","bytes_resident":0,"bytes_on_disk":13406659256,"context_length":0,
+          "max_model_len":0,"capabilities":["image"],"meta":{"architecture":"ideogram4","engine":"mlx"}},
+         {"id":"mlx-community/bge-small-en-v1.5-8bit","object":"model","loaded":false,
+          "state":"unloaded","bytes_resident":0,"bytes_on_disk":35540803,"context_length":512,
+          "max_model_len":512,"capabilities":["embeddings"],"meta":{"architecture":"bert","engine":"mlx"}}]}
+        """
+        let obj = try! JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+        return (obj["data"] as! [[String: Any]]).map { APIClient.parseModelInfo($0) }
+    }
+
+    func testAnUnloadedChatModelIsOfferedAsTheRewriter() {
+        let names = MagicPromptRewriter.choices(liveRows()).map(\.name)
+        XCTAssertEqual(names, ["andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-4bit"],
+                       "the image generator and the embedding model cannot write a caption")
+    }
+
+    /// And the id the picker offers is the one the server resolves — round-trip
+    /// through the same repair the saved value goes through.
+    func testTheOfferedIdIsWhatNormalizeKeeps() {
+        let rows = liveRows()
+        let id = MagicPromptRewriter.choices(rows)[0].name
+        XCTAssertEqual(MagicPromptRewriter.normalize(id, in: rows), id)
+    }
+}

@@ -6482,6 +6482,38 @@ fn magicPromptCaptionText(text: []const u8) []const u8 {
     return ideogram_prompt.stripCodeFences(split.content);
 }
 
+/// A caption the model closed short is a caption, not a failure.
+///
+/// Measured on a live 9B distill: 5 of 5 answers ended `…}]}` — element,
+/// elements array, compositional deconstruction — and never closed the ROOT
+/// object, with `finish_reason: stop` every time. That is the checkpoint's
+/// formatting, not truncation, and it failed 100% of this box's rewrites. The
+/// tool-call chain has repaired exactly this shape since it shipped
+/// (`chat.completeUnbalancedJsonObject`: string/escape-aware bracket stack,
+/// appends only the missing closers, declines a text cut mid-string or one
+/// that is already balanced).
+///
+/// Returns owned bytes, or null when there is nothing to repair — the caller
+/// keeps its own slice rather than paying for a copy. The repaired text is
+/// re-verified like any other, so a bad guess still falls back to the raw
+/// prompt.
+fn magicPromptRepairIfUnbalanced(allocator: std.mem.Allocator, stripped: []const u8) ?[]u8 {
+    return chat_mod.completeUnbalancedJsonObject(allocator, stripped);
+}
+
+/// First `max` bytes of a rewriter answer, cut on a UTF-8 boundary.
+///
+/// "output is not JSON" with nothing else is unactionable — it cost a whole
+/// session to learn the answer was one `}` short. Captions are non-ASCII by
+/// design (the vendored prompt says to preserve CJK, Cyrillic and accented
+/// Latin as-is), so the cut has to respect codepoints.
+fn magicPromptPreview(text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var end = max;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
 /// Cap on the rewriter's own output. The caption schema tops out well under
 /// this; past it the model is looping, and a caption longer than the DiT's
 /// 2048-token text window cannot be conditioned on anyway.
@@ -6666,13 +6698,39 @@ fn magicPromptRewrite(
     const stripped = magicPromptCaptionText(text);
     if (stripped.len == 0) return .{ .skipped = "rewriter returned nothing" };
 
-    var report = ideogram_prompt.verify(allocator, stripped);
+    // Strict first, then the ONE tolerant repair — the same order the
+    // tool-call chain runs in, and for the same reason: the answer is usually
+    // right and short a closer, and dropping it costs the whole rewrite.
+    var caption = stripped;
+    var repaired: ?[]u8 = null;
+    defer if (repaired) |r| allocator.free(r);
+    var report = ideogram_prompt.verify(allocator, caption);
     if (report.invalid_json) {
-        log.warn("[ideogram4] magic prompt: rewriter output is not JSON; using the raw prompt\n", .{});
+        if (magicPromptRepairIfUnbalanced(allocator, stripped)) |fixed| {
+            const re = ideogram_prompt.verify(allocator, fixed);
+            if (!re.invalid_json) {
+                log.info("[ideogram4] magic prompt: completed {d} dropped closer(s)\n", .{fixed.len - stripped.len});
+                repaired = fixed;
+                caption = fixed;
+                report = re;
+            } else {
+                allocator.free(fixed);
+            }
+        }
+    }
+    if (report.invalid_json) {
+        // QUOTE it: "not JSON" alone says nothing about whether the model
+        // refused, thought out loud, or just dropped a brace.
+        log.warn("[ideogram4] magic prompt: rewriter output is not JSON ({d} tokens, {d} bytes); using the raw prompt\n", .{ out.items.len, stripped.len });
+        log.warn("[ideogram4] magic prompt: answer began: {s}\n", .{magicPromptPreview(stripped, 240)});
+        if (stripped.len > 240) log.warn("[ideogram4] magic prompt: answer ended: {s}\n", .{magicPromptPreview(stripped[stripped.len - @min(stripped.len, 120) ..], 120)});
+        if (out.items.len >= MAGIC_PROMPT_MAX_TOKENS) {
+            log.warn("[ideogram4] magic prompt: hit the {d}-token cap — the caption was cut off\n", .{MAGIC_PROMPT_MAX_TOKENS});
+        }
         return .{ .skipped = "rewriter output is not JSON" };
     }
     for (report.items()) |w| log.warn("[ideogram4] caption verifier: {s}\n", .{w});
-    const owned = allocator.dupe(u8, stripped) catch return .{ .skipped = "oom" };
+    const owned = allocator.dupe(u8, caption) catch return .{ .skipped = "oom" };
     log.info("[ideogram4] magic prompt: {d} chars -> {d} ({d} verifier warnings)\n", .{ prompt.len, owned.len, report.count });
     return .{ .caption = owned };
 }
@@ -23489,4 +23547,45 @@ test "the pre-load magic-prompt site marks the rewrite ATTEMPTED, not succeeded"
     // The pre-fix shape: a literal true, reachable only from the success arm.
     const on_success = "already_rewritten = " ++ "true;";
     try std.testing.expect(std.mem.indexOf(u8, src, on_success) == null);
+}
+
+test "a caption the model closed one brace short is still a caption" {
+    // Measured 2026-09-05 on Qwen3.5-9B-Distilled-OPUS-Heretic: 5 of 5
+    // samples ended `…}]}` — element, elements array, compositional
+    // deconstruction — and never closed the ROOT object. finish_reason was
+    // `stop` every time, so this is the checkpoint's formatting, not
+    // truncation, and it made the rewriter fail 100% of the time on this box.
+    // The tool-call chain has had exactly this tolerance since it shipped.
+    const a = std.testing.allocator;
+    const short =
+        \\{"aspect_ratio":"2:3","high_level_description":"a barn",
+        \\ "compositional_deconstruction":{"background":"a field","elements":[
+        \\  {"type":"obj","bbox":[100,100,900,900],"desc":"a red barn"}]}
+    ;
+    const fixed = magicPromptRepairIfUnbalanced(a, short) orelse return error.NoRepair;
+    defer a.free(fixed);
+    const rep = ideogram_prompt.verify(a, fixed);
+    try std.testing.expect(!rep.invalid_json);
+    try std.testing.expectEqual(@as(usize, 0), rep.count);
+
+    // Already balanced = nothing to repair; the caller keeps its own slice
+    // rather than paying for a copy.
+    try std.testing.expect(magicPromptRepairIfUnbalanced(a, "{\"a\":1}") == null);
+    // Not an object, or cut mid-string: not something to guess at.
+    try std.testing.expect(magicPromptRepairIfUnbalanced(a, "sorry, I can't") == null);
+    try std.testing.expect(magicPromptRepairIfUnbalanced(a, "{\"a\":\"unterminated") == null);
+}
+
+test "a rewriter answer that cannot be used is quoted in the log" {
+    // "output is not JSON" with nothing else cost a whole debugging session:
+    // the answer was one `}` short, and no line in the log said so. A preview
+    // has to be a UTF-8-safe cut — a caption is full of non-ASCII by design
+    // (the prompt says to preserve CJK/Cyrillic/accented Latin as-is).
+    try std.testing.expectEqualStrings("abc", magicPromptPreview("abc", 8));
+    try std.testing.expectEqualStrings("abcdefgh", magicPromptPreview("abcdefghij", 8));
+    // 'é' is two bytes: cutting at 4 must not split it.
+    try std.testing.expectEqualStrings("caf", magicPromptPreview("café au lait", 4));
+    // A whole multi-byte codepoint fits at the boundary.
+    try std.testing.expectEqualStrings("café", magicPromptPreview("café au lait", 5));
+    try std.testing.expectEqualStrings("", magicPromptPreview("", 8));
 }
