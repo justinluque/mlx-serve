@@ -1904,3 +1904,39 @@ The general shape: **a control that takes an internal id, sitting in a UI whose
 every rendering of that id is a label, is a bug with no error path.** Both
 halves of that sentence are load-bearing — the rewrite is non-fatal by design,
 so nothing surfaced but a log line, and the symptom was image quality.
+
+**The gate that says "the rewrite already ran" has to mean ATTEMPTED.** The
+rewrite runs at the pre-load site in `handleConnection`, before the image model
+is resolved, for a memory reason: `ensureLoaded` on the target holds a refcount
+for the whole request including generation, so a rewriter loading afterwards
+competes with a model it cannot evict. `handleGen` keeps a second call as the
+fallback for a backend discovery did not flag, and `already_rewritten` is the
+one gate between them — but it was set inside the success arm. Every non-fatal
+failure, which is the entire design of this path, therefore fell through to a
+second attempt in exactly the order the first site exists to avoid:
+
+```
+[ideogram4] magic prompt: rewriter output is not JSON; using the raw prompt   <- the real reason
+[gen] loading image engine: …/Ideogram-4-MLX-Serve-mixed_3_8
+Refusing to load andrevp/Qwen3.5-9B-…: needs ~6.10 GB … none evictable
+[ideogram4] magic prompt: model '' unavailable (NotEnoughMemory)              <- the masking one
+```
+
+Two costs, and the second is worse: a wasted second rewriter load, and a log
+where the last word on the rewrite is a memory refusal that had nothing to do
+with why it failed. `tryMagicPromptRewrite` returns `{body, attempted}` now and
+the gate is built from `attempted`; scan-pinned against the literal
+`already_rewritten = true`.
+
+**A delivery site that decodes tokens itself owes the same think split as
+every chat surface.** The rewrite submits with `enable_thinking = false` and the
+vendored prompt's `[META]` block says `thinking_mode: disabled` — both are
+instructions to the TEMPLATE, and neither binds a checkpoint. A distilled
+thinking model (a Qwen3.5-9B distill, live 2026-09-05) emitted its block
+anyway, and because this path reads tokens straight off the slot instead of
+going through `/v1/chat/completions`, nothing split it: the preamble reached
+the caption verifier and every single rewrite failed as "output is not JSON".
+`magicPromptCaptionText` now runs `chat.splitThinkBlock` before
+`stripCodeFences`. The general form is already a rule for the chat surfaces —
+what this adds is that *reading* the model's answer is a delivery site too,
+wherever the tokens are decoded.

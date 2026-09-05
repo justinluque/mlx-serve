@@ -2151,9 +2151,16 @@ fn handleConnection(
                     // `.auto` resolves to true without waiting for the real
                     // engine: `arch_hint` already says `ideogram4`, whose
                     // `wantsStructuredCaption()` is unconditionally true.
-                    if (tryMagicPromptRewrite(allocator, stream.io, body_for_check, true)) |nb| {
+                    const pre = tryMagicPromptRewrite(allocator, stream.io, body_for_check, true);
+                    // ATTEMPTED, not succeeded. Every failure here is
+                    // non-fatal by design, and a second attempt from
+                    // `handleGen` runs with the target model resident and
+                    // unevictable — it cannot do better, it burns a second
+                    // rewriter load, and its memory refusal overwrites the
+                    // real reason in the log.
+                    already_rewritten = pre.attempted;
+                    if (pre.body) |nb| {
                         precomputed_body = nb;
-                        already_rewritten = true;
                     } else if (converted_edit_json) |j| {
                         // No rewrite, but the multipart body is already
                         // converted — hand that down instead of converting again.
@@ -6457,6 +6464,24 @@ const MagicPromptResult = struct {
     skipped: ?[]const u8 = null,
 };
 
+/// The rewriter's raw decoded output → the text to parse as a caption.
+///
+/// `enable_thinking = false` and the vendored prompt's `thinking_mode:
+/// disabled` are instructions to the TEMPLATE, not promises about the
+/// checkpoint: a distilled thinking model emits its block regardless, and
+/// this path decodes tokens straight off the slot rather than going through a
+/// chat surface — so the preamble reached the JSON verifier and every rewrite
+/// failed as "output is not JSON". Reasoning is split off the same way every
+/// delivery site splits it, then the fences come off.
+///
+/// `opened_by_template` is false because this path has the prompt as IDS, not
+/// as rendered bytes. It only matters for a block the model never closes,
+/// which has no caption in it either way.
+fn magicPromptCaptionText(text: []const u8) []const u8 {
+    const split = chat_mod.splitThinkBlock(text, true, false);
+    return ideogram_prompt.stripCodeFences(split.content);
+}
+
 /// Cap on the rewriter's own output. The caption schema tops out well under
 /// this; past it the model is looping, and a caption longer than the DiT's
 /// 2048-token text window cannot be conditioned on anyway.
@@ -6638,7 +6663,7 @@ fn magicPromptRewrite(
     }
     const text = tok.decode(allocator, out.items, false) catch return .{ .skipped = "oom" };
     defer allocator.free(text);
-    const stripped = ideogram_prompt.stripCodeFences(text);
+    const stripped = magicPromptCaptionText(text);
     if (stripped.len == 0) return .{ .skipped = "rewriter returned nothing" };
 
     var report = ideogram_prompt.verify(allocator, stripped);
@@ -6666,7 +6691,20 @@ fn magicPromptRewrite(
 /// backend discovery did not flag — and they differ only in what `.auto`
 /// resolves to, which is why `want_auto` is a parameter: the pre-load site has
 /// only discovery's `arch_hint`, `handleGen` has the real engine.
-fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const u8, want_auto: bool) ?[]u8 {
+///
+/// `attempted` says the request's ONE rewrite has now happened — whatever it
+/// returned. It is what `already_rewritten` is built from: a gate keyed on
+/// SUCCESS lets every non-fatal failure fall through to a second attempt in
+/// the worse order.
+const MagicPromptTry = struct {
+    /// Rewritten body, caller frees. Null = the prompt travels unchanged.
+    body: ?[]u8 = null,
+    /// The rewrite ran (or was declined on this body's own fields), so no
+    /// later site should run it again for this request.
+    attempted: bool = false,
+};
+
+fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const u8, want_auto: bool) MagicPromptTry {
     var mp_model_owned: []u8 = &.{};
     defer if (mp_model_owned.len != 0) allocator.free(mp_model_owned);
     const mp = media_mod.parseMagicPromptFields(allocator, body, &mp_model_owned);
@@ -6675,13 +6713,16 @@ fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const
         .on => true,
         .auto => want_auto,
     };
-    if (!wanted) return null;
+    // `magic_prompt:false` is not an attempt — but every later site reads the
+    // same field off the same body and declines identically, so the
+    // distinction costs nothing and keeps `attempted` honest.
+    if (!wanted) return .{};
 
     const bp = media_mod.promptAndSizeFromGenBody(body);
-    if (bp.prompt.len == 0) return null;
+    if (bp.prompt.len == 0) return .{ .attempted = true };
     if (ideogram_prompt.looksLikeCaption(bp.prompt)) {
         log.info("[ideogram4] magic prompt skipped: prompt is already a structured caption\n", .{});
-        return null;
+        return .{ .attempted = true };
     }
 
     // img2img source, so the rewriter can ground `compositional_deconstruction`
@@ -6698,13 +6739,14 @@ fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const
     const res = magicPromptRewrite(allocator, io, bp.prompt, bp.width, bp.height, mp.model, src_for_rewrite);
     const cap = res.caption orelse {
         if (res.skipped) |why| log.info("[ideogram4] magic prompt skipped: {s}\n", .{why});
-        return null;
+        return .{ .attempted = true };
     };
     defer allocator.free(cap);
-    return media_mod.withRewrittenPrompt(allocator, body, cap) catch |err| {
+    const rewritten = media_mod.withRewrittenPrompt(allocator, body, cap) catch |err| {
         log.warn("[ideogram4] magic prompt: body rewrite failed ({s}); using the raw prompt\n", .{@errorName(err)});
-        return null;
+        return .{ .attempted = true };
     };
+    return .{ .body = rewritten, .attempted = true };
 }
 
 fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute, already_rewritten: bool) !void {
@@ -6734,7 +6776,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     var effective_body = body;
     if (!already_rewritten and route.modality() == .image) {
         if (lm.image_engine) |eng| {
-            if (tryMagicPromptRewrite(allocator, stream.io, body, eng.wantsStructuredCaption())) |nb| {
+            if (tryMagicPromptRewrite(allocator, stream.io, body, eng.wantsStructuredCaption()).body) |nb| {
                 rewritten_body = nb;
                 effective_body = nb;
             }
@@ -23399,4 +23441,39 @@ test "a streaming stop sequence cuts at the match, not at the token boundary" {
     const many = [_][]const u8{ "END", "N" };
     try t.expectEqual(@as(usize, 1), stopSequenceCut("aNbEND", 6, &many).?.index);
     try t.expectEqual(@as(?StopCut, null), stopSequenceCut("all clear", 3, &stops));
+test "the rewriter's answer is split for reasoning before it is parsed as a caption" {
+    // The rewrite submits with `enable_thinking = false` and the vendored
+    // prompt says `thinking_mode: disabled`, but neither binds the CHECKPOINT
+    // — a distilled thinking model emits its block anyway. This path decodes
+    // the raw token stream, so an unsplit `<think>` preamble reached the JSON
+    // verifier and every rewrite failed as "output is not JSON" (live
+    // 2026-09-05, a Qwen3.5-9B distill). Every other delivery site in the
+    // server splits; this one was the exception.
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        // The live shape: a reasoning preamble, then the caption.
+        .{ .in = "<think>The user wants a barn.</think>{\"high_level_description\":\"a barn\"}", .want = "{\"high_level_description\":\"a barn\"}" },
+        // Reasoning AND a code fence — the two rescues compose.
+        .{ .in = "<think>hm</think>\n```json\n{\"a\":1}\n```", .want = "{\"a\":1}" },
+        // A template-opened block closes without ever opening in the output.
+        .{ .in = "planning\n</think>\n{\"a\":1}", .want = "{\"a\":1}" },
+        // No thinking at all is the common case and must pass through.
+        .{ .in = "{\"a\":1}", .want = "{\"a\":1}" },
+        .{ .in = "```\n{\"a\":1}\n```", .want = "{\"a\":1}" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c.want, magicPromptCaptionText(c.in));
+}
+
+test "the pre-load magic-prompt site marks the rewrite ATTEMPTED, not succeeded" {
+    // `handleGen`'s gate exists so the rewrite runs ONCE, before the image
+    // model is pinned. Setting it only on success meant every non-fatal
+    // failure — the whole point of the design — fell through to a SECOND
+    // attempt in `handleGen`, this time with the target resident and
+    // unevictable: "needs ~6.10 GB … none evictable", which then MASKED the
+    // real first-attempt reason in the log (live 2026-09-05).
+    const src = @embedFile("server.zig");
+    const from_attempt = "already_rewritten = " ++ "pre.attempted;";
+    try std.testing.expect(std.mem.indexOf(u8, src, from_attempt) != null);
+    // The pre-fix shape: a literal true, reachable only from the success arm.
+    const on_success = "already_rewritten = " ++ "true;";
+    try std.testing.expect(std.mem.indexOf(u8, src, on_success) == null);
 }

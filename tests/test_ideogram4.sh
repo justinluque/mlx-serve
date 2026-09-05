@@ -167,6 +167,27 @@ else
   echo "SKIP: [5] no chat model for the rewriter (set CHAT_MODEL)"
 fi
 
+# ── 5c. ONE rewrite attempt per request, whatever it returns.
+# The pre-load site runs the rewrite BEFORE the image model is pinned, because
+# a rewriter loading afterwards starves against a target it cannot evict. That
+# gate used to be keyed on SUCCESS, so every non-fatal failure — the whole
+# point of the design — fell through to a SECOND attempt in the wrong order,
+# whose memory refusal then masked the real reason in the log.
+BEFORE=$(grep -c "magic prompt: model 'no-such-rewriter-model'" "$TMP/server.log" || true)
+api /v1/images/generations -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"a green barn at noon\",\"size\":\"512x512\",\"steps\":12,\"seed\":7,\"magic_prompt\":true,\"magic_prompt_model\":\"no-such-rewriter-model\"}" \
+  > "$TMP/once.json"
+AFTER=$(grep -c "magic prompt: model 'no-such-rewriter-model'" "$TMP/server.log" || true)
+ATTEMPTS=$((AFTER - BEFORE))
+if [ "$ATTEMPTS" = "1" ]; then
+  echo "PASS: [5c] a failed rewrite is attempted exactly once"
+else
+  fail "[5c] expected 1 rewrite attempt, saw $ATTEMPTS"
+fi
+python3 -c "import json,sys; d=json.load(open('$TMP/once.json')); sys.exit(0 if 'data' in d else 1)" \
+  && echo "PASS: [5c] and the image still rendered from the raw prompt" \
+  || fail "[5c] an unresolvable rewriter killed the request — it must fall back"
+
 # ── 6. LoRA: the ONE grammar. A path that does not exist is proven on OUR side
 #       of the mlx boundary (an mlx error KILLS the process).
 CODE=$(curl -s -o "$TMP/lora.json" -w '%{http_code}' -m 60 \
