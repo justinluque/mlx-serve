@@ -1,5 +1,25 @@
 # Changelog
 
+## v26.9.3 (unreleased)
+
+### Highlights
+
+- **Five new image backends.** FLUX.1 dev/schnell (the classic T5-XXL + CLIP-L MMDiT, architecturally distinct from FLUX.2 klein, with runtime LoRA), Stable Diffusion XL 1.0 and SDXL Turbo (real classifier-free guidance and by far the largest open LoRA ecosystem — up to 8 adapters at once, stacked and summed), Stable Diffusion 1.5 / SD-Turbo and Stable Diffusion 3.5 (Medium, Large, Large Turbo — three text encoders including T5-XXL), Tongyi-MAI's Z-Image and Z-Image-Turbo (a small, fast single-stream DiT), and Anima (circlestone-labs' anime/illustration Cosmos-Predict2 DiT, with img2img and LoRA support). Pick any of them in the Image window; negative prompts and a guidance slider appear only on the models that actually read them.
+- **Ideogram-style native prompt rewriting extends to the whole family where relevant**, and every new backend downloads only the parts it needs — SDXL's upstream repo is ~77 GB of fp32 duplicates, single-file merged checkpoints and ONNX/OpenVINO exports; the fetch pulls just the fp16 diffusers subfolders.
+- **Mistral Small 3.1/3.2 and Mistral3's Pixtral vision tower.** Text runs on the existing flat Mistral architecture unchanged; images go through Mistral3's own patch-merger projector and 2D RoPE, with the model's own CLIP-style resize instead of the shared 0.5/0.5 normalization other towers use.
+- **JoyCaption and other standard HF LLaVA-family vision-language models** (Llama-3 + SigLIP) are now served natively.
+- **HTML and SVG code blocks render live in chat**, not just as source: a model that writes a closed `<html>` or `<svg>` fence gets an inline preview surface with a toggle between the rendered page and the source, the same idea as an Artifact.
+- **Classifier-free guidance for FLUX.2 klein base checkpoints** (the undistilled 9B build): a real second forward against a negative prompt, hidden entirely on the distilled presets where it would be decoration.
+- **My Models shows remaining disk space** next to each model's size, so you can tell at a glance whether a download will actually fit.
+
+### Fixes
+
+- A Krea-2 pack quantized to a width other than the catalog's own `mixed_4_8` (for example a locally built `mixed_3_8`) read as "found but not ready" in the Create pane and offered Download forever, even though the server loaded and served it correctly — the ready-marker pattern named one specific filename instead of the layout. Any quant width now reads as ready.
+- Krea-2 VAE decode could abort the process with an uncatchable Metal OOM at higher resolutions on memory-constrained Macs, even after the denoise steps finished successfully. Four independent transients (an unevaluated lazy graph holding every stage live, a causal conv doing three convolutions to compute one, Winograd's per-call working-set budget, and a dense attention score matrix at the VAE's one wide-head block) are now cut, tiled or chunked; peak memory at 1536x1536 drops from about 11 GB to under 4 GB with byte-identical-in-practice output.
+- The bundled KaTeX fonts LaTeX rendering depends on could fail to load when the app shipped inside a structured resource bundle (Mac App Store builds), silently falling back to plain-text math.
+
+---
+
 ## v26.9.2 (unreleased)
 
 ### Highlights
@@ -170,15 +190,6 @@ Neural Engine prefill, 16k-token prompt (new, off by default):
 - **Reference audio for music** (#259): a clip whose feel and timbre the track follows. Up to 30 seconds is used; it is a style hint, not a copy. Thanks @Morac2.
 - **LTX first and last frame** (#260): `last_frame_image` pins the final frame the same way `first_frame_image` pins the first, on every LTX pipeline including two-stage. A request the model cannot honour (no VAE encoder, fewer than 9 frames) is a named 400 rather than a plausible video of something else.
 - `instrumental: true` beside non-empty lyrics is a named 400 instead of a silent choice.
-
-### Stable Diffusion XL
-
-- **Stable Diffusion XL runs natively.** Pick **Stable Diffusion XL 1.0** or **SDXL Turbo** in the Image window; both are ~7 GB and about 10 GB to run. Not a distilled flow model like everything else we ship: SDXL predicts noise on a discrete beta schedule and runs real classifier-free guidance, two UNet forwards a step, which is why its step counts are 20-50 rather than 4-12. Turbo is the distilled build of the same architecture and generates in 1-4 steps with no guidance.
-- **The reason to want it is the LoRAs.** SDXL has by far the largest adapter ecosystem of any open image model, and those adapters bind here through the same stacked-LoRA grammar the other backends use — up to 8 at once, summed at forward time, never merged.
-- **Negative prompts.** A new Advanced field on the models that read one. Every other image model we ship generates guidance-free and has no unconditional branch for a negative prompt to steer, so the box appears only where it does something. Leaving it empty is not the same request as omitting it, and the app sends what you meant.
-- Over the API: `POST /v1/images/generations` with `model` set to an SDXL pack, plus optional `negative_prompt`, `guidance` (`guidance_scale` is accepted too) and `timestep_spacing`. Sizes snap to SDXL's /64 training buckets between 512 and 2048.
-- Downloads take the parts that are used. Stability's repo is ~77 GB — fp32 duplicates of every weight, single-file merged checkpoints, and ONNX/OpenVINO export trees — and the fetch pulls only the fp16 diffusers subfolders.
-- Every stage is pinned numerically against diffusers: both CLIP towers, the UNet (including a fixture driven by real text embeddings, not noise), the VAE decoder and the full pipeline.
 
 ### App
 
