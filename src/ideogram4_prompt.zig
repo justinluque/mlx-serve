@@ -136,6 +136,48 @@ pub fn stripCodeFences(text: []const u8) []const u8 {
     return std.mem.trim(u8, body, " \t\r\n");
 }
 
+/// The separator the app's model picker puts between a GGUF repo name and the
+/// quant it loads ("org/repo · Q8_K_P"). Sibling quants share a name, so the
+/// picker HAS to say which one — but that label is not a model id, and the
+/// rewriter field is the one place a user can hand-copy it into an id slot.
+const display_label_sep = " · ";
+
+/// Candidate registry ids for a user-supplied rewriter model name, most
+/// specific first. Feed each to the registry's name resolver and take the
+/// first that lands.
+///
+/// The field takes a model ID, but everything the user can SEE is a display
+/// label, so the two forms a copy-paste produces are tried too: the label's
+/// quant suffix dropped ("org/repo · Q8_K_P" -> "org/repo"), and then the org
+/// prefix dropped as well ("repo") — the resolver strips '/' off the ids it
+/// scans but never off the candidate, so an org-qualified name never reaches
+/// its own basename arm.
+///
+/// Writes into `buf` and returns the filled prefix; every candidate is a slice
+/// of `raw`, so both outlive it. An empty name yields no candidates: "" already
+/// means "the server's default model" and must not be resolved against ids.
+pub fn rewriterIdCandidates(raw: []const u8, buf: *[3][]const u8) [][]const u8 {
+    const name = std.mem.trim(u8, raw, " \t\r\n");
+    if (name.len == 0) return buf[0..0];
+    var n: usize = 1;
+    buf[0] = name;
+    if (std.mem.lastIndexOf(u8, name, display_label_sep)) |i| {
+        const stem = std.mem.trimEnd(u8, name[0..i], " \t");
+        if (stem.len != 0) {
+            buf[n] = stem;
+            n += 1;
+        }
+    }
+    if (std.mem.lastIndexOfScalar(u8, buf[n - 1], '/')) |i| {
+        const base = buf[n - 1][i + 1 ..];
+        if (base.len != 0) {
+            buf[n] = base;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
 /// True when a prompt is ALREADY a structured caption and must be passed
 /// through untouched.
 ///
@@ -595,4 +637,36 @@ test "hex colors are uppercase #RRGGBB, matching what the model was trained on" 
     try testing.expect(!isHexColor("#FFF")); // short form
     try testing.expect(!isHexColor("C0392B")); // no hash
     try testing.expect(!isHexColor("#GGGGGG"));
+}
+
+test "a rewriter model named by its UI label falls back to candidates a registry id can match" {
+    var buf: [3][]const u8 = undefined;
+
+    // The name as typed is always tried first, and is the only candidate
+    // when there is nothing to strip.
+    const plain = rewriterIdCandidates("model-8bit", &buf);
+    try testing.expectEqual(@as(usize, 1), plain.len);
+    try testing.expectEqualStrings("model-8bit", plain[0]);
+
+    // What the app's model picker SHOWS for a GGUF quant: repo name, the
+    // " · " separator, then the quant. Both the suffix-stripped form and the
+    // bare basename are offered, in that order.
+    const labelled = rewriterIdCandidates("HauhauCS/Gemma-4-E4B-Uncensored · Q8_K_P", &buf);
+    try testing.expectEqual(@as(usize, 3), labelled.len);
+    try testing.expectEqualStrings("HauhauCS/Gemma-4-E4B-Uncensored · Q8_K_P", labelled[0]);
+    try testing.expectEqualStrings("HauhauCS/Gemma-4-E4B-Uncensored", labelled[1]);
+    try testing.expectEqualStrings("Gemma-4-E4B-Uncensored", labelled[2]);
+
+    // An org prefix with no display suffix still yields its basename.
+    const orged = rewriterIdCandidates("HauhauCS/Gemma-4-E4B", &buf);
+    try testing.expectEqual(@as(usize, 2), orged.len);
+    try testing.expectEqualStrings("Gemma-4-E4B", orged[1]);
+
+    // Empty in, empty out: "" already means "the server's default model".
+    try testing.expectEqual(@as(usize, 0), rewriterIdCandidates("", &buf).len);
+
+    // A trailing separator leaves nothing to strip to, so no empty candidate
+    // is ever offered.
+    const trailing = rewriterIdCandidates("model · ", &buf);
+    for (trailing) |c| try testing.expect(c.len != 0);
 }

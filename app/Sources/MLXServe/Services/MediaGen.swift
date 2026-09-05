@@ -1993,6 +1993,63 @@ extension ImageModelPreset {
     }
 }
 
+/// Which chat model writes Ideogram 4's structured caption.
+///
+/// The server takes a model ID here. The UI has only ever shown display
+/// LABELS (a GGUF repo plus the quant it loads, `org/repo · Q8_K_P` — sibling
+/// quants share a name), and the field used to be free text, so the value a
+/// user could reasonably type resolved to no model at all: the rewrite was
+/// skipped and Ideogram conditioned on the raw sentence it was never trained
+/// on, with only a server log line to say so. The picker now offers real ids,
+/// and `normalize` repairs what the free-text field left behind.
+enum MagicPromptRewriter {
+    /// Models that can actually answer the rewrite. A generator has no
+    /// tokenizer, and a LAN entry belongs to the peer that hosts it — the
+    /// rewrite runs on THIS server, before the image job is queued.
+    static func choices(_ models: [ModelInfo]) -> [ModelInfo] {
+        models.filter { $0.servesChat && $0.lanPeer == nil }
+    }
+
+    /// A saved value → the served id to send. "" (the server's default) stays
+    /// "", an exact id wins outright, and the display forms fall back onto
+    /// their id. Anything ambiguous or unknown is returned UNCHANGED: the
+    /// picker shows it as unavailable, which beats silently generating with a
+    /// model the user did not choose.
+    ///
+    /// Mirrors `ideogram4_prompt.rewriterIdCandidates` on the server, which
+    /// does the same repair for API clients.
+    static func normalize(_ saved: String, in models: [ModelInfo]) -> String {
+        let name = saved.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return "" }
+        let ids = choices(models).map(\.name)
+        if ids.contains(name) { return name }
+        for candidate in candidates(name) {
+            let hits = ids.filter {
+                $0.caseInsensitiveCompare(candidate) == .orderedSame
+                    || $0.range(of: candidate, options: [.caseInsensitive]) != nil
+            }
+            if hits.count == 1 { return hits[0] }
+        }
+        return name
+    }
+
+    /// The label forms, most specific first: as typed, the quant suffix
+    /// dropped, then the org prefix dropped too.
+    private static func candidates(_ name: String) -> [String] {
+        var out = [name]
+        if let sep = name.range(of: " · ", options: .backwards) {
+            let stem = String(name[name.startIndex..<sep.lowerBound])
+                .trimmingCharacters(in: .whitespaces)
+            if !stem.isEmpty { out.append(stem) }
+        }
+        if let slash = out[out.count - 1].lastIndex(of: "/") {
+            let base = String(out[out.count - 1][out[out.count - 1].index(after: slash)...])
+            if !base.isEmpty { out.append(base) }
+        }
+        return out
+    }
+}
+
 extension ImageGenRequest {
     /// Number of values `condWeightsText` must supply — one per tapped text
     /// encoder layer (Krea stacks 12 layers; FLUX concatenates 3).

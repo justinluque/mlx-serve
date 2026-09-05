@@ -157,3 +157,94 @@ final class Ideogram4RequestBodyTests: XCTestCase {
         }
     }
 }
+
+/// The rewriter field takes a model ID, but everything the user can SEE is a
+/// display label. A label pasted (or persisted from the old free-text field)
+/// into that slot resolved to nothing server-side and the whole rewrite fell
+/// back to the raw prompt — which for Ideogram 4 means conditioning on
+/// out-of-distribution text, with only a log line to say so.
+@MainActor
+final class MagicPromptRewriterPickTests: XCTestCase {
+
+    private func chat(_ name: String, lan: String? = nil) -> ModelInfo {
+        ModelInfo(name: name, quantBits: 4, layers: 0, hiddenSize: 0, vocabSize: 0,
+                  contextLength: 0, modelMaxTokens: 0, capabilities: ["chat"], lanPeer: lan)
+    }
+    private func image(_ name: String) -> ModelInfo {
+        ModelInfo(name: name, quantBits: 4, layers: 0, hiddenSize: 0, vocabSize: 0,
+                  contextLength: 0, modelMaxTokens: 0, capabilities: ["image"])
+    }
+
+    /// Only local chat models can write a caption: a generator has no
+    /// tokenizer, and a LAN entry is the peer's to load.
+    func testOnlyLocalChatModelsAreOffered() {
+        let models = [chat("a"), image("b"), chat("c@peer", lan: "peer")]
+        XCTAssertEqual(MagicPromptRewriter.choices(models).map(\.name), ["a"])
+    }
+
+    /// The empty string is the documented "server default" and must survive
+    /// normalization untouched.
+    func testEmptyStaysTheServerDefault() {
+        XCTAssertEqual(MagicPromptRewriter.normalize("  ", in: [chat("a")]), "")
+    }
+
+    /// A saved value that is already an id is returned verbatim, even when a
+    /// looser match would also fit.
+    func testAnExactIdWins() {
+        let models = [chat("Gemma-4-E4B"), chat("Gemma-4-E4B-Q8_K_P")]
+        XCTAssertEqual(MagicPromptRewriter.normalize("Gemma-4-E4B", in: models), "Gemma-4-E4B")
+    }
+
+    /// The two forms the picker/tray actually render: `org/repo · QUANT` and
+    /// the bare repo name. Both map back onto the served id.
+    func testADisplayLabelMapsBackOntoItsId() {
+        let models = [chat("Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P"), chat("Qwen3.5-4B")]
+        XCTAssertEqual(
+            MagicPromptRewriter.normalize("HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive · Q8_K_P", in: models),
+            "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P")
+        XCTAssertEqual(
+            MagicPromptRewriter.normalize("Gemma-4-E4B-Uncensored-HauhauCS-Aggressive", in: models),
+            "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P")
+    }
+
+    /// Ambiguity is not repaired: two quants of one repo are two different
+    /// models, and picking one for the user is a silent model swap.
+    func testAnAmbiguousLabelIsLeftAlone() {
+        let models = [chat("repo-Q4_K_M"), chat("repo-Q8_K_P")]
+        XCTAssertEqual(MagicPromptRewriter.normalize("repo", in: models), "repo")
+    }
+
+    /// A model that is simply gone (deleted, or the server is down and the
+    /// list is empty) keeps its saved name so the UI can say "unavailable"
+    /// instead of quietly switching to the default.
+    func testAnUnknownNameIsPreserved() {
+        XCTAssertEqual(MagicPromptRewriter.normalize("gone", in: []), "gone")
+        XCTAssertEqual(MagicPromptRewriter.normalize("gone", in: [chat("a")]), "gone")
+    }
+}
+
+/// The magic-prompt controls call `persist()` on every change, so they are
+/// meant to be sticky — but neither one was in `ImageGenSettings`, so the
+/// rewriter choice was silently forgotten at every relaunch.
+@MainActor
+final class MagicPromptStickinessTests: XCTestCase {
+    func testTheMagicPromptControlsSurviveASaveLoadRoundTrip() throws {
+        var s = ImageGenSettings()
+        XCTAssertTrue(s.magicPrompt, "on by default — Ideogram wants a caption")
+        XCTAssertEqual(s.magicPromptModel, "", "no rewriter named = the server's default")
+        s.magicPrompt = false
+        s.magicPromptModel = "org/repo"
+        let back = try JSONDecoder().decode(ImageGenSettings.self,
+                                            from: try JSONEncoder().encode(s))
+        XCTAssertEqual(back.magicPrompt, false)
+        XCTAssertEqual(back.magicPromptModel, "org/repo")
+    }
+
+    /// Settings written by a build that had neither field still decode.
+    func testOlderSettingsDecodeWithTheDefaults() throws {
+        let legacy = #"{"modelId":"x","quality":"Good","resolutionId":"r","steps":8,"seed":-1,"keepResident":false,"strength":0.6,"editMode":true,"condGain":1.0,"condWeightsText":"","loras":[],"customWidth":1024,"customHeight":1024}"#
+        let s = try JSONDecoder().decode(ImageGenSettings.self, from: Data(legacy.utf8))
+        XCTAssertTrue(s.magicPrompt)
+        XCTAssertEqual(s.magicPromptModel, "")
+    }
+}

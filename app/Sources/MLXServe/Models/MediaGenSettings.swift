@@ -79,6 +79,13 @@ struct ImageGenSettings: Codable, Equatable {
     /// the same convention as the H3 reference lists surviving a preset switch.
     var customWidth: Int = 1024
     var customHeight: Int = 1024
+    /// Ideogram 4's magic prompt (the toggle, and the chat model that writes
+    /// the caption — "" = the server's default). Both controls already called
+    /// `persist()` on change, so they were always meant to be sticky; without
+    /// them here the rewriter choice was forgotten at every relaunch.
+    /// Optional-decoded via defaults so settings from older builds still load.
+    var magicPrompt: Bool = true
+    var magicPromptModel: String = ""
 
     private static let storageKey = "imageGenSettings"
 
@@ -168,6 +175,8 @@ extension ImageGenSettings {
         }
         if let v = try c.decodeIfPresent(Int.self, forKey: .customWidth) { customWidth = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .customHeight) { customHeight = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .magicPrompt) { magicPrompt = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .magicPromptModel) { magicPromptModel = v }
     }
 }
 

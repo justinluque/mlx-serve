@@ -207,6 +207,8 @@ Agent loop: tools → parse → exec → feed back; history builder is budget-aw
 
 - **A knob whose "Automatic" is probe-backed shows what it RESOLVED, it does not offer "Probe" as a second entry** (`SpecCostInfo`, `/props` `spec_cost`): a user cannot choose between "Automatic" and "Probe" without benchmarking, so Automatic stays ONE entry (the A/B lives in `MLX_SERVE_SPEC_COST_PROBE=0`) and its label names the measured width — a bare "Automatic (6)" reads the same as a hardcoded cap, so the label says `measured`. `draftBlockSize` deliberately gets NO picker: it only clamps DOWNWARD against the sidecar's trained block, so picking 8 on a block-5 sidecar is a silent no-op while picking 8 for MTP is a real change — a knob that can only make things worse. (The two also differ in UNIT: `--mtp-depth N` = N drafts, `--draft-block-size N` = verify WIDTH = 1 + drafts.)
 
+- **A control that takes an internal ID is a PICKER, never free text** (`MagicPromptRewriter.choices` over `server.allModels`, ImageGenView): every id the app renders is a display LABEL (`org/repo · Q8_K_P`), so a typed name resolved to no model and Ideogram's non-fatal rewrite silently fell back to the raw prompt. `normalize` repairs a label saved by the old field; an id that no longer resolves stays selectable as `(unavailable)` rather than becoming the default. A control that calls `persist()` owes its settings struct a field — both magic-prompt controls did and neither was in `ImageGenSettings`, so the choice never survived a relaunch. Guards: `MagicPromptRewriterPickTests`, `MagicPromptStickinessTests`.
+
 ## Debugging
 
 - `print()` is invisible when launched via `open` — run the binary directly or write to file.

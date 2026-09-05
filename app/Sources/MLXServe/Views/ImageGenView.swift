@@ -511,11 +511,27 @@ struct ImageGenView: View {
                     .onChange(of: magicPrompt) { _, _ in guard !hydrating else { return }; persist() }
                 if magicPrompt {
                     VStack(alignment: .leading, spacing: 4) {
-                        TextField("", text: $magicPromptModel, prompt: Text("default text model"))
-                            .textFieldStyle(.roundedBorder)
-                            .font(.caption.monospaced())
-                            .onChange(of: magicPromptModel) { _, _ in guard !hydrating else { return }; persist() }
-                        Text("Which loaded chat model writes the caption. Empty = the server's default. The rewrite runs first, so it adds its own few seconds.")
+                        // A PICKER, not a text field: the field takes a model
+                        // id and every label the app shows is something else
+                        // ("org/repo · Q8_K_P"), so a typed name resolved to
+                        // no model and the rewrite silently fell back to the
+                        // raw prompt. A saved name that no longer resolves
+                        // stays selectable and says so, rather than quietly
+                        // becoming the default.
+                        Picker("", selection: $magicPromptModel) {
+                            Text("Server default").tag("")
+                            ForEach(MagicPromptRewriter.choices(server.allModels), id: \.name) { m in
+                                Text(m.name).tag(m.name)
+                            }
+                            if !magicPromptModel.isEmpty,
+                               !MagicPromptRewriter.choices(server.allModels).contains(where: { $0.name == magicPromptModel }) {
+                                Text("\(magicPromptModel) (unavailable)").tag(magicPromptModel)
+                            }
+                        }
+                        .labelsHidden()
+                        .font(.caption)
+                        .onChange(of: magicPromptModel) { _, _ in guard !hydrating else { return }; persist() }
+                        Text("Which chat model writes the caption. It loads on demand, so the rewrite adds its own few seconds.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -842,6 +858,10 @@ struct ImageGenView: View {
         loras = s.loras
         customWidthText = String(s.customWidth)
         customHeightText = String(s.customHeight)
+        magicPrompt = s.magicPrompt
+        // Repair a saved DISPLAY LABEL (what the old free-text field invited)
+        // into the id the server can actually resolve.
+        magicPromptModel = MagicPromptRewriter.normalize(s.magicPromptModel, in: server.allModels)
         // A LoRA file may have moved since last session — drop stale entries.
         loras.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
     }
@@ -865,6 +885,8 @@ struct ImageGenView: View {
         s.condGain = condGain
         s.condWeightsText = condWeightsText
         s.loras = loras
+        s.magicPrompt = magicPrompt
+        s.magicPromptModel = magicPromptModel
         s.save()
     }
 

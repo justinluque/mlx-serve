@@ -139,6 +139,24 @@ if [ -n "$CHAT" ]; then
   else
     fail "[5] no magic-prompt line in the log at all"
   fi
+  # The rewriter model was just loaded by name, so "unavailable" here is a
+  # RESOLUTION bug, not the design's non-fatal tolerance.
+  grep -q "rewriter model unavailable" "$TMP/server.log" \
+    && fail "[5] the rewriter model did not resolve: $(grep -m1 'magic prompt: model' "$TMP/server.log")"
+
+  # 5b. A DISPLAY LABEL must resolve back to its id. Everything the app shows
+  # is a label (a GGUF quant renders as "org/repo · Q8_K_P"), and a label that
+  # resolved to nothing took the non-fatal fallback — conditioning Ideogram on
+  # the raw sentence it was never trained on, with only a log line to say so.
+  : > "$TMP/label.json"
+  api /v1/images/generations -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"a blue barn at dawn\",\"size\":\"512x512\",\"steps\":12,\"seed\":7,\"magic_prompt\":true,\"magic_prompt_model\":\"someorg/$CHAT_ID · Q8_K_P\"}" \
+    > "$TMP/label.json"
+  if grep -q "resolved to model id '$CHAT_ID'" "$TMP/server.log"; then
+    echo "PASS: [5b] a display label resolved back to the served id"
+  else
+    fail "[5b] a display label did not resolve: $(grep -m1 'magic prompt: model' "$TMP/server.log")"
+  fi
 
   # A prompt that is ALREADY a caption must never be rewritten.
   : > /dev/null

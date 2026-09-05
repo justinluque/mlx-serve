@@ -2061,7 +2061,7 @@ fn handleConnection(
             // /api/ paths so /v1 fallback semantics stay pinned.
             var resolved: ?[]const u8 = null;
             if (std.mem.startsWith(u8, path, "/api/")) {
-                resolved = ollamaResolveRegistryId(stream.io, registry, requested_model_id);
+                resolved = resolveRegistryIdByName(stream.io, registry, requested_model_id);
             }
             // Unknown id — fall back to the default model rather than 404,
             // so off-the-shelf SDK clients keep working. Multi-model
@@ -2430,10 +2430,14 @@ fn handleOllamaEarly(allocator: std.mem.Allocator, stream: *Conn, method: []cons
     return false;
 }
 
-/// Ollama-style model name → registered model id, or null. Registry ids
-/// are stable for the process lifetime (unload keeps the stub), so the
-/// returned slice stays valid after the mutex drops.
-fn ollamaResolveRegistryId(io: std.Io, registry: *ModelRegistry, name: []const u8) ?[]const u8 {
+/// Loose model name → registered model id, or null. Registry ids are stable
+/// for the process lifetime (unload keeps the stub), so the returned slice
+/// stays valid after the mutex drops.
+///
+/// Named for the Ollama surface it was written for, but the tolerance is not
+/// Ollama-specific: any field a HUMAN types a model name into wants it (see
+/// `resolveRewriterModelId`).
+fn resolveRegistryIdByName(io: std.Io, registry: *ModelRegistry, name: []const u8) ?[]const u8 {
     registry.mutex.lockUncancelable(io);
     defer registry.mutex.unlock(io);
     var ids_buf: [128][]const u8 = undefined;
@@ -6397,6 +6401,24 @@ fn genJobRun(ctx: *anyopaque) void {
     };
 }
 
+/// A user-supplied rewriter model name → the registry id to load.
+///
+/// The field takes an id, but the app's picker and every log line show a
+/// display LABEL, and a label pasted into an id slot resolved to nothing: the
+/// whole rewrite silently fell back to the raw prompt, which for Ideogram 4
+/// means conditioning on out-of-distribution text. Each candidate form
+/// (`ideogram_prompt.rewriterIdCandidates`) is tried in turn.
+///
+/// Unresolvable names come back UNCHANGED so `ensureLoaded` raises the error
+/// and the warning names what the user actually typed.
+fn resolveRewriterModelId(io: std.Io, registry: *ModelRegistry, raw: []const u8) []const u8 {
+    var buf: [3][]const u8 = undefined;
+    for (ideogram_prompt.rewriterIdCandidates(raw, &buf)) |cand| {
+        if (resolveRegistryIdByName(io, registry, cand)) |id| return id;
+    }
+    return raw;
+}
+
 /// Dispatch a media-generation request to the inference thread. `lm` is the
 /// already-resolved + refcounted model (so it can't be evicted mid-gen). The
 /// generation runs on the scheduler's inference thread (the sole mlx caller);
@@ -6457,7 +6479,11 @@ fn magicPromptRewrite(
     // An empty id means "the default model" — the same shorthand every other
     // endpoint takes. A media model resolved here would have no tokenizer and
     // no transformer, so it is refused rather than half-run.
-    const lm = sch.ensureLoaded(model_id) catch |err| {
+    const resolved_id = resolveRewriterModelId(io, sch.registry, model_id);
+    if (!std.mem.eql(u8, resolved_id, model_id)) {
+        log.info("[ideogram4] magic prompt: rewriter '{s}' resolved to model id '{s}'\n", .{ model_id, resolved_id });
+    }
+    const lm = sch.ensureLoaded(resolved_id) catch |err| {
         log.warn("[ideogram4] magic prompt: model '{s}' unavailable ({s}); using the raw prompt\n", .{ model_id, @errorName(err) });
         return .{ .skipped = "rewriter model unavailable" };
     };
