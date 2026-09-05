@@ -1,5 +1,14 @@
 # Changelog
 
+## v26.9.4 (unreleased)
+
+### Fixes
+
+- Stable Diffusion 1.5 / SD-Turbo pulls failed to load with `MissingTransformerLayers`: SD 1.x's real `unet/config.json` never declares `transformer_layers_per_block` (only SDXL's per-stage depth needs to state it), but the parser treated the key as mandatory. It now defaults to 1 when absent, matching diffusers' own behavior.
+- Ideogram 4's magic-prompt rewriter received prompts still JSON-escaped instead of the actual text — a prompt with a quote or apostrophe reached the rewriter mangled, the same bug already fixed for every other image-request text field.
+
+---
+
 ## v26.9.3 (unreleased)
 
 ### Highlights
