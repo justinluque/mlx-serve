@@ -841,15 +841,20 @@ pub fn videoRgbTransportReason(delivered_frames: u32, width: u32, height: u32) ?
     return std.fmt.bufPrint(&S.buf, "{d} frames at {d}x{d} is {d} MB of raw RGB; one response carries at most {d} MB — fewer frames or windows, or a smaller canvas", .{ delivered_frames, width, height, bytes / (1024 * 1024), MAX_VIDEO_RGB_BYTES / (1024 * 1024) }) catch "video too large for one response";
 }
 
-/// The prompt and requested canvas of an image body, BORROWED from `body`.
-/// The magic-prompt rewriter needs both before the job is built: the caption's
-/// `aspect_ratio` field is the first thing the system prompt asks for, and it
-/// drives every bbox in the caption that follows.
+/// The prompt and requested canvas of an image body. `prompt` is OWNED
+/// (unescaped out of the raw JSON string) unless empty, in which case it is
+/// the static `""` and needs no free — same convention as `owned.len != 0`
+/// elsewhere in this file. The magic-prompt rewriter needs both before the
+/// job is built: the caption's `aspect_ratio` field is the first thing the
+/// system prompt asks for, and it drives every bbox in the caption that
+/// follows — and the rewriter is itself a text encoder, so a prompt with an
+/// escaped quote or apostrophe must reach it unescaped like every other
+/// image-request text field.
 pub const GenBodyPrompt = struct { prompt: []const u8, width: u32, height: u32 };
 
-pub fn promptAndSizeFromGenBody(body: []const u8) GenBodyPrompt {
+pub fn promptAndSizeFromGenBody(allocator: std.mem.Allocator, body: []const u8) !GenBodyPrompt {
     var out = GenBodyPrompt{ .prompt = "", .width = 1024, .height = 1024 };
-    if (extractJsonString(body, "prompt")) |p| out.prompt = p;
+    if (extractJsonString(body, "prompt")) |p| out.prompt = try jsonUnescape(allocator, p);
     if (extractJsonString(body, "size")) |size| {
         if (parseSize(size)) |wh| {
             out.width = wh.w;
@@ -7210,17 +7215,27 @@ test "a non-object body is refused, not silently rewritten" {
 }
 
 test "the rewriter reads the prompt and the canvas the caption must describe" {
+    const a = std.testing.allocator;
     // The system prompt asks for `aspect_ratio` FIRST and every bbox follows
     // from it, so the size has to be read before the job is built.
-    const b = promptAndSizeFromGenBody("{\"prompt\":\"a red barn\",\"size\":\"1536x512\"}");
+    const b = try promptAndSizeFromGenBody(a, "{\"prompt\":\"a red barn\",\"size\":\"1536x512\"}");
+    defer if (b.prompt.len != 0) a.free(b.prompt);
     try std.testing.expectEqualStrings("a red barn", b.prompt);
     try std.testing.expectEqual(@as(u32, 1536), b.width);
     try std.testing.expectEqual(@as(u32, 512), b.height);
     // No size = the endpoint's documented 1024² default, not zero.
-    const d = promptAndSizeFromGenBody("{\"prompt\":\"x\"}");
+    const d = try promptAndSizeFromGenBody(a, "{\"prompt\":\"x\"}");
+    defer if (d.prompt.len != 0) a.free(d.prompt);
     try std.testing.expectEqual(@as(u32, 1024), d.width);
     try std.testing.expectEqual(@as(u32, 1024), d.height);
-    try std.testing.expectEqualStrings("", promptAndSizeFromGenBody("{}").prompt);
+    const e = try promptAndSizeFromGenBody(a, "{}");
+    defer if (e.prompt.len != 0) a.free(e.prompt);
+    try std.testing.expectEqualStrings("", e.prompt);
+    // An escaped quote must reach the rewriter (a text encoder) unescaped,
+    // same as every other image-request text field.
+    const f = try promptAndSizeFromGenBody(a, "{\"prompt\":\"a \\\"red\\\" barn\"}");
+    defer if (f.prompt.len != 0) a.free(f.prompt);
+    try std.testing.expectEqualStrings("a \"red\" barn", f.prompt);
 }
 
 test "ideogram4 classifies as image media on both sides of the duplicated predicate" {

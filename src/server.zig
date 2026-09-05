@@ -4389,7 +4389,8 @@ fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const
     };
     if (!wanted) return null;
 
-    const bp = media_mod.promptAndSizeFromGenBody(body);
+    const bp = media_mod.promptAndSizeFromGenBody(allocator, body) catch return null;
+    defer if (bp.prompt.len != 0) allocator.free(bp.prompt);
     if (bp.prompt.len == 0) return null;
     if (ideogram_prompt.looksLikeCaption(bp.prompt)) {
         log.info("[ideogram4] magic prompt skipped: prompt is already a structured caption\n", .{});
