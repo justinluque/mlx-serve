@@ -36,6 +36,7 @@
 - **It writes its own prompt.** The model was trained only on structured JSON captions, so a plain sentence goes through a rewriter first, using a chat model you already have loaded. Turn it off (`magic_prompt: false`, or the toggle in the image pane) and send a caption yourself to place elements and pick colours by hand.
 - **Style LoRAs work on it**, stacked and summed like every other image backend.
 - **Convert your own**, at 4-bit, 8-bit, or one of two mixed policies (`tests/convert_ideogram4.py --precision mixed`): mixed 4/8 ~18 GB, `mixed_3_8` ~13 GB. Every mixed policy keeps the modulation and conditioning projections at 8-bit — that tier is 2% of the pack — and spends its budget on the attention/MLP bulk and the text encoder instead. `--bulk-bits` / `--sensitive-bits` / `--te-bits` override any tier.
+- **SeedVR2 upscaling.** One-step diffusion restoration for photos: sharpens detail, removes compression artifacts, and fills in real detail rather than resizing. Pick a model in the Image window.
 
 ### Fixes
 
