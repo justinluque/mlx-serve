@@ -782,6 +782,14 @@ struct ImageGenView: View {
                             .progressViewStyle(.linear)
                             .frame(width: 240)
                         Text(message).font(.footnote).foregroundStyle(.secondary)
+                        // The caption arrives before the first denoise step,
+                        // so it is readable while the steps tick — a bad one
+                        // is obvious immediately and the run can be cancelled
+                        // instead of watched.
+                        if let caption = service.revisedPrompt {
+                            captionBox(caption, title: "Magic prompt caption")
+                                .frame(maxWidth: 520)
+                        }
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -833,30 +841,49 @@ struct ImageGenView: View {
             // worth reading on its own: hand-editing one and re-running with
             // the rewrite off is the documented way to drive bbox and palette.
             if let caption = service.revisedPrompt {
-                DisclosureGroup(isExpanded: $showRevisedPrompt) {
-                    HStack(alignment: .top, spacing: 6) {
-                        ScrollView {
-                            Text(caption)
-                                .font(.caption.monospaced())
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(maxHeight: 160)
-                        Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(caption, forType: .string)
-                        } label: { Image(systemName: "doc.on.doc") }
-                        .buttonStyle(.borderless)
-                        .help("Copy the caption — paste it back with magic prompt off to edit it by hand")
-                    }
-                } label: {
-                    Text("Magic prompt caption")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                captionBox(caption, title: "Magic prompt caption")
             }
         }
         .padding(8)
+    }
+
+    /// The structured caption, collapsed. Shown DURING the run (it lands
+    /// before the first step) and again under the finished image.
+    @ViewBuilder
+    private func captionBox(_ caption: String, title: String) -> some View {
+        DisclosureGroup(isExpanded: $showRevisedPrompt) {
+            HStack(alignment: .top, spacing: 6) {
+                ScrollView {
+                    Text(caption)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 160)
+                VStack(spacing: 4) {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(caption, forType: .string)
+                    } label: { Image(systemName: "doc.on.doc") }
+                    .buttonStyle(.borderless)
+                    .help("Copy the caption")
+                    // The documented way to take control: the caption becomes
+                    // the prompt and the rewriter steps out of the way, so the
+                    // next run renders exactly what you edit.
+                    Button {
+                        prompt = caption
+                        magicPrompt = false
+                        persist()
+                    } label: { Image(systemName: "pencil") }
+                    .buttonStyle(.borderless)
+                    .help("Edit by hand — puts this caption in the prompt box and turns the rewrite off")
+                }
+            }
+        } label: {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var outputFolderLink: some View {

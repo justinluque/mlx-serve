@@ -2016,3 +2016,14 @@ you wanted. The filter itself is pinned against a REAL idle-server payload
 `capabilities:["chat", ...]` and is offerable before anything is resident,
 which is the property that makes the picker usable at all. The empty case now
 says "No chat model discovered yet" instead of quietly showing one row.
+
+**The caption arrives minutes before the image, so it ships minutes before the
+image.** The rewrite finishes on the connection thread before the gen job is
+queued; holding its output until the `complete` event delivered the one thing
+that explains what is about to be rendered only after there was nothing left
+to decide. It goes out as its own SSE event (`{"type":"revised_prompt"}`)
+right after the headers - an unknown `type` is ignorable to every existing
+client, so it is additive - and still rides the final body for non-streaming
+callers. The app shows it under the progress bar while the steps tick, with a
+button that puts the caption in the prompt box and turns the rewrite off,
+which is the documented way to take control of bbox and palette.

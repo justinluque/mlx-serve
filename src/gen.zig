@@ -2320,6 +2320,16 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
+    // The caption first, then the steps: it was ready before this job was
+    // queued, and it is what tells the caller whether the next minute is
+    // worth waiting for.
+    const revised_raw = extractJsonString(body, "revised_prompt");
+    if (want_stream) {
+        if (try revisedPromptEvent(allocator, revised_raw)) |ev| {
+            defer allocator.free(ev);
+            conn.writeAll(ev) catch {};
+        }
+    }
 
     const gen_opts = ImageGenOpts{
         .init_image = init_img, // null in edit mode
@@ -2353,11 +2363,9 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     defer allocator.free(b64);
     _ = std.base64.standard.Encoder.encode(b64, png_bytes);
 
-    // `revised_prompt`: the caption the renderer actually saw, echoed back the
-    // way OpenAI's own images API does it. `withRewrittenPrompt` put it on the
-    // body, so it arrives here already JSON-escaped — pass the RAW span
-    // through rather than unescaping and re-escaping it.
-    const revised_raw = extractJsonString(body, "revised_prompt");
+    // `revised_prompt` rides the final body too (OpenAI's own field), so a
+    // non-streaming caller and anything that missed the early event still get
+    // it. Already JSON-escaped on the body — the RAW span passes through.
     const out = try imageResponseJson(allocator, b64, revised_raw, want_stream);
     defer allocator.free(out);
     log.info("[image] -> {d} PNG bytes ({d} b64)\n", .{ png_bytes.len, b64.len });
@@ -2366,6 +2374,24 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         return;
     }
     return sendBytesJson(conn, allocator, out);
+}
+
+/// The SSE event that hands the caller the caption BEFORE the render starts.
+///
+/// The rewrite finishes on the connection thread before the image job is even
+/// queued, so the caption exists minutes before the PNG. Holding it until the
+/// `complete` event delivers the one thing that explains what is about to be
+/// rendered only after there is nothing left to decide — and a caption is
+/// worth reading while the steps tick, because a bad one is visible
+/// immediately and the run can be cancelled.
+///
+/// Its OWN event type: every existing client treats an unknown `type` as
+/// ignorable, so this is additive. `revised_prompt_raw` is the RAW
+/// (already-escaped) span from the request body; null means no rewrite ran,
+/// and then there is no event at all. Caller frees.
+fn revisedPromptEvent(allocator: std.mem.Allocator, revised_prompt_raw: ?[]const u8) !?[]u8 {
+    const raw = revised_prompt_raw orelse return null;
+    return try std.fmt.allocPrint(allocator, "data: {{\"type\":\"revised_prompt\",\"revised_prompt\":\"{s}\"}}\n\n", .{raw});
 }
 
 /// The image response body: one `data` row carrying the PNG, plus the caption
@@ -6039,4 +6065,27 @@ test "an image response echoes the caption the renderer actually saw" {
     defer a.free(streamed);
     try std.testing.expect(std.mem.startsWith(u8, streamed, "data: {\"type\":\"complete\","));
     try std.testing.expect(std.mem.endsWith(u8, streamed, "\n\n"));
+}
+
+test "the caption is streamed before the first denoise step, not with the image" {
+    // The rewrite finishes on the CONNECTION thread before the image job is
+    // even queued, so the caption exists minutes before the PNG does. Holding
+    // it until the `complete` event means the one thing that explains what is
+    // about to be rendered arrives after there is nothing left to decide.
+    const a = std.testing.allocator;
+
+    const ev = try revisedPromptEvent(a, "{\\\"a\\\":\\\"b\\\"}") orelse return error.NoEvent;
+    defer a.free(ev);
+    try std.testing.expect(std.mem.startsWith(u8, ev, "data: "));
+    try std.testing.expect(std.mem.endsWith(u8, ev, "\n\n"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, ev["data: ".len .. ev.len - 2], .{});
+    defer parsed.deinit();
+    // Its own event type: an unknown type is `.ignored` by every existing
+    // client, so this is additive — a progress event that suddenly carried a
+    // caption would be read by clients that only expect step/total.
+    try std.testing.expectEqualStrings("revised_prompt", parsed.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("{\"a\":\"b\"}", parsed.value.object.get("revised_prompt").?.string);
+
+    // No rewrite = no event at all.
+    try std.testing.expect(try revisedPromptEvent(a, null) == null);
 }

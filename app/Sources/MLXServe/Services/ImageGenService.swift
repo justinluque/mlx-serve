@@ -92,9 +92,16 @@ final class ImageGenService: ObservableObject {
                         let total = ev["total"] as? Int ?? steps
                         let stage = ev["stage"] as? String ?? "Generating"
                         phase = .running(step: step, total: max(total, 1), message: "\(stage)…")
+                    case "revised_prompt":
+                        // Arrives before the first denoise step — the caption
+                        // is what says whether the next minute is worth
+                        // waiting for.
+                        revisedPrompt = ev["revised_prompt"] as? String
                     case "complete":
                         png = Self.decodePngB64(ev)
-                        revisedPrompt = Self.decodeRevisedPrompt(ev)
+                        // The final body carries it too; keep the early one if
+                        // the complete event has none.
+                        revisedPrompt = Self.decodeRevisedPrompt(ev) ?? revisedPrompt
                     case "error":
                         await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? "Generation failed.")
