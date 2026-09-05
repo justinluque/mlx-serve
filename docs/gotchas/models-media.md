@@ -1691,3 +1691,70 @@ Two things learned on the way:
 - **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
 
 H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
+
+## Krea-2's VAE decode was the transient, not the denoise (2026-09-04)
+
+Reported as "runs the entire way through, then crashes on decoding" at higher
+resolutions. The server log ends on `[image] generating 1024x1536 steps=8` with
+no `.ips` and no error — the uncatchable Metal OOM abort. The reporter's box is
+a 24 GB Mac holding a 5.5 GB VLM plus the 14.7 GB Krea engine, so ~3 GB was
+free when the eight denoise steps finished and the VAE decode started.
+
+Nothing bills a VAE decode per request (same gap as #321), so the first job was
+to measure it. An env-gated test decodes a synthetic latent at a given size and
+reports `mlx_get_peak_memory`, nothing else resident:
+
+| size | before | after |
+|---|---|---|
+| 1024x1024 | 10.25 GB | 2.59 GB |
+| 1024x1536 | 11.17 GB | 3.65 GB |
+| 1536x1536 | 20.72 GB | 5.34 GB |
+| 2048x2048 | never finished | 9.28 GB |
+
+`clampKreaDim` advertises up to 2048, and 2048 could not decode at all on this
+machine. Four independent terms, found by evaluating at each decoder stage and
+watching active memory:
+
+- **The whole decode was ONE lazy graph.** MLX frees an intermediate when its
+  refcount drops, and an unevaluated array's refcount never drops — so every
+  stage's tensors stayed live until the single `eval` the caller does at the
+  end. At the last up block one plane is 0.9 GB at 1536x1536. Cutting the tape
+  after each op that produces a full-size plane (`boundTape`) is bit-identical:
+  an eval only forces work that was already scheduled. The eager frees that
+  pair with it are worth nothing on their own — the first attempt moved the
+  peak by 0.2 GB because the frees were dropping handles to lazy nodes.
+- **`causalConv3d` at T=1 was doing three convolutions to get one.** The causal
+  pad puts `2*pad` ZERO frames before x and none after, so with kt=3 taps 0 and
+  1 convolve zeros. MLX 0.32.2 splits an N=1, temporal-pad-0 conv3d into `kt`
+  per-tap 2D convs (#321's `small_kd_conv_3D_gpu`) and holds every tap's
+  Winograd transform live until the command buffer completes — 6+ GB for one
+  604 MB output. LTX's `conv3dDepthChunked` has nothing to bite on here: at
+  T=1 there are no frames to chunk over. Collapsing to the last tap is exact
+  (`worst_abs = 0` against the whole-volume arm at both shapes the decoder
+  builds) and removes two thirds of the transient with two thirds of the work.
+- **Winograd budgets per CALL and only tiles over the BATCH axis**, and this
+  decoder's batch is always 1. `winograd_batch_step` will take 75% of
+  `recommendedMaxWorkingSetSize` for a single conv; the last 3x3 upsample conv
+  over a 1536x1536 plane took 6.6 GB of transform buffers and was the decode's
+  peak. `conv2dBanded` splits the OUTPUT rows — exact, because an output row
+  reads only `kh` input rows — and pads only each band's missing edge rows,
+  since padding the whole plane up front costs as much as the buffers being
+  avoided.
+- **The mid attention is one head of width 384**, and MLX has no fused kernel
+  at that head dim (it serves {64, 72, 80, 96, 128, 192, 256}), so the block
+  falls to the unfused arm and MATERIALIZES an `[HW, HW]` f32 score matrix —
+  quadratic in PIXELS: 1.0 GB at 1024x1024, 5.4 at 1536x1536, 17 at 2048x2048,
+  and matmul and softmax hold one each. Chunking the QUERY rows is exact (a
+  softmax row normalizes over keys alone) and caps the term at `chunk x HW`.
+
+Live, a 1024x1024 image at a fixed seed differs from the old arms in **100 of
+3,145,728 subpixels, all by 1** — banding and the tap collapse change which
+kernel MLX picks, and a different kernel is a different reduction order. Every
+arm is `worst_abs = 0` against its own reference in the hermetic tests; the
+pixel delta is kernel selection, not math.
+
+The lesson that generalizes past Krea: **a media backend's per-request
+transient is unbilled, so it has to be MEASURED, and the first thing to measure
+is how long the lazy graph is.** Three of the four terms above are invisible to
+any per-op reasoning — they are properties of what stays live, not of what any
+single op allocates.
