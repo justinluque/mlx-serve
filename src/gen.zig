@@ -18,6 +18,7 @@ const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
+const z_image_mod = @import("z_image.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -92,14 +93,15 @@ pub const Modality = enum {
 /// waiting. The test at the bottom of this file pins them together.
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
-    "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3",
+    "zimage",    "qwen3_tts",  "acestep",        "kokoro",
+    "AudioVideo", "hunyuan3d", "minimax_h3",     "minimax_music3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
+    if (std.mem.startsWith(u8, model_type, "zimage")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -168,6 +170,9 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
     // the "mage_flow" marker so routing + the backend dispatch light up.
     if (isMageFlowRepo(io, allocator, model_dir)) return allocator.dupe(u8, "mage_flow") catch null;
+    // Same for a Z-Image (Tongyi-MAI) diffusers repo: no root config.json,
+    // only model_index.json (`_class_name == "ZImagePipeline"`).
+    if (isZImageRepo(io, allocator, model_dir)) return allocator.dupe(u8, "zimage") catch null;
     // Same for an mflux FLUX.2 conversion with no config.json at all (the only
     // MLX build of klein 9B). Identified by the DiT's own weight names, through
     // the SAME predicate discovery uses — a private copy here is how `list` and
@@ -220,6 +225,24 @@ fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
     if (parsed.value.object.get("_mage_flow_version") != null) return true;
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+}
+
+/// True when `model_dir/model_index.json` marks a Z-Image (Tongyi-MAI)
+/// pipeline. Same shape as `isMageFlowRepo`.
+fn isZImageRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const cn = parsed.value.object.get("_class_name") orelse return false;
+    return cn == .string and std.mem.eql(u8, cn.string, "ZImagePipeline");
 }
 
 /// Classify a model dir into a media modality (reads its `model_type`), or null
@@ -465,6 +488,7 @@ const ImageBackend = union(enum) {
     flux: FluxImpl,
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
+    zimage: *z_image_mod.Engine,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -545,6 +569,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .mage_flow = try mage_flow_mod.Engine.load(io, allocator, model_dir) };
                 return self;
             }
+            if (std.mem.startsWith(u8, mt, "zimage")) {
+                self.backend = .{ .zimage = try z_image_mod.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
             if (std.mem.startsWith(u8, mt, "krea")) {
                 self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
                 return self;
@@ -560,6 +588,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.deinit(),
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
+            .zimage => |m| m.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -569,6 +598,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.s,
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
+            .zimage => |m| m.s,
         };
     }
 
@@ -578,6 +608,7 @@ pub const ImageEngine = struct {
             .flux => 3,
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
+            .zimage => 0, // conditioning-rebalance not wired for Z-Image yet
         };
     }
 
@@ -587,6 +618,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
+            .zimage => false, // no VAE encoder — text-to-image only
         };
     }
 
@@ -597,6 +629,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
+            .zimage => false, // txt2img only
         };
     }
 
@@ -640,6 +673,7 @@ pub const ImageEngine = struct {
                 .flux => .flux2,
                 .krea => .krea2,
                 .mage_flow => .generic,
+                .zimage => .generic,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -651,6 +685,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
+            .zimage => 0, // Z-Image does not support LoRA yet
         };
         if (matched == 0) {
             stack.deinit();
@@ -666,6 +701,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
             .mage_flow => {}, // no LoRA attached
+            .zimage => {}, // no LoRA attached
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;
@@ -699,6 +735,12 @@ pub const ImageEngine = struct {
                 m.editImage(allocator, prompt, opts.edit_image_bytes, width, height, seed, steps, progress)
             else
                 m.generateImage(allocator, prompt, width, height, seed, steps, progress),
+            // Turbo (8 steps, CFG 0) or base (50 steps, CFG 5) per checkpoint
+            // defaults — no img2img/edit support yet.
+            .zimage => |m| blk: {
+                if (opts.init_image != null or opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                break :blk m.generateImage(allocator, prompt, width, height, seed, steps, progress);
+            },
         };
     }
 
@@ -718,6 +760,22 @@ pub const ImageEngine = struct {
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
             // MageFlow is native-resolution, VAE downsample 16 → multiples of 16.
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            // Z-Image: multiples of 32 in [256, 2048] (see z_image.normalizeDim).
+            .zimage => .{ .w = clampZImageDim(req_w), .h = clampZImageDim(req_h) },
+        };
+    }
+
+    /// Steps to use when the request omits `steps`. Every OTHER backend here
+    /// is a distilled 4-step turbo (Krea-2-Turbo, MageFlow-Turbo, FLUX.2
+    /// klein), so a single hardcoded 4 has always been right — Z-Image is
+    /// the first backend that ships BOTH a distilled variant (Turbo, 8
+    /// steps) and a non-distilled one (base, 50 steps, needs real CFG) under
+    /// the SAME modality, so the default has to be resolved per checkpoint
+    /// (`z_image.Config.default_steps`), not per architecture.
+    pub fn defaultSteps(self: *const ImageEngine) u32 {
+        return switch (self.backend) {
+            .flux, .krea, .mage_flow => 4,
+            .zimage => |m| m.cfg.default_steps,
         };
     }
 
@@ -728,7 +786,7 @@ pub const ImageEngine = struct {
     pub fn maxDimFor(kind: std.meta.Tag(ImageBackend)) u32 {
         return switch (kind) {
             .flux => 1536,
-            .krea, .mage_flow => 2048,
+            .krea, .mage_flow, .zimage => 2048,
         };
     }
 
@@ -750,6 +808,14 @@ pub fn clampFluxDim(v: u32) u32 {
 /// VAE ×8 + DiT patch ×2 alignment).
 fn clampKreaDim(v: u32) u32 {
     const rounded = ((v + 15) / 16) * 16;
+    return std.math.clamp(rounded, 256, 2048);
+}
+
+/// Round a requested dimension to a multiple of 32 in [256, 2048] (Z-Image's
+/// VAE ×8 + DiT patch ×2 alignment — `z_image.normalizeDim`).
+fn clampZImageDim(v: u32) u32 {
+    if (v == 0) return 1024;
+    const rounded = ((v + 31) / 32) * 32;
     return std.math.clamp(rounded, 256, 2048);
 }
 
@@ -1828,7 +1894,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 4);
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse engine.defaultSteps());
 
     // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
@@ -4436,6 +4502,8 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
     try testing.expectEqual(Modality.image, modalityFromType("mage_flow").?);
     try testing.expectEqual(Modality.image, modalityFromType("mageflow").?);
+    try testing.expectEqual(Modality.image, modalityFromType("zimage").?);
+    try testing.expectEqual(Modality.image, modalityFromType("zimage-turbo").?);
     try testing.expectEqual(@as(?Modality, null), modalityFromType("gemma4"));
     try testing.expectEqual(@as(?Modality, null), modalityFromType("qwen3_5_moe"));
 }
@@ -4462,6 +4530,35 @@ test "mage_flow detects from the official diffusers layout (model_index.json, no
     const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
     defer allocator.free(mt);
     try testing.expectEqualStrings("mage_flow", mt);
+    try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
+}
+
+test "zimage detects from the official diffusers layout (model_index.json, no root config.json)" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // Z-Image (Tongyi-MAI) repos have no root config.json/model_type — the
+    // pipeline identity lives in model_index.json (_class_name). This is
+    // the class bug MageFlow already had once: `peekModelType` deciding the
+    // ImageEngine backend must special-case this SAME shape or a Z-Image
+    // dir silently falls through to the FLUX backend and fails to load
+    // with a generic FileNotFound.
+    try tmp.dir.createDirPath(io, "zi");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "zi/model_index.json",
+        .data = "{\"_class_name\":\"ZImagePipeline\"}",
+    });
+    const model_dir = try std.fs.path.join(allocator, &.{ root, "zi" });
+    defer allocator.free(model_dir);
+
+    const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
+    defer allocator.free(mt);
+    try testing.expectEqualStrings("zimage", mt);
     try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
 }
 

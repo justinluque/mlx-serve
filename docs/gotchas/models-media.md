@@ -1758,3 +1758,54 @@ transient is unbilled, so it has to be MEASURED, and the first thing to measure
 is how long the lazy graph is.** Three of the four terms above are invisible to
 any per-op reasoning — they are properties of what stays live, not of what any
 single op allocates.
+
+## Z-Image text encoder: a live SIGSEGV, then a live wrong-shape matmul
+
+Bringing up `z_image.zig`'s `TextEncoder` (reusing `transformer.zig`'s real
+`Transformer`/`CaptureLayers` machinery, same idea as `ltx_video.gemmaCapture4`)
+crashed with `EXC_BAD_ACCESS` inside `mlx::core::take` — the embedding-table
+gather in `Transformer.rawEmbedding` — on the FIRST real generation against
+the real 8-bit Turbo mirror. The token ids being gathered were all safely
+in-range (`[64, 151645]` against a 151936-row table), which is what made this
+confusing at first: it looked like a bad token id, and it wasn't.
+
+Root cause: `TextEncoder.load` did `var weights = try model_mod.loadWeights(...)`,
+`Transformer.init(io, allocator, config, &weights)`, then `defer weights.deinit()`
+fired at the END of `load()` — before the `TextEncoder` (which now outlives
+`load()`, stored on the long-lived `Engine`) ever calls `.encode()`. Every
+OTHER caller of `Transformer.init` in this codebase (`main.zig`'s offline
+path, `dflash.zig`, `diffusion.zig`, `ltx_video.gemmaCapture4`) keeps its
+`Weights` alive for the ENTIRE lifetime it uses the resulting `Transformer` —
+`Transformer` binds VIEWS into the weights' arrays, not deep copies, and
+freeing `weights` early is silently fine until the next forward touches the
+freed memory, which is exactly what a background-loaded, request-triggered
+text encoder does. Fix: `TextEncoder` now stores its `Weights` as a field and
+frees it in `deinit()`, alongside `xfm`.
+
+With that fixed, the SAME setup failed differently: a live, catchable MLX
+error — `[matmul] Last dimension of first input with shape (1,14,2560) must
+match second to last dimension of second input with shape (640,4096)`. 640 is
+`2560 * 8 bits / 32` — the affine-quantized PACKED width of a q_proj weight
+the converter had quantized to 8-bit. `transformer.zig`'s shared Qwen3 loader
+(`getLayerScaleOrEmpty`, keyed on `config.quant_bits`) decides dense-vs-
+quantized from `config.json`'s own `quantization` block, NOT from whether a
+`.scales` sibling tensor happens to exist in the safetensors file — unlike
+`MfLinear` (the DiT's own loader, shared with MageFlow/H3), which infers
+quantization from packed geometry alone, no config needed. The converter
+copied `text_encoder/config.json` from the upstream (unquantized) checkpoint
+verbatim, so `config.quant_bits` was 0 and every packed `.weight` got read as
+a dense matrix of the wrong shape. Fix: `copy_support_files` in both
+`convert_zimage_weights.py` and `fetch_and_convert_zimage.py` now injects
+`{"bits": N, "group_size": 64, "mode": "affine"}` into each output's own copy
+of `text_encoder/config.json`, matching the bits that run actually quantized
+the text encoder at.
+
+Both bugs were invisible to `zig build test` (no real weights) and only
+surfaced live, once a real checkpoint reached the second forward. The live
+`zimage text encoder live` test (`ZIMAGE_TEST_MODEL=<dir> zig build test
+-Dtest-filter="zimage text encoder live"`) pins the first; the converter's
+`--self-test` pins the second (quantization-block injection, no weights
+needed). Verified end-to-end: `/v1/images/generations` against the real
+8-bit AND 4-bit Turbo mirrors both produced a genuinely coherent photo of a
+fox in snow, not noise — the actual acceptance bar for a backend with no
+numeric oracle.

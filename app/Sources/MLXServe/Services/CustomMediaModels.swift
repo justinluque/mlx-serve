@@ -33,6 +33,12 @@ enum CustomMediaModels {
         id.range(of: "mageflow-edit", options: .caseInsensitive) != nil
     }
 
+    /// Mirrors the server's `z_image.dirLooksTurbo`: Z-Image and Z-Image-Turbo
+    /// are byte-identical apart from the checkpoint dir name carrying "turbo".
+    private static func isTurboDir(_ id: String) -> Bool {
+        id.range(of: "turbo", options: .caseInsensitive) != nil
+    }
+
     // MARK: - Arch → family templates
 
     private static func imageFamily(arch: String, id: String) -> ImageModelPreset? {
@@ -42,6 +48,9 @@ enum CustomMediaModels {
         if arch.hasPrefix("krea") { return .krea2Turbo }
         if arch.hasPrefix("mage_flow") || arch == "mageflow" {
             return isEditDir(id) ? .mageFlowEditTurbo : .mageFlowTurbo
+        }
+        if arch.hasPrefix("zimage") {
+            return isTurboDir(id) ? .zImageTurbo8bit : .zImage8bit
         }
         return nil
     }
