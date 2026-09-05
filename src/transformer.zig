@@ -8378,6 +8378,42 @@ pub const Transformer = struct {
         // vector (attention_factor on the rotated dims, 1.0 on the pass-through
         // tail) and the HOST inverse frequencies the M-RoPE tables and the QSA
         // pooled-key ladder are filled from. Sliding layers use default RoPE.
+        // Llama-3.1/3.2 "llama3" rope_scaling: a piecewise wavelength blend
+        // (transformers `_compute_llama3_parameters`), NOT Gemma's uniform
+        // proportional scaling above — mutually exclusive with it, but reuses
+        // the SAME `rope_freqs_global` custom-frequencies mechanism (every
+        // layer is "global" for a plain Llama trunk, so `forwardStandardWith`
+        // picks it up with zero forward-pass changes).
+        if (config.rope_llama3) {
+            const half = config.head_dim / 2;
+            const freqs_f64 = try allocator.alloc(f64, half);
+            defer allocator.free(freqs_f64);
+            computeLlama3RopeFreqs(
+                freqs_f64,
+                config.head_dim,
+                config.rope_theta,
+                config.rope_llama3_factor,
+                config.rope_llama3_low_freq_factor,
+                config.rope_llama3_high_freq_factor,
+                config.rope_llama3_orig_max_pos,
+            );
+            const freqs_f32 = try allocator.alloc(f32, half);
+            defer allocator.free(freqs_f32);
+            for (freqs_f64, 0..) |v, i| freqs_f32[i] = @floatCast(v);
+            const fshape = [_]c_int{@intCast(half)};
+            const arr = mlx.mlx_array_new_data(freqs_f32.ptr, &fshape, 1, .float32);
+            {
+                const eval_vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(eval_vec);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
+                try mlx.check(mlx.mlx_eval(eval_vec));
+            }
+            rope_freqs_global = arr;
+        }
+
+        // Laguna YaRN (full-attention layers): precompute the mlx_fast_rope
+        // denominator array + the mscale vector (attention_factor on rotated
+        // dims, 1.0 on the pass-through tail). Sliding layers use default RoPE.
         var rope_freqs_yarn: ?mlx.mlx_array = null;
         var yarn_mscale: ?mlx.mlx_array = null;
         var yarn_inv_freq: ?[]const f64 = null;
@@ -22055,6 +22091,40 @@ fn computeYarnFreqs(
     };
     spec.invFreq(out);
     for (out) |*v| v.* = 1.0 / v.*;
+}
+
+/// Llama-3.1/3.2 "llama3" `rope_scaling`: transformers'
+/// `_compute_llama3_parameters` — a piecewise blend between the standard
+/// (extrapolated) frequency and a uniformly-scaled (interpolated) one, keyed
+/// on each dimension's wavelength relative to `original_max_position_embeddings`.
+/// `out[i] = 1/inv_freq_llama3[i]` (same "reciprocal of inv_freq" convention
+/// as `computeYarnFreqs` — see the `mlx_fast_rope` `freqs` doc comment there).
+fn computeLlama3RopeFreqs(
+    out: []f64,
+    head_dim: u32,
+    base: f64,
+    factor: f64,
+    low_freq_factor: f64,
+    high_freq_factor: f64,
+    orig_max: u32,
+) void {
+    const dim: f64 = @floatFromInt(head_dim);
+    const n = out.len; // dim/2
+    const mp: f64 = @floatFromInt(orig_max);
+    const low_freq_wavelen = mp / low_freq_factor;
+    const high_freq_wavelen = mp / high_freq_factor;
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const inv_freq = 1.0 / std.math.pow(f64, base, @as(f64, @floatFromInt(2 * i)) / dim);
+        const wavelen = 2.0 * std.math.pi / inv_freq;
+        var inv_freq_llama = if (wavelen > low_freq_wavelen) inv_freq / factor else inv_freq;
+        const smooth = (mp / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
+        const smoothed_inv_freq = (1.0 - smooth) / factor * inv_freq_llama + smooth * inv_freq_llama;
+        const is_medium_freq = wavelen >= high_freq_wavelen and wavelen <= low_freq_wavelen;
+        if (is_medium_freq) inv_freq_llama = smoothed_inv_freq;
+        out[i] = 1.0 / inv_freq_llama;
+    }
 }
 
 /// Hy3 (hy_v3 / DeepSeek-V3-style) sigmoid routing chain — mirrors the
