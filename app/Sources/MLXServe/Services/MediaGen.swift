@@ -144,6 +144,7 @@ enum FluxVariant: String, Hashable, Codable {
     case zImage           // Tongyi-MAI Z-Image (50-step, CFG 5) single-stream S3-DiT — served by the zimage backend
     case zImageTurbo      // Tongyi-MAI Z-Image-Turbo — same arch, distilled 8-step, no CFG (no negative-prompt branch)
     case anima            // circlestone-labs/Anima Cosmos-style DiT — served by the native `anima` backend
+    case ideogram4        // Ideogram 4 single-stream MRoPE DiT + a SECOND unconditional DiT — served by the ideogram4 backend
 }
 
 struct ImageQualitySettings: Hashable {
@@ -661,6 +662,85 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Anime/illustration image generation — the full-quality Cosmos-style DiT (stronger, slower than Turbo) with img2img and LoRA support. Non-commercial license."
     )
 
+    /// Ideogram 4 is flexible from 256 to 2048 per side on any multiple of 16
+    /// (patch 2 × VAE 8), with aspect ratios documented up to 6:1. Native 2K is
+    /// the headline capability, so the menu leads with a large square and keeps
+    /// the wide formats the model was trained to lay text out in.
+    private static let ideogramResolutions: [ResolutionOption] = [
+        .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
+        .init(width: 1536, height: 1536, label: "1536 × 1536 (large square)"),
+        .init(width: 2048, height: 2048, label: "2048 × 2048 (max, native 2K)"),
+        .init(width: 768,  height: 768,  label: "768 × 768 (square, fast)"),
+        .init(width: 1024, height: 1536, label: "1024 × 1536 (portrait 2:3, book cover)"),
+        .init(width: 1536, height: 1024, label: "1536 × 1024 (landscape 3:2)"),
+        .init(width: 1344, height: 768,  label: "1344 × 768 (landscape 16:9)"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (portrait 9:16)"),
+        .init(width: 2048, height: 1152, label: "2048 × 1152 (16:9, large)"),
+        .init(width: 1536, height: 512,  label: "1536 × 512 (banner 3:1)"),
+        .init(width: 1024, height: 1280, label: "1024 × 1280 (portrait 4:5)"),
+    ]
+
+    /// The three sampler presets the reference ships, mapped onto our quality
+    /// tiers. Their `mu`/`std` differ per preset server-side, and the step
+    /// count is what selects them (`ideogram4.SamplerPreset.forSteps`) — so a
+    /// tier here must land ON one of 12 / 20 / 48, not near it.
+    private static let ideogramQuality: [QualityPreset: ImageQualitySettings] = [
+        .fast:         .init(steps: 12),   // V4_TURBO_12
+        .good:         .init(steps: 20),   // V4_DEFAULT_20
+        .quality:      .init(steps: 48),   // V4_QUALITY_48
+        .superQuality: .init(steps: 48),
+    ]
+
+    private static let ideogramDescription = """
+        Ideogram's open-weight design model — best-in-class text rendering, \
+        multilingual signage and typography, and explicit layout control. It \
+        writes its own structured caption from your idea, so a plain sentence \
+        works; send JSON yourself to place elements and pick colours by hand.
+        """
+
+    // Converted with `tests/convert_ideogram4.py` from the upstream FP8
+    // release (NF4 dequant needs a CUDA host for `bitsandbytes` — there is
+    // no way to unpack it on Apple Silicon, so FP8 is the source every
+    // mirror is built from). A `mixed_2_8` pack was tried and withdrawn —
+    // 2-bit affine on the DiT bulk renders a woven-grid artifact at every
+    // prompt (`MIN_BULK_BITS` in the converter refuses it now).
+    //
+    // Two presets: `mixed_3_8` (bulk 3-bit) is sized to fit a 24 GB Mac with
+    // 6 GB not guaranteed by the system, with real headroom left for
+    // activations. `mixed_4_8` (bulk 4-bit, text encoder 8-bit — the
+    // reference `mixed` policy) is the quality point for a Mac with more
+    // headroom to spend; both hold the modulation/conditioning tier at
+    // 8-bit regardless.
+    static let ideogram4_mixed_3_8 = ImageModelPreset(
+        id: "justintime47/ideogram-4-mixed-3-8",
+        name: "Ideogram 4 mixed 3/8-bit (~13 GB)",
+        variant: .ideogram4,
+        configName: "ideogram4",
+        repo: "justintime47/Ideogram-4-MLX-Serve-mixed_3_8",
+        approxDownloadGB: 13,
+        approxRAMGB: 18,
+        resolutions: ideogramResolutions,
+        defaultResolution: ideogramResolutions[0],
+        qualityProfiles: ideogramQuality,
+        defaultQuality: .good,
+        description: ideogramDescription
+    )
+
+    static let ideogram4_mixed_4_8 = ImageModelPreset(
+        id: "justintime47/ideogram-4-mixed-4-8",
+        name: "Ideogram 4 mixed 4/8-bit (~19 GB)",
+        variant: .ideogram4,
+        configName: "ideogram4",
+        repo: "justintime47/Ideogram-4-MLX-Serve-mixed_4_8",
+        approxDownloadGB: 19,
+        approxRAMGB: 24,
+        resolutions: ideogramResolutions,
+        defaultResolution: ideogramResolutions[0],
+        qualityProfiles: ideogramQuality,
+        defaultQuality: .good,
+        description: ideogramDescription
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is Z-Image Turbo
     /// 4-bit — smallest download in the whole catalog.
     static let all: [ImageModelPreset] = [
@@ -671,7 +751,9 @@ struct ImageModelPreset: Identifiable, Hashable {
         .flux2Klein9B_Q4,                              // 10
         .flux2Klein9BBase_Q4,                          // 10
         .flux1Dev_Q4, .flux1Schnell_Q4,                // 10, 10
+        .ideogram4_mixed_3_8,                          // 13
         .krea2Turbo,                                   // 15
+        .ideogram4_mixed_4_8,                          // 18
     ]
 }
 
@@ -2024,6 +2106,15 @@ struct ImageGenRequest {
     /// How far to renoise the source (1 = ignore it, low = small change).
     /// Only meaningful with `initImagePath` in variation mode.
     var strength: Double = 0.6
+    /// Ideogram 4's magic prompt: let the server rewrite a plain idea into the
+    /// structured JSON caption the model was trained on. Only sent when the
+    /// preset declares `supportsMagicPrompt` — every other backend ignores the
+    /// field, and a control that does nothing is worse than a missing one.
+    /// Off = condition on the typed text verbatim, which is the right choice
+    /// when the user hand-wrote a caption.
+    var magicPrompt: Bool = true
+    /// Model id to rewrite WITH. Empty = the server's default text model.
+    var magicPromptModel: String = ""
     /// Instruction editing (FLUX.2 only): condition on the source as a clean
     /// in-context reference — "make the hair blue" keeps the same person.
     /// false = variation (renoise) mode.
@@ -2064,6 +2155,9 @@ extension ImageModelPreset {
         // for `.zimage` — "not wired for Z-Image yet"). Mage-Flow + FLUX.1 use
         // a single text-encoder hidden state — no rebalance either.
         case .mageFlowTurbo, .mageFlowEditTurbo, .zImage, .zImageTurbo, .flux1Dev, .flux1Schnell, .anima: return 0
+        // 13 taps, but the rebalance UI slices tap-MAJOR features and
+        // Ideogram's are tap-INNER; gen.zig reports 0 until that is wired.
+        case .ideogram4: return 0
         default: return 3
         }
     }
@@ -2076,6 +2170,9 @@ extension ImageModelPreset {
         // `clampKreaDim` — VAE ×8 + DiT patch ×2. Mage-Flow is native-resolution
         // with a ×16 VAE downsample and shares the same clamp server-side.
         case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .anima:
+            return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
+        // `ideogram4.clampDim` — patch 2 × ae_scale 8, 256–2048 per the card.
+        case .ideogram4:
             return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
         // widest preset edge.
@@ -2121,6 +2218,10 @@ extension ImageModelPreset {
         // variation path; FLUX.1's VAE encoder / img2img is not wired yet
         // (the server rejects a source image by name).
         case .mageFlowTurbo, .mageFlowEditTurbo, .zImage, .zImageTurbo, .flux1Dev, .flux1Schnell: return false
+        // The Flux2 autoencoder ships BOTH halves and `convert_ideogram4.py`
+        // carries them both into the pack, so the server-side VAE encoder
+        // loads and `mode:"variation"` is a real path — not the
+        // decoder-only pack this was first assumed to be (falls to `default`).
         default: return true
         }
     }
@@ -2151,6 +2252,12 @@ extension ImageModelPreset {
         default: return false
         }
     }
+
+    /// Ideogram 4 was trained EXCLUSIVELY on structured JSON captions, so the
+    /// server rewrites a plain sentence into one before conditioning on it
+    /// (`magic_prompt`). The pane surfaces the toggle only where it does
+    /// something — everywhere else the field is ignored.
+    var supportsMagicPrompt: Bool { variant == .ideogram4 }
 
     /// The fixed step count for a distilled preset (its `.good` profile).
     var fixedSteps: Int { settings(.good).steps }

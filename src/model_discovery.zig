@@ -78,6 +78,13 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
     // Anima: our converted pack writes the DiT (transformer + llm_adapter) last.
     if (std.mem.eql(u8, model_type, "anima")) return "transformer.safetensors";
+    // Ideogram 4: the unconditional transformer is a SECOND 9.3B checkpoint,
+    // and it is what a half-finished pull is most likely to be missing — the
+    // conditional weights alone would load and then denoise against a branch
+    // that never loaded. `tests/convert_ideogram4.py` writes this file last,
+    // after every shard of both transformers; an unconverted upstream repo
+    // carries it too.
+    if (std.mem.startsWith(u8, model_type, "ideogram4")) return "unconditional_transformer/config.json";
     return null;
 }
 
@@ -88,6 +95,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
         std.mem.startsWith(u8, model_type, "zimage") or
+        std.mem.startsWith(u8, model_type, "ideogram4") or
         std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "kokoro") or
@@ -154,6 +162,12 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // (`_class_name`=="ZImagePipeline").
         if (peekZImageIndex(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "zimage") catch return .missing_or_unparseable };
+        // Ideogram 4 publishes in the same diffusers shape. Our own converted
+        // packs DO write a root config.json, so this arm serves an unconverted
+        // upstream repo. Mirrors gen.isIdeogram4Repo — the two must agree, or
+        // `list` and the loader disagree about whether a dir is a model.
+        if (peekIdeogram4Index(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "ideogram4") catch return .missing_or_unparseable };
         // …and an mflux FLUX.2 conversion may carry nothing at all (the only
         // MLX build of klein 9B ships no config.json). Same fallback, keyed on
         // the DiT's own weight names.
@@ -204,10 +218,12 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
 }
 
-/// True when `sub/model_index.json` marks a MageFlow pipeline (`_class_name` ==
-/// "MageFlowPipeline", or a `_mage_flow_version` tag). Same signature as
-/// gen.isMageFlowRepo, over an already-open Dir.
-pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+/// `model_index.json`'s pipeline identity: true when `_class_name` equals
+/// `want`, or when `tag` names a key the document carries at all. ONE reader
+/// for every diffusers-shaped repo — the 1 MiB read cap, the buffer size and
+/// the swallow-every-error policy live here once, so raising any of them
+/// cannot apply to some pipelines and not others.
+fn indexMarksPipeline(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, want: []const u8, tag: ?[]const u8) bool {
     var file = sub.openFile(io, "model_index.json", .{}) catch return false;
     defer file.close(io);
     var rbuf: [4096]u8 = undefined;
@@ -217,9 +233,24 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
-    if (parsed.value.object.get("_mage_flow_version") != null) return true;
+    if (tag) |t| {
+        if (parsed.value.object.get(t) != null) return true;
+    }
     const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+    return cn == .string and std.mem.eql(u8, cn.string, want);
+}
+
+/// True when `sub/model_index.json` marks an Ideogram 4 pipeline. Twin of
+/// `gen.isIdeogram4Repo`, which is a path→Dir wrapper over this.
+pub fn peekIdeogram4Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return indexMarksPipeline(io, allocator, sub, "Ideogram4Pipeline", null);
+}
+
+/// True when `sub/model_index.json` marks a MageFlow pipeline (`_class_name` ==
+/// "MageFlowPipeline", or a `_mage_flow_version` tag). Twin of
+/// `gen.isMageFlowRepo`, which is a path→Dir wrapper over this.
+pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return indexMarksPipeline(io, allocator, sub, "MageFlowPipeline", "_mage_flow_version");
 }
 
 /// True when `sub/model_index.json` marks a Z-Image (Tongyi-MAI) pipeline
@@ -890,6 +921,8 @@ fn tryAddModel(
         if (!has_config and
             !peekMageFlowIndex(io, allocator, sub) and
             !peekZImageIndex(io, allocator, sub) and
+            !peekIdeogram4Index(io, allocator, sub) and
+            !peekMfluxFlux1(io, allocator, sub) and
             !peekMfluxFlux2(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:

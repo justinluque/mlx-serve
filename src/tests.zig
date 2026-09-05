@@ -58,6 +58,8 @@ test {
     _ = @import("flux1_clip.zig");
     _ = @import("flux1_vae.zig");
     _ = @import("flux1.zig");
+    _ = @import("ideogram4.zig");
+    _ = @import("ideogram4_prompt.zig");
     _ = @import("krea.zig");
     _ = @import("mage_flow.zig");
     _ = @import("z_image.zig");

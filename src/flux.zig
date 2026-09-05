@@ -240,7 +240,29 @@ pub const FluxConfig = struct {
     te_rope_theta: f32 = 1_000_000.0,
     te_rms_eps: f32 = 1e-6,
     te_vocab: u32 = 151936,
+    /// 1-based capture indices: `te_taps[k] == n` means "the hidden state
+    /// after decoder layer n-1". FLUX.2 taps 9/18/27; Ideogram 4 reuses this
+    /// same encoder with its own 13-tap list (see `ideogram4.zig`), which is
+    /// why the list is config and not a literal in `encode`.
+    te_taps: []const u32 = &.{ 9, 18, 27 },
+    /// Where the tap axis lands when the captures are flattened. FLUX.2 is
+    /// tap-MAJOR ([tap][hidden], which is what `applyCondRebalance` slices);
+    /// Ideogram 4 permutes (T,B,L,H)→(B,L,H,T), i.e. tap-INNER. Same shape,
+    /// different vector — a wrong answer here is a plausible wrong image.
+    te_tap_inner: bool = false,
 };
+
+/// Every tap index must name a layer the loaded encoder actually has:
+/// `te_taps[k] == n` means "after decoder layer n-1", so `n` runs 1..layers.
+/// Cross-checkpoint config (FLUX taps 3 of a klein encoder, Ideogram 13 of a
+/// Qwen3-VL-8B) makes this a real mismatch and not a theoretical one, and an
+/// unfilled capture slot is otherwise only discovered by unwrapping a null.
+pub fn tapsFitLayers(taps: []const u32, layers: u32) bool {
+    for (taps) |t| {
+        if (t == 0 or t > layers) return false;
+    }
+    return true;
+}
 
 // ── Geometry, derived from the checkpoint ──
 //
@@ -397,7 +419,10 @@ pub const TextEncoder = struct {
     }
 
     /// Encode token ids [1, seq] (int32) with attention_mask [1, seq] → capture
-    /// raw hidden states at layers 9/18/27 → prompt_embeds [1, seq, 3*hidden].
+    /// raw hidden states at every layer `cfg.te_taps` names → prompt_embeds
+    /// [1, seq, te_taps.len * hidden]. `cfg.te_tap_inner` picks where the tap
+    /// axis lands in that flattened feature dim (FLUX tap-MAJOR, Ideogram
+    /// tap-INNER) — same shape either way, different vector.
     pub fn encode(self: *TextEncoder, ids: []const i32, mask: []const i32) !mlx.mlx_array {
         const s = self.s;
         const c = self.cfg;
@@ -417,9 +442,11 @@ pub const TextEncoder = struct {
         const attn_mask = try self.buildMask(mask, seq);
         defer _ = mlx.mlx_array_free(attn_mask);
 
-        // capture indices: list[0]=embed, list[k]=after layer k-1. Want 9,18,27.
-        const want = [_]usize{ 9, 18, 27 };
-        var caps: [3]?mlx.mlx_array = .{ null, null, null };
+        // capture indices: list[0]=embed, list[k]=after layer k-1.
+        const want = c.te_taps;
+        const caps = try self.allocator.alloc(?mlx.mlx_array, want.len);
+        defer self.allocator.free(caps);
+        @memset(caps, null);
         errdefer for (caps) |cp| {
             if (cp) |a| _ = mlx.mlx_array_free(a);
         };
@@ -440,16 +467,26 @@ pub const TextEncoder = struct {
         }
         _ = mlx.mlx_array_free(x);
 
-        // stack [1,3,seq,H] → transpose [1,seq,3,H] → reshape [1,seq,3H]
-        const stacked = try concat(&[_]mlx.mlx_array{ caps[0].?, caps[1].?, caps[2].? }, 0, s); // [3, seq, H]
+        // stack [T,seq,H] → transpose [seq,T,H] → reshape [1,seq,T·H]. The
+        // feature-dim interleave is per-token-position ACROSS taps (the
+        // reference permutes (T,B,L,H)→(B,L,H,T) then flattens), so the tap
+        // axis must end up INNERMOST — a [T·H] concat would feed the DiT a
+        // different vector under the same shape.
+        const cap_arrs = try self.allocator.alloc(mlx.mlx_array, want.len);
+        defer self.allocator.free(cap_arrs);
+        for (caps, 0..) |cp, i| cap_arrs[i] = cp orelse return error.MissingWeight;
+        const stacked = try concat(cap_arrs, 0, s); // [T, seq, H]
         for (caps) |cp| _ = mlx.mlx_array_free(cp.?);
         defer _ = mlx.mlx_array_free(stacked);
-        // stacked is [3, 1, seq, H] (each cap was [1,seq,H]); concat axis0 → [3,seq,H]? caps are [1,seq,H] → concat axis0 → [3,seq,H]
-        const st4 = try reshape(stacked, &[_]c_int{ 3, seq, @intCast(H) }, s);
+        const nt: c_int = @intCast(want.len);
+        const st4 = try reshape(stacked, &[_]c_int{ nt, seq, @intCast(H) }, s);
         defer _ = mlx.mlx_array_free(st4);
-        const tr = try transpose(st4, &[_]c_int{ 1, 0, 2 }, s); // [seq, 3, H]
+        const tr = if (c.te_tap_inner)
+            try transpose(st4, &[_]c_int{ 1, 2, 0 }, s) // [seq, H, T]
+        else
+            try transpose(st4, &[_]c_int{ 1, 0, 2 }, s); // [seq, T, H]
         defer _ = mlx.mlx_array_free(tr);
-        return reshape(tr, &[_]c_int{ 1, seq, @intCast(3 * H) }, s);
+        return reshape(tr, &[_]c_int{ 1, seq, @intCast(@as(u32, @intCast(nt)) * H) }, s);
     }
 
     fn buildMask(self: *TextEncoder, mask: []const i32, seq: c_int) !mlx.mlx_array {
@@ -550,6 +587,24 @@ pub const TextEncoder = struct {
 };
 
 pub fn loadTextEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !TextEncoder {
+    return loadTextEncoderWith(io, allocator, s, model_dir, .{});
+}
+
+/// Fields another engine may pin on the shared Qwen3 encoder. Zero/null = keep
+/// the value the checkpoint's own shapes (or the FLUX default) produced.
+pub const TeOverrides = struct {
+    taps: ?[]const u32 = null,
+    tap_inner: bool = false,
+    rope_theta: f32 = 0,
+    rms_eps: f32 = 0,
+    /// Log tag, so an Ideogram load does not print `[flux]`.
+    tag: []const u8 = "flux",
+};
+
+/// The Qwen3 text encoder, loaded from `<model_dir>/text_encoder`. Shared with
+/// `ideogram4.zig`, which taps 13 layers of a Qwen3-VL-8B instead of 3 of a
+/// klein encoder — everything else about the two is the same transformer.
+pub fn loadTextEncoderWith(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8, ov: TeOverrides) !TextEncoder {
     const dir = try fmtKey(allocator, "{s}/text_encoder", .{model_dir});
     defer allocator.free(dir);
     var w = try model_mod.loadWeights(io, allocator, dir);
@@ -564,8 +619,19 @@ pub fn loadTextEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir
         .layers = countIndexed(&w, allocator, "layers.{d}.input_layernorm.weight"),
         .vocab = rowsOf(&w, "embed_tokens.weight"),
     }, .{});
-    log.info("[flux] text encoder: hidden={d} layers={d} heads={d}/{d} inter={d}\n", .{
-        te.cfg.te_hidden, te.cfg.te_layers, te.cfg.te_heads, te.cfg.te_kv, te.cfg.te_inter,
+    if (ov.taps) |t| te.cfg.te_taps = t;
+    te.cfg.te_tap_inner = ov.tap_inner;
+    if (ov.rope_theta != 0) te.cfg.te_rope_theta = ov.rope_theta;
+    if (ov.rms_eps != 0) te.cfg.te_rms_eps = ov.rms_eps;
+    // A tap past the last layer never fills its capture slot. Refuse at LOAD,
+    // by name, rather than letting `encode` discover it on the first request
+    // (#217: a missing weight is a load error, never `unreachable`).
+    if (!tapsFitLayers(te.cfg.te_taps, te.cfg.te_layers)) {
+        log.err("[{s}] text encoder has {d} layers but the tap list reaches past it — wrong text_encoder for this pack?\n", .{ ov.tag, te.cfg.te_layers });
+        return error.MissingWeight;
+    }
+    log.info("[{s}] text encoder: hidden={d} layers={d} heads={d}/{d} inter={d} taps={d}\n", .{
+        ov.tag, te.cfg.te_hidden, te.cfg.te_layers, te.cfg.te_heads, te.cfg.te_kv, te.cfg.te_inter, te.cfg.te_taps.len,
     });
     te.allocator = allocator;
     te.s = s;
@@ -1301,7 +1367,16 @@ pub const Vae = struct {
         const denorm = try addA(scaled, bnmf, s); defer _ = mlx.mlx_array_free(denorm);
         // unpatchify [1,128,64,64] -> [1,32,128,128]
         const up = try unpatchify(denorm, s); defer _ = mlx.mlx_array_free(up);
-        const up_bf = try astype(up, .bfloat16, s); defer _ = mlx.mlx_array_free(up_bf);
+        return self.decodeLatent(up);
+    }
+
+    /// The decoder proper: unpacked latents [1,32,H,W] → image [1,3,8H,8W]
+    /// (NCHW, [-1,1]). Split out of `decode` because Ideogram 4 ships the same
+    /// Flux2 KL autoencoder but normalizes its latents with its own published
+    /// per-channel table instead of the checkpoint's `bn` running stats.
+    pub fn decodeLatent(self: *Vae, latent_nchw: mlx.mlx_array) !mlx.mlx_array {
+        const s = self.s;
+        const up_bf = try astype(latent_nchw, .bfloat16, s); defer _ = mlx.mlx_array_free(up_bf);
         // post_quant_conv (1x1) in NHWC
         const nhwc = try transpose(up_bf, &[_]c_int{ 0, 2, 3, 1 }, s); defer _ = mlx.mlx_array_free(nhwc);
         var h = try conv2d(nhwc, self.pq_w, self.pq_b, 0, s);
@@ -1498,6 +1573,43 @@ pub const VaeEncoder = struct {
     /// f32, bn-NORMALIZED (the distribution mean; deterministic — no sampling).
     pub fn encode(self: *VaeEncoder, img: mlx.mlx_array) !mlx.mlx_array {
         const s = self.s;
+        const nf = try self.encodeLatent(img);
+        defer _ = mlx.mlx_array_free(nf);
+        const packed_lat = try patchify(nf, s); // [1,128,64,64]
+        defer _ = mlx.mlx_array_free(packed_lat);
+        // bn normalize: (x - mean) / sqrt(var + eps)  (inverse of decode's denorm)
+        const vsh = [_]c_int{ 1, 128, 1, 1 };
+        const bnm = try reshape(self.bn_mean, &vsh, s);
+        defer _ = mlx.mlx_array_free(bnm);
+        const bnv = try reshape(self.bn_var, &vsh, s);
+        defer _ = mlx.mlx_array_free(bnv);
+        const eps = mlx.mlx_array_new_float(1e-4);
+        defer _ = mlx.mlx_array_free(eps);
+        var vpe = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(vpe);
+        try mlx.check(mlx.mlx_add(&vpe, bnv, eps, s));
+        var std_ = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(std_);
+        try mlx.check(mlx.mlx_sqrt(&std_, vpe, s));
+        const stdf = try astype(std_, .float32, s);
+        defer _ = mlx.mlx_array_free(stdf);
+        const bnmf = try astype(bnm, .float32, s);
+        defer _ = mlx.mlx_array_free(bnmf);
+        const centered = try subA(packed_lat, bnmf, s);
+        defer _ = mlx.mlx_array_free(centered);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_divide(&out, centered, stdf, s));
+        return out;
+    }
+
+    /// The encoder proper: image [1,3,H,W] f32 [0,1] (NCHW) → the latent
+    /// distribution's MEAN [1,32,H/8,W/8] f32 (NCHW), before any patchify or
+    /// normalization. Split out of `encode` because Ideogram 4 ships the same
+    /// Flux2 autoencoder but packs its patches in the opposite order and
+    /// normalizes with its own published table.
+    pub fn encodeLatent(self: *VaeEncoder, img: mlx.mlx_array) !mlx.mlx_array {
+        const s = self.s;
         // [0,1] → [-1,1], NCHW → NHWC bf16
         const two = mlx.mlx_array_new_float(2.0);
         defer _ = mlx.mlx_array_free(two);
@@ -1562,34 +1674,11 @@ pub const VaeEncoder = struct {
         try mlx.check(mlx.mlx_contiguous(&meanc, mean, false, s));
         const nchw = try transpose(meanc, &[_]c_int{ 0, 3, 1, 2 }, s);
         defer _ = mlx.mlx_array_free(nchw);
-        const nf = try astype(nchw, .float32, s);
-        defer _ = mlx.mlx_array_free(nf);
-        const packed_lat = try patchify(nf, s); // [1,128,64,64]
-        defer _ = mlx.mlx_array_free(packed_lat);
-        // bn normalize: (x - mean) / sqrt(var + eps)  (inverse of decode's denorm)
-        const vsh = [_]c_int{ 1, 128, 1, 1 };
-        const bnm = try reshape(self.bn_mean, &vsh, s);
-        defer _ = mlx.mlx_array_free(bnm);
-        const bnv = try reshape(self.bn_var, &vsh, s);
-        defer _ = mlx.mlx_array_free(bnv);
-        const eps = mlx.mlx_array_new_float(1e-4);
-        defer _ = mlx.mlx_array_free(eps);
-        var vpe = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(vpe);
-        try mlx.check(mlx.mlx_add(&vpe, bnv, eps, s));
-        var std_ = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(std_);
-        try mlx.check(mlx.mlx_sqrt(&std_, vpe, s));
-        const stdf = try astype(std_, .float32, s);
-        defer _ = mlx.mlx_array_free(stdf);
-        const bnmf = try astype(bnm, .float32, s);
-        defer _ = mlx.mlx_array_free(bnmf);
-        const centered = try subA(packed_lat, bnmf, s);
-        defer _ = mlx.mlx_array_free(centered);
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_divide(&out, centered, stdf, s));
-        return out;
+        // Owned by the caller: the two consumers pack it differently.
+        var nf = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(nf);
+        try mlx.check(mlx.mlx_astype(&nf, nchw, .float32, s));
+        return nf;
     }
 };
 
@@ -1949,6 +2038,24 @@ test "flux reference-image conditioning engages and changes the output" {
     diff /= @floatFromInt(n);
     std.debug.print("[flux-edit] mean|base-edited|={d:.4}\n", .{diff});
     try testing.expect(diff > 0.01);
+}
+
+test "a tap list is refused when it reaches past the encoder's layers" {
+    // The taps are CONFIG now and cross-checkpoint: FLUX pins 3 of a klein
+    // encoder, Ideogram 13 of a Qwen3-VL-8B. A pack whose text_encoder is
+    // shorter than the list leaves a capture slot unfilled, which used to be
+    // discovered by unwrapping a null — a panic, not a load error (#217).
+    try std.testing.expect(tapsFitLayers(&[_]u32{ 9, 18, 27 }, 32));
+    try std.testing.expect(tapsFitLayers(&[_]u32{ 9, 18, 27 }, 27)); // last layer is in range
+    try std.testing.expect(!tapsFitLayers(&[_]u32{ 9, 18, 27 }, 26));
+    // Ideogram's own list against the encoder it ships with, and against one
+    // that is a single layer short.
+    try std.testing.expect(tapsFitLayers(&[_]u32{ 1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 36 }, 36));
+    try std.testing.expect(!tapsFitLayers(&[_]u32{ 1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 36 }, 35));
+    // Index 0 is the embedding, not a layer output — the capture loop only
+    // ever writes indices 1..layers, so a 0 would never be filled either.
+    try std.testing.expect(!tapsFitLayers(&[_]u32{0}, 32));
+    try std.testing.expect(tapsFitLayers(&.{}, 0));
 }
 
 test "flux applyCondRebalance scales tap thirds and global gain" {

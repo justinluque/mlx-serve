@@ -21,6 +21,7 @@ const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const z_image_mod = @import("z_image.zig");
 const anima_mod = @import("anima.zig");
+const ideogram4 = @import("ideogram4.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -95,7 +96,7 @@ pub const Modality = enum {
 /// waiting. The test at the bottom of this file pins them together.
 pub const media_model_types = [_][]const u8{
     "flux2",     "flux1",      "krea",           "mage_flow",      "mageflow",
-    "zimage",    "qwen3_tts",  "acestep",        "kokoro",
+    "zimage",    "qwen3_tts",  "acestep",        "kokoro",          "ideogram4",
     "AudioVideo", "hunyuan3d", "minimax_h3",     "minimax_music3", "anima",
 };
 
@@ -106,6 +107,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.startsWith(u8, model_type, "zimage")) return .image;
     if (std.mem.eql(u8, model_type, "anima")) return .image;
+    if (std.mem.startsWith(u8, model_type, "ideogram4")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -177,6 +179,10 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // Same for a Z-Image (Tongyi-MAI) diffusers repo: no root config.json,
     // only model_index.json (`_class_name == "ZImagePipeline"`).
     if (isZImageRepo(io, allocator, model_dir)) return allocator.dupe(u8, "zimage") catch null;
+    // Ideogram 4 publishes in the same shape: a diffusers `model_index.json`
+    // naming `Ideogram4Pipeline` and no root `model_type`. Our own converted
+    // packs DO write one, so this arm only serves an unconverted upstream repo.
+    if (isIdeogram4Repo(io, allocator, model_dir)) return allocator.dupe(u8, "ideogram4") catch null;
     // Same for an mflux FLUX.2 conversion with no config.json at all (the only
     // MLX build of klein 9B). Identified by the DiT's own weight names, through
     // the SAME predicate discovery uses — a private copy here is how `list` and
@@ -189,10 +195,19 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     return null;
 }
 
+/// Open an absolute model dir for one of discovery's Dir-based predicates.
+/// `openDirAbsolute` on an empty or relative path is ReleaseFast UB that
+/// miscompiles the CALLER, so the guard lives here once instead of at each
+/// predicate.
+fn openModelDir(io: std.Io, model_dir: []const u8) ?std.Io.Dir {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
+    return std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch null;
+}
+
 /// True when `model_dir` holds FLUX.1 MMDiT weights but no config.json to say
 /// so. Thin path→Dir wrapper over `model_discovery.peekMfluxFlux1`.
 fn isFlux1Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    var dir = openModelDir(io, model_dir) orelse return false;
     defer dir.close(io);
     return discovery.peekMfluxFlux1(io, allocator, dir);
 }
@@ -200,7 +215,7 @@ fn isFlux1Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
 /// Thin path→Dir wrapper over `model_discovery.peekMfluxFlux2`.
 fn isMfluxFlux2Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    var dir = openModelDir(io, model_dir) orelse return false;
     defer dir.close(io);
     return discovery.peekMfluxFlux2(io, allocator, dir);
 }
@@ -224,23 +239,21 @@ fn readConfigModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []co
     return allocator.dupe(u8, mt.string) catch null;
 }
 
-/// True when `model_dir/model_index.json` marks a MageFlow pipeline (its
-/// `_class_name` is "MageFlowPipeline", or the `_mage_flow_version` tag exists).
+/// True when `model_dir/model_index.json` marks a MageFlow pipeline.
+/// Thin path→Dir wrapper over `model_discovery.peekMageFlowIndex` — the ONE
+/// reader, so `list` and the loader can never disagree about the shape.
 fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
-    defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    defer file.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
-    defer allocator.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    if (parsed.value.object.get("_mage_flow_version") != null) return true;
-    const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+    var dir = openModelDir(io, model_dir) orelse return false;
+    defer dir.close(io);
+    return discovery.peekMageFlowIndex(io, allocator, dir);
+}
+
+/// True when `model_dir/model_index.json` marks an Ideogram 4 pipeline.
+/// Thin path→Dir wrapper over `model_discovery.peekIdeogram4Index`.
+fn isIdeogram4Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = openModelDir(io, model_dir) orelse return false;
+    defer dir.close(io);
+    return discovery.peekIdeogram4Index(io, allocator, dir);
 }
 
 /// True when `model_dir/model_index.json` marks a Z-Image (Tongyi-MAI)
@@ -324,6 +337,173 @@ const FLUX_SEQ_LEN: usize = 512; // mflux Qwen3 tokenizer max_length
 
 /// FLUX.2 image backend internals (the original `ImageEngine` body verbatim).
 /// Holds the three sub-models + tokenizer; owned by the `ImageBackend` union.
+/// Ideogram 4: two 9.3B transformers (asymmetric CFG), a 13-tap Qwen3-VL-8B
+/// encoder, and the Flux2 KL autoencoder. Residency is the defining constraint
+/// — the unconditional branch is its OWN checkpoint, not the conditional
+/// weights run with an empty prompt — so the text encoder follows FluxImpl's
+/// low-mem policy: it runs exactly one forward per image and is the only part
+/// that can be reloaded cheaply from page cache.
+const Ideogram4Impl = struct {
+    s: mlx.mlx_stream,
+    te: ?flux.TextEncoder,
+    cond: ideogram4.Transformer,
+    uncond: ideogram4.Transformer,
+    vae: flux.Vae,
+    /// The Flux2 autoencoder ships BOTH halves and Ideogram publishes both, so
+    /// img2img is available — but a pack converted without the encoder half
+    /// still loads and still generates, hence the optional.
+    vae_enc: ?flux.VaeEncoder,
+    tok: tok_mod.Tokenizer,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []u8,
+    low_mem: bool,
+    /// Chat-template framing around the prompt, written into the pack's
+    /// config.json by the converter from the checkpoint's OWN
+    /// `tokenizer/chat_template.jinja`. Owned. Empty = use the defaults below,
+    /// which are Qwen3-VL-Instruct's rendering of a single text turn.
+    chat_prefix: []u8,
+    chat_suffix: []u8,
+
+    const default_chat_prefix = "<|im_start|>user\n";
+    const default_chat_suffix = "<|im_end|>\n<|im_start|>assistant\n";
+
+    fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Ideogram4Impl {
+        const self = try allocator.create(Ideogram4Impl);
+        errdefer allocator.destroy(self);
+        self.io = io;
+        self.allocator = allocator;
+        self.low_mem = FluxImpl.lowMemDefault();
+        self.model_dir = try allocator.dupe(u8, model_dir);
+        errdefer allocator.free(self.model_dir);
+        self.s = mlx.mlx_default_gpu_stream_new();
+
+        self.chat_prefix = &.{};
+        self.chat_suffix = &.{};
+        errdefer allocator.free(self.chat_prefix);
+        errdefer allocator.free(self.chat_suffix);
+        readChatFraming(io, allocator, model_dir, &self.chat_prefix, &self.chat_suffix);
+
+        if (self.low_mem) {
+            self.te = null;
+            log.info("[image] Ideogram 4 low-mem mode: text encoder loads per request\n", .{});
+        } else {
+            self.te = try loadTe(io, allocator, self.s, model_dir);
+        }
+        errdefer if (self.te) |*t| t.deinit();
+        self.cond = try ideogram4.loadTransformer(io, allocator, self.s, model_dir, "transformer");
+        errdefer self.cond.deinit();
+        self.uncond = try ideogram4.loadTransformer(io, allocator, self.s, model_dir, "unconditional_transformer");
+        errdefer self.uncond.deinit();
+        self.vae = try flux.loadVae(io, allocator, self.s, model_dir);
+        errdefer self.vae.deinit();
+        self.vae_enc = flux.loadVaeEncoder(io, allocator, self.s, model_dir) catch |e| blk: {
+            log.warn("[image] Ideogram 4 VAE encoder load failed ({}) — image-to-image disabled\n", .{e});
+            break :blk null;
+        };
+        errdefer if (self.vae_enc) |*e| e.deinit();
+        const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{model_dir});
+        defer allocator.free(tok_dir);
+        self.tok = try tok_mod.loadTokenizerAny(io, allocator, tok_dir);
+        log.info("[image] Ideogram 4 ready (cond + uncond transformers, Flux2 VAE)\n", .{});
+        return self;
+    }
+
+    fn loadTe(io: std.Io, allocator: std.mem.Allocator, s: mlx.mlx_stream, model_dir: []const u8) !flux.TextEncoder {
+        return flux.loadTextEncoderWith(io, allocator, s, model_dir, .{
+            .taps = &ideogram4.qwen3_vl_taps,
+            .tap_inner = true,
+            .rope_theta = 5_000_000.0,
+            .tag = "ideogram4",
+        });
+    }
+
+    /// Pull `chat_prefix`/`chat_suffix` out of the pack's config.json. Absent
+    /// is normal (an unconverted upstream repo); the defaults then apply.
+    fn readChatFraming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, prefix: *[]u8, suffix: *[]u8) void {
+        const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return;
+        defer allocator.free(path);
+        const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return;
+        defer file.close(io);
+        var rb: [4096]u8 = undefined;
+        var rs = file.reader(io, &rb);
+        const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return;
+        defer allocator.free(content);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        if (parsed.value.object.get("chat_prefix")) |v| {
+            if (v == .string) prefix.* = allocator.dupe(u8, v.string) catch return;
+        }
+        if (parsed.value.object.get("chat_suffix")) |v| {
+            if (v == .string) suffix.* = allocator.dupe(u8, v.string) catch return;
+        }
+    }
+
+    fn deinit(self: *Ideogram4Impl) void {
+        if (self.te) |*t| t.deinit();
+        self.cond.deinit();
+        self.uncond.deinit();
+        self.vae.deinit();
+        if (self.vae_enc) |*e| e.deinit();
+        self.tok.deinit();
+        self.allocator.free(self.model_dir);
+        self.allocator.free(self.chat_prefix);
+        self.allocator.free(self.chat_suffix);
+        self.allocator.destroy(self);
+    }
+
+    /// Tokenize the caption and run the pipeline → image [1,3,H,W] f32 [0,1].
+    ///
+    /// No padding and no left-align: the reference pads only to batch a
+    /// multi-prompt call, and we serve one prompt, so every token is real and
+    /// the attention mask is all ones. That is also what lets the DiT skip the
+    /// block-diagonal segment mask entirely.
+    fn generateImage(self: *Ideogram4Impl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, gen_opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
+        const prefix = if (self.chat_prefix.len != 0) self.chat_prefix else default_chat_prefix;
+        const suffix = if (self.chat_suffix.len != 0) self.chat_suffix else default_chat_suffix;
+        const templated = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, prompt, suffix });
+        defer allocator.free(templated);
+
+        const enc = try self.tok.encode(allocator, templated);
+        defer allocator.free(enc);
+        if (enc.len > ideogram4.max_text_tokens) return error.PromptTooLong;
+
+        const ids = try allocator.alloc(i32, enc.len);
+        defer allocator.free(ids);
+        const mask = try allocator.alloc(i32, enc.len);
+        defer allocator.free(mask);
+        for (enc, 0..) |t, i| {
+            ids[i] = @intCast(t);
+            mask[i] = 1;
+        }
+
+        var opts = ideogram4.GenOpts{ .steps = steps };
+        // img2img: VAE-encode the (already target-sized) source to its latent
+        // MEAN. `ideogram4.generateFromCond` owns the patchify and the
+        // normalization — both differ from FLUX's on the same autoencoder.
+        var init_latent: ?mlx.mlx_array = null;
+        defer if (init_latent) |l| {
+            _ = mlx.mlx_array_free(l);
+        };
+        if (gen_opts.init_image) |src| {
+            const enc_ptr = if (self.vae_enc) |*e| e else return error.Img2ImgUnsupported;
+            if (progress) |p| p.emit("Encoding source image", 0, @max(steps, 1));
+            init_latent = try enc_ptr.encodeLatent(src);
+            opts.init_latent = init_latent;
+            opts.strength = gen_opts.strength;
+        }
+        if (progress) |p| p.emit("Encoding prompt", 0, @max(steps, 1));
+        const cond_enc = blk: {
+            if (self.te) |*t| break :blk try ideogram4.encodePrompt(t, ids, mask);
+            var t = try loadTe(self.io, self.allocator, self.s, self.model_dir);
+            defer t.deinit();
+            break :blk try ideogram4.encodePrompt(&t, ids, mask);
+        };
+        return ideogram4.generateFromCond(&self.cond, &self.uncond, &self.vae, cond_enc, ids.len, seed, height, width, opts, progress);
+    }
+};
+
 const FluxImpl = struct {
     s: mlx.mlx_stream,
     /// Text encoder — nullable because LOW-MEM mode (iPhone) loads it lazily
@@ -507,6 +687,7 @@ const ImageBackend = union(enum) {
     mage_flow: *mage_flow_mod.Engine,
     zimage: *z_image_mod.Engine,
     anima: *anima_mod.Engine,
+    ideogram4: *Ideogram4Impl,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -531,6 +712,88 @@ pub fn videoRgbTransportReason(delivered_frames: u32, width: u32, height: u32) ?
     return std.fmt.bufPrint(&S.buf, "{d} frames at {d}x{d} is {d} MB of raw RGB; one response carries at most {d} MB — fewer frames or windows, or a smaller canvas", .{ delivered_frames, width, height, bytes / (1024 * 1024), MAX_VIDEO_RGB_BYTES / (1024 * 1024) }) catch "video too large for one response";
 }
 
+/// The prompt and requested canvas of an image body, BORROWED from `body`.
+/// The magic-prompt rewriter needs both before the job is built: the caption's
+/// `aspect_ratio` field is the first thing the system prompt asks for, and it
+/// drives every bbox in the caption that follows.
+pub const GenBodyPrompt = struct { prompt: []const u8, width: u32, height: u32 };
+
+pub fn promptAndSizeFromGenBody(body: []const u8) GenBodyPrompt {
+    var out = GenBodyPrompt{ .prompt = "", .width = 1024, .height = 1024 };
+    if (extractJsonString(body, "prompt")) |p| out.prompt = p;
+    if (extractJsonString(body, "size")) |size| {
+        if (parseSize(size)) |wh| {
+            out.width = wh.w;
+            out.height = wh.h;
+        }
+    }
+    return out;
+}
+
+/// How a request wants its prompt handled before it reaches the model.
+///
+/// `auto` is the default and means "rewrite when the backend needs a
+/// structured caption and this prompt is not one already" — which is exactly
+/// Ideogram 4 and nothing else today. Explicit `true`/`false` override it.
+pub const MagicPromptMode = enum { auto, on, off };
+
+pub const MagicPromptFields = struct {
+    mode: MagicPromptMode = .auto,
+    /// Model id to rewrite WITH. Empty = the server's default text model.
+    /// Borrows from the request body.
+    model: []const u8 = "",
+};
+
+/// Read `magic_prompt` / `magic_prompt_model` off a generation body. A body
+/// that does not parse, or carries neither field, is `auto` with no model —
+/// the caller has already validated the body it will actually run.
+pub fn parseMagicPromptFields(allocator: std.mem.Allocator, body: []const u8, out_model: *[]u8) MagicPromptFields {
+    out_model.* = &.{};
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    var f = MagicPromptFields{};
+    if (parsed.value.object.get("magic_prompt")) |v| switch (v) {
+        .bool => |b| f.mode = if (b) .on else .off,
+        // The string spellings exist because form-encoded clients (and the
+        // OpenAI edits surface) cannot send a JSON bool.
+        .string => |s| {
+            if (std.mem.eql(u8, s, "auto")) f.mode = .auto;
+            if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "on")) f.mode = .on;
+            if (std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "off")) f.mode = .off;
+        },
+        else => {},
+    };
+    if (parsed.value.object.get("magic_prompt_model")) |v| {
+        if (v == .string) {
+            out_model.* = allocator.dupe(u8, v.string) catch &.{};
+            f.model = out_model.*;
+        }
+    }
+    return f;
+}
+
+/// Replace a body's `prompt` with `caption`, preserving every other field.
+/// Returns a fresh body (caller frees), or an error when the body is not a
+/// JSON object — which the caller treats as "do not rewrite" rather than as a
+/// request failure.
+pub fn withRewrittenPrompt(allocator: std.mem.Allocator, body: []const u8, caption: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.NotAnObject;
+    // The map is the PARSE ARENA's, so it grows with the ARENA's allocator.
+    // Putting with the caller's allocator instead frees arena-owned storage
+    // through the wrong allocator the moment the map has to grow — three
+    // top-level keys was enough to abort under a checking allocator, and every
+    // real image body carries more than that.
+    const arena = parsed.arena.allocator();
+    var obj = parsed.value.object;
+    try obj.put(arena, "prompt", .{ .string = caption });
+    // Echoed back so a client can see what was actually rendered — the whole
+    // point of a rewriter is that the caption is not what the user typed.
+    try obj.put(arena, "revised_prompt", .{ .string = caption });
+    return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = obj }, .{});
+}
 
 /// Per-request image-generation options shared by both backends.
 pub const ImageGenOpts = struct {
@@ -609,6 +872,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .anima = try anima_mod.Engine.load(io, allocator, model_dir) };
                 return self;
             }
+            if (std.mem.startsWith(u8, mt, "ideogram4")) {
+                self.backend = .{ .ideogram4 = try Ideogram4Impl.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -623,6 +890,7 @@ pub const ImageEngine = struct {
             .mage_flow => |m| m.deinit(),
             .zimage => |m| m.deinit(),
             .anima => |m| m.deinit(),
+            .ideogram4 => |i| i.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -635,6 +903,7 @@ pub const ImageEngine = struct {
             .mage_flow => |m| m.s,
             .zimage => |m| m.s,
             .anima => |m| m.s,
+            .ideogram4 => |i| i.s,
         };
     }
 
@@ -647,6 +916,9 @@ pub const ImageEngine = struct {
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
             .zimage => 0, // conditioning-rebalance not wired for Z-Image yet
             .anima => 0, // conditioning-rebalance not wired for Anima yet
+            // 13 taps, but the rebalance slicing assumes tap-MAJOR features and
+            // Ideogram's are tap-INNER — wiring it needs its own reshape.
+            .ideogram4 => 0,
         };
     }
 
@@ -659,6 +931,10 @@ pub const ImageEngine = struct {
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
             .zimage => false, // no VAE encoder — text-to-image only
             .anima => |m| m.vae.hasEncoder(),
+            // The Flux2 autoencoder ships both halves and Ideogram publishes
+            // both, so this is a real capability — not the decoder-only pack
+            // it was first assumed to be.
+            .ideogram4 => |i| i.vae_enc != null,
         };
     }
 
@@ -672,7 +948,16 @@ pub const ImageEngine = struct {
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
             .zimage => false, // txt2img only
             .anima => false, // Anima has no edit training
+            .ideogram4 => false, // text-to-image only; no edit training
         };
+    }
+
+    /// True when the backend was trained on STRUCTURED JSON captions and a
+    /// plain sentence is out of distribution for it, not merely weaker. Only
+    /// Ideogram 4 — the magic-prompt rewriter keys on this, never on a
+    /// model-id string.
+    pub fn wantsStructuredCaption(self: *const ImageEngine) bool {
+        return self.backend == .ideogram4;
     }
 
     /// True when the edit backend consumes RAW reference bytes (`edit_image_bytes`)
@@ -721,6 +1006,7 @@ pub const ImageEngine = struct {
                 .mage_flow => .generic,
                 .zimage => .generic,
                 .anima => .generic,
+                .ideogram4 => .ideogram4,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -732,6 +1018,10 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .flux1 => |*f| flux1_mod.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
+            // The adapter attaches to the CONDITIONAL transformer only: the
+            // unconditional branch never sees the prompt, and every published
+            // fine-tune trains against the conditional weights.
+            .ideogram4 => |i| ideogram4.attachLora(&i.cond, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
             .zimage => 0, // Z-Image does not support LoRA yet
             .anima => |m| anima_mod.attachLora(&m.dit, &stack),
@@ -750,6 +1040,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.detachLora(&f.dit),
             .flux1 => |*f| flux1_mod.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
+            .ideogram4 => |i| ideogram4.detachLora(&i.cond),
             .mage_flow => {}, // no LoRA attached
             .zimage => {}, // no LoRA attached
             .anima => |m| anima_mod.detachLora(&m.dit),
@@ -810,6 +1101,12 @@ pub const ImageEngine = struct {
                 };
                 break :blk m.generateImageOpts(allocator, prompt, width, height, seed, steps, opts.guidance_scale orelse 0.0, aopts, progress);
             },
+            .ideogram4 => |i| blk: {
+                // No edit training: in-context reference conditioning is a
+                // capability, not a code path we simply have not written.
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                break :blk i.generateImage(allocator, prompt, width, height, seed, steps, opts, progress);
+            },
         };
     }
 
@@ -833,6 +1130,8 @@ pub const ImageEngine = struct {
             // Z-Image: multiples of 32 in [256, 2048] (see z_image.normalizeDim).
             .zimage => .{ .w = clampZImageDim(req_w), .h = clampZImageDim(req_h) },
             .anima => .{ .w = clampAnimaDim(req_w), .h = clampAnimaDim(req_h) },
+            // Ideogram: 256–2048 per side, multiples of patch·ae_scale = 16.
+            .ideogram4 => .{ .w = ideogram4.clampDim(req_w), .h = ideogram4.clampDim(req_h) },
         };
     }
 
@@ -844,7 +1143,7 @@ pub const ImageEngine = struct {
         return switch (kind) {
             .flux => 1536,
             .flux1 => 1536,
-            .krea, .mage_flow, .zimage => 2048,
+            .krea, .mage_flow, .zimage, .ideogram4 => 2048,
             .anima => 1920,
         };
     }
@@ -868,6 +1167,7 @@ pub const ImageEngine = struct {
             .flux1 => |f| if (f.is_schnell) @as(u32, 4) else @as(u32, 20),
             .zimage => |m| m.cfg.default_steps,
             .anima => |m| m.recommended.steps,
+            .ideogram4 => 20,
         };
     }
 };
@@ -4251,6 +4551,35 @@ fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// img2img source, decoded once. Used by the magic-prompt rewriter, which
+/// needs the source image BEFORE a `GenJob` exists — `genJobRun` (above)
+/// re-reads `image`/`mode` off the same body on its own when it actually
+/// builds `ImageGenOpts`. Duplicated WORK (one extra base64 decode per
+/// request, cheap relative to vision-encoding or diffusion), not duplicated
+/// logic: both call through `extractJsonString`/`base64DecodeAlloc`, so a
+/// future change to either only has one implementation to track.
+pub const GenBodyImage = struct {
+    /// Raw (still-encoded PNG/JPEG) bytes, plain base64 — the same convention
+    /// `genJobRun` uses for `image`, NOT a `data:...;base64,` URL. Owned;
+    /// caller frees.
+    bytes: []u8,
+    /// false only when `mode` is explicitly `"edit"`.
+    is_variation: bool,
+};
+
+/// Read + base64-decode the `image` field off a generation request body, if
+/// present. Returns null when there's no `image` field or it fails to
+/// base64-decode — callers treat either the same as "no source image".
+pub fn decodeGenBodyImage(allocator: std.mem.Allocator, body: []const u8) ?GenBodyImage {
+    const raw = extractJsonString(body, "image") orelse return null;
+    var is_variation = true;
+    if (extractJsonString(body, "mode")) |m| {
+        if (std.mem.eql(u8, m, "edit")) is_variation = false;
+    }
+    const bytes = base64DecodeAlloc(allocator, raw) catch return null;
+    return .{ .bytes = bytes, .is_variation = is_variation };
+}
+
 /// Parse a "WxH" size string (e.g. "1024x1024", "512x768") → {w,h}, or null.
 fn parseSize(size: []const u8) ?struct { w: u32, h: u32 } {
     const xi = std.mem.indexOfScalar(u8, size, 'x') orelse std.mem.indexOfScalar(u8, size, 'X') orelse return null;
@@ -5505,6 +5834,46 @@ test "paint stage dir resolves from the combined single-repo layout (subdir firs
     try testing.expect(findPaintDir(allocator, bare) == null);
 }
 
+test "no parsed JSON object is mutated with a non-arena allocator" {
+    // CLASS GUARD. `std.json` allocates a parsed `ObjectMap` from the parse's
+    // OWN arena, so growing that map with the caller's general-purpose
+    // allocator frees arena-owned storage through the wrong allocator. Under a
+    // checking allocator that is `free after resize`; in production it is heap
+    // corruption. `withRewrittenPrompt` shipped this way and needed only three
+    // top-level keys to trip it — every real image body carries more.
+    //
+    // `chat.fillOptionalToolDefKeys` already documents the hazard, and
+    // `chat.zig`/`lan.zig` already pass an arena at every mutation site, so
+    // the rule is house style; this pins it. The scan is textual on purpose:
+    // the bug is invisible at the type level, since both allocators are
+    // `std.mem.Allocator`.
+    inline for (.{ "gen.zig", "chat.zig", "lan.zig", "server.zig" }) |file| {
+        const src = @embedFile(file);
+        var it = std.mem.splitScalar(u8, src, '\n');
+        var line_no: usize = 0;
+        while (it.next()) |line| {
+            line_no += 1;
+            const code = std.mem.trimStart(u8, line, " \t");
+            if (std.mem.startsWith(u8, code, "//")) continue; // prose, incl. this test's own
+            const put = std.mem.indexOf(u8, line, ".put(") orelse continue;
+            // Only calls on a JSON value's map: `obj.put(`, `x.object.put(`.
+            const recv = std.mem.trimStart(u8, line[0..put], " \t}{|)(=,");
+            const is_json_map = std.mem.endsWith(u8, recv, ".object") or
+                std.mem.endsWith(u8, recv, "obj") or
+                std.mem.endsWith(u8, recv, "params");
+            if (!is_json_map) continue;
+            const arg = line[put + ".put(".len ..];
+            const ok = std.mem.startsWith(u8, arg, "arena") or
+                std.mem.startsWith(u8, arg, "a,") or // a local arena allocator
+                std.mem.indexOf(u8, arg, "arena.allocator()") != null;
+            if (!ok) {
+                std.debug.print("{s}:{d}: parsed-map .put() with a non-arena allocator: {s}\n", .{ file, line_no, std.mem.trim(u8, line, " \t") });
+                return error.NonArenaJsonMapMutation;
+            }
+        }
+    }
+}
+
 test "media model types: discovery and modality dispatch agree" {
     // CLASS GUARD. `model_discovery.isMediaModelType` and `modalityFromType`
     // are documented duplication (discovery must not import mlx), and they
@@ -5743,4 +6112,113 @@ test "videoRgbTransportReason: chained windows are billed into the response cap 
     try std.testing.expect(videoRgbTransportReason(minimax_h3.chainDeliveredFrames(5, 141), 1056, 864) != null);
     // One window of the same shape fits.
     try std.testing.expect(videoRgbTransportReason(141, 1056, 864) == null);
+}
+
+test "magic_prompt parses as bool, as the string spellings, and defaults to auto" {
+    const a = std.testing.allocator;
+    const Case = struct { body: []const u8, want: MagicPromptMode };
+    for ([_]Case{
+        .{ .body = "{\"prompt\":\"x\"}", .want = .auto },
+        .{ .body = "{\"magic_prompt\":true}", .want = .on },
+        .{ .body = "{\"magic_prompt\":false}", .want = .off },
+        .{ .body = "{\"magic_prompt\":\"auto\"}", .want = .auto },
+        // Form-encoded clients cannot send a JSON bool.
+        .{ .body = "{\"magic_prompt\":\"true\"}", .want = .on },
+        .{ .body = "{\"magic_prompt\":\"off\"}", .want = .off },
+        // Garbage is `auto`, not a request failure: the body the job will
+        // actually run has already been validated elsewhere.
+        .{ .body = "not json", .want = .auto },
+        .{ .body = "{\"magic_prompt\":42}", .want = .auto },
+    }) |c| {
+        var owned: []u8 = &.{};
+        const f = parseMagicPromptFields(a, c.body, &owned);
+        defer if (owned.len != 0) a.free(owned);
+        try std.testing.expectEqual(c.want, f.mode);
+    }
+}
+
+test "magic_prompt_model comes back OWNED, so it outlives the parse" {
+    const a = std.testing.allocator;
+    var owned: []u8 = &.{};
+    const f = parseMagicPromptFields(a, "{\"magic_prompt_model\":\"org/repo\"}", &owned);
+    defer if (owned.len != 0) a.free(owned);
+    try std.testing.expectEqualStrings("org/repo", f.model);
+    try std.testing.expectEqualStrings("org/repo", owned);
+}
+
+test "a rewritten body keeps every other field and echoes the caption back" {
+    const a = std.testing.allocator;
+    const body = "{\"model\":\"ideogram4\",\"prompt\":\"a red barn\",\"size\":\"1024x768\",\"seed\":7}";
+    const caption = "{\"high_level_description\":\"A red barn.\"}";
+    const out = try withRewrittenPrompt(a, body, caption);
+    defer a.free(out);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings(caption, o.get("prompt").?.string);
+    // The caller can see what was actually rendered — the point of a rewriter
+    // is that the caption is not what the user typed.
+    try std.testing.expectEqualStrings(caption, o.get("revised_prompt").?.string);
+    try std.testing.expectEqualStrings("ideogram4", o.get("model").?.string);
+    try std.testing.expectEqualStrings("1024x768", o.get("size").?.string);
+    try std.testing.expectEqual(@as(i64, 7), o.get("seed").?.integer);
+}
+
+test "a rewritten body survives a hash-map grow at any key count" {
+    // `withRewrittenPrompt` mutates the map `std.json` allocated from its OWN
+    // parse arena. Growing that map with the CALLER's allocator frees
+    // arena-owned storage through the wrong allocator — heap corruption, and
+    // invisible until the body carries enough keys to force a grow (three was
+    // enough). Every field a real image body carries is another chance, so the
+    // bar is a SWEEP, not one hand-picked body.
+    const a = std.testing.allocator;
+    var n: usize = 0;
+    while (n <= 48) : (n += 1) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        try buf.appendSlice(a, "{\"prompt\":\"a red barn\"");
+        var i: usize = 0;
+        while (i < n) : (i += 1) try buf.print(a, ",\"k{d}\":{d}", .{ i, i });
+        try buf.appendSlice(a, "}");
+        const out = try withRewrittenPrompt(a, buf.items, "CAP");
+        defer a.free(out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("CAP", parsed.value.object.get("prompt").?.string);
+        try std.testing.expectEqualStrings("CAP", parsed.value.object.get("revised_prompt").?.string);
+        // Every original field survives the rewrite.
+        try std.testing.expectEqual(n + 2, parsed.value.object.count());
+    }
+}
+
+test "a non-object body is refused, not silently rewritten" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.NotAnObject, withRewrittenPrompt(a, "[1,2,3]", "x"));
+    try std.testing.expect(std.meta.isError(withRewrittenPrompt(a, "nope", "x")));
+}
+
+test "the rewriter reads the prompt and the canvas the caption must describe" {
+    // The system prompt asks for `aspect_ratio` FIRST and every bbox follows
+    // from it, so the size has to be read before the job is built.
+    const b = promptAndSizeFromGenBody("{\"prompt\":\"a red barn\",\"size\":\"1536x512\"}");
+    try std.testing.expectEqualStrings("a red barn", b.prompt);
+    try std.testing.expectEqual(@as(u32, 1536), b.width);
+    try std.testing.expectEqual(@as(u32, 512), b.height);
+    // No size = the endpoint's documented 1024² default, not zero.
+    const d = promptAndSizeFromGenBody("{\"prompt\":\"x\"}");
+    try std.testing.expectEqual(@as(u32, 1024), d.width);
+    try std.testing.expectEqual(@as(u32, 1024), d.height);
+    try std.testing.expectEqualStrings("", promptAndSizeFromGenBody("{}").prompt);
+}
+
+test "ideogram4 classifies as image media on both sides of the duplicated predicate" {
+    try std.testing.expectEqual(Modality.image, modalityFromType("ideogram4").?);
+    try std.testing.expect(discovery.isMediaModelType("ideogram4"));
+    // The completeness marker is the SECOND transformer: a pack with only the
+    // conditional weights would load and then denoise against a branch that
+    // never loaded.
+    try std.testing.expectEqualStrings(
+        "unconditional_transformer/config.json",
+        discovery.requiredMediaMarker("ideogram4").?,
+    );
 }
