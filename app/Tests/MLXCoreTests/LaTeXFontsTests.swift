@@ -64,6 +64,27 @@ final class LaTeXFontsTests: XCTestCase {
         )
     }
 
+    /// The toolchain's swift-build layout writes a STRUCTURED macOS bundle
+    /// (`Contents/Resources/Fonts/`) where the classic SwiftPM build directory
+    /// wrote a FLAT one (`Fonts/` at the root), and `build.sh` copies whichever
+    /// one `--show-bin-path` produced into the .app verbatim. `Bundle`'s own
+    /// resource lookup — what actually LOADS a font, see
+    /// `scripts/patch-swatex-font-lookup.sh` — reads both, so a probe that
+    /// knows only the flat layout reports "no fonts" while the fonts sit right
+    /// there and every equation renders as its own source text.
+    func testAStructuredBundleLayoutIsAHit() {
+        let resources = URL(fileURLWithPath: "/Applications/MLX Core.app/Contents/Resources")
+        let bundle = resources.appendingPathComponent(LaTeXFonts.bundleName)
+        let located = LaTeXFonts.locate(
+            searching: [resources],
+            fileExists: present([
+                bundle.appendingPathComponent("Contents/Resources")
+                    .appendingPathComponent(LaTeXFonts.probeFont).path
+            ])
+        )
+        XCTAssertEqual(located, bundle)
+    }
+
     func testTheFontsAreResolvableInThisTestRun() {
         XCTAssertTrue(
             LaTeXFonts.isAvailable,
