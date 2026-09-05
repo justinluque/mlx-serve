@@ -46,16 +46,20 @@ struct ImageGenView: View {
     /// Source-image mode: true = instruction edit (FLUX.2 in-context reference,
     /// keeps the subject), false = variation (renoise remix).
     @State private var editMode: Bool = true
+    /// What to steer away from. Only shown for models that read it — see
+    /// `ImageModelPreset.supportsNegativePrompt`.
+    @State private var negativePrompt: String = ""
+    /// Classifier-free guidance scale. Only shown for models that read one —
+    /// see `ImageModelPreset.supportsGuidance`.
+    @State private var guidance: Double = 5.0
     /// Conditioning rebalance (Advanced): global gain on the prompt embeddings.
     @State private var condGain: Double = 1.0
     /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
     @State private var condWeightsText: String = ""
-    /// Classifier-free guidance (Advanced, `model.supportsGuidance` only):
-    /// how strongly to follow the prompt over the unconditional pathway.
+    /// Classifier-free guidance (Advanced, `model.supportsKleinGuidance`
+    /// only): how strongly to follow the prompt over the unconditional
+    /// pathway.
     @State private var guidanceScale: Double = 1.0
-    /// What to steer away from (Advanced, CFG only). Transient like the main
-    /// prompt — not persisted.
-    @State private var negativePrompt: String = ""
     /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
     /// Several can attach at once — their effects sum, so order doesn't matter.
     @State private var loras: [LoraAdapter] = []
@@ -94,6 +98,8 @@ struct ImageGenView: View {
         .onChange(of: customWidthText) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: customHeightText) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: negativePrompt) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: guidance) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
     }
@@ -482,6 +488,41 @@ struct ImageGenView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
+            // The negative prompt is shown only for models that actually read
+            // one. Every distilled backend here generates guidance-free and
+            // has no unconditional branch for it to steer, so showing the box
+            // on those would be decoration — which is exactly why this panel
+            // carried neither a CFG nor a negative field before SDXL landed.
+            if model.supportsNegativePrompt {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Negative prompt (optional)").font(.caption.weight(.semibold))
+                    TextField("things to avoid — e.g. blurry, extra fingers, watermark", text: $negativePrompt)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.callout)
+                    Text("Steered away from, not banned. Leave it empty and the model runs its usual unguided-side pass; anything typed here pushes the picture away from it.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Divider()
+            }
+            // Same gate as the negative prompt: only a real-guidance backend has
+            // a scale worth steering. Range mirrors the server's own [1,30]
+            // check (`gen.zig`'s `guidance`/`guidance_scale` parse).
+            if model.supportsGuidance {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Guidance (CFG)").font(.caption.weight(.semibold))
+                        Spacer()
+                        Text(String(format: "%.1f", guidance)).font(.caption).foregroundStyle(.secondary)
+                        Stepper("", value: $guidance, in: 1...30, step: 0.5)
+                            .labelsHidden()
+                    }
+                    Text("How strongly the prompt steers the image. Higher follows the prompt more literally at the cost of variety; lower drifts but stays natural. This checkpoint defaults to ~5.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Divider()
+            }
             // Steps stay overridable even where the schedule is fixed — it's
             // the Advanced panel, and the hint says the cost.
             HStack {
@@ -501,7 +542,7 @@ struct ImageGenView: View {
             // Real CFG — the undistilled base checkpoint only. Every other
             // preset has guidance baked into its weights, so the field would
             // be pure decoration there and stays hidden.
-            if model.supportsGuidance {
+            if model.supportsKleinGuidance {
                 Divider()
                 Text("Classifier-free guidance").font(.caption.weight(.semibold))
                 VStack(alignment: .leading, spacing: 2) {
@@ -860,6 +901,8 @@ struct ImageGenView: View {
         keepResident = s.keepResident
         strength = s.strength
         editMode = s.editMode
+        negativePrompt = s.negativePrompt
+        guidance = s.guidance
         condGain = s.condGain
         condWeightsText = s.condWeightsText
         guidanceScale = s.guidanceScale
@@ -886,6 +929,8 @@ struct ImageGenView: View {
         s.keepResident = keepResident
         s.strength = strength
         s.editMode = editMode
+        s.negativePrompt = negativePrompt
+        s.guidance = guidance
         s.condGain = condGain
         s.condWeightsText = condWeightsText
         s.guidanceScale = guidanceScale
@@ -928,11 +973,12 @@ struct ImageGenView: View {
             magicPromptModel: magicPromptModel,
             editMode: effectiveEditMode,
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
+            negativePrompt: (model.supportsNegativePrompt || model.supportsKleinGuidance) ? negativePrompt : "",
+            guidance: guidance,
             condGain: condGain,
             condWeightsText: condWeightsText,
             loras: loras,
-            guidanceScale: model.supportsGuidance ? guidanceScale : 1.0,
-            negativePrompt: model.supportsGuidance ? negativePrompt : ""
+            guidanceScale: model.supportsKleinGuidance ? guidanceScale : 1.0
         )
         persist()  // final capture — the agent's generate_image reuses these
 

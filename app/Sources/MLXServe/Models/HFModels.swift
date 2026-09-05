@@ -70,7 +70,7 @@ let supportedModelTypes: Set<String> = [
 /// architecture" in the Downloaded tab) while still being excluded from
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
 /// Mirrors `model_discovery.isMediaModelType` (Zig).
-private let mediaModelTypePrefixes: [String] = ["flux2", "flux1", "krea", "mage_flow", "zimage", "hunyuan3d", "anima", "ideogram4"]
+private let mediaModelTypePrefixes: [String] = ["flux2", "flux1", "krea", "mage_flow", "zimage", "hunyuan3d", "anima", "ideogram4", "sdxl"]
 // Mirrors `gen.media_model_types` on the server. Drift here is not cosmetic:
 // a media model missing from this list fails the ARCHITECTURE gate outright,
 // so the browser draws it a red "Unsupported" — which is what happened to
@@ -86,7 +86,8 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "flux1", "krea", "mage_
 // asserts this agrees. Zig already pinned its own two copies against each
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
-    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow",
+    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "sd1",
+    "sd3",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -125,6 +126,7 @@ enum MediaModality: CaseIterable {
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
             || modelType.hasPrefix("zimage") || modelType == "anima"
             || modelType.hasPrefix("ideogram4") { self = .image; return }
+        if modelType.hasPrefix("sdxl") || modelType == "sd1" || modelType == "sd3" { self = .image; return }
         if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
@@ -195,6 +197,10 @@ private let servedDiffusersClasses: [String: String] = [
     // Ideogram 4 publishes in the same shape — a diffusers model_index.json
     // and no root model_type. Mirrors model_discovery.peekIdeogram4Index.
     "Ideogram4Pipeline": "ideogram4",
+    "StableDiffusionXLPipeline": "sdxl",
+    // SD 3.5 (Large, Large-Turbo, Medium) all declare this one class; what
+    // separates them is the transformer's own config, which the server reads.
+    "StableDiffusion3Pipeline": "sd3",
 ]
 
 struct HFModel: Identifiable, Codable {

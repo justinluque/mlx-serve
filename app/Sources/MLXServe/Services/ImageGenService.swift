@@ -233,10 +233,19 @@ final class ImageGenService: ObservableObject {
            weights.count == request.condWeightCount {
             json["cond_weights"] = weights
         }
-        // Classifier-free guidance (base klein only — `model.supportsGuidance`
+        // Classifier-free guidance (base klein only — `model.supportsKleinGuidance`
         // gates the control, so a distilled preset's 1.0 default never reaches
         // here as anything but the omitted-field no-op).
         if request.guidanceScale != 1.0 { json["guidance_scale"] = request.guidanceScale }
+        // Omitted on a model that can't read it, so the server's own
+        // checkpoint default (`SchedulerConfig.default_guidance`) applies —
+        // sending a bare number to a guidance-free distill would earn a 400.
+        if request.model.supportsGuidance { json["guidance"] = request.guidance }
+        // Omitted when blank — absent and empty are DIFFERENT requests on a
+        // guidance model: an absent `negative_prompt` zeroes SDXL's
+        // unconditional branch, while "" is encoded (BOS + EOS + 75 pads
+        // through both text towers) and is not the same tensor. A user who
+        // never touched the box means absent.
         let negativePrompt = request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !negativePrompt.isEmpty { json["negative_prompt"] = negativePrompt }
         // Stacked style LoRAs: several `.safetensors` adapters attach at once
