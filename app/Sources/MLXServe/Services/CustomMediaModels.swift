@@ -56,6 +56,7 @@ enum CustomMediaModels {
         if arch.hasPrefix("zimage") {
             return isTurboDir(id) ? .zImageTurbo8bit : .zImage8bit
         }
+        if arch == "anima" { return .animaBase }
         return nil
     }
 
