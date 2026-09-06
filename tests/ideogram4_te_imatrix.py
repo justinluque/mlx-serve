@@ -79,8 +79,17 @@ def split_docs(docs: list[str], holdout: bool) -> list[str]:
 TOWER_PREFIXES = ("language_model.", "model.language_model.", "model.", "")
 
 
+# The component every text-encoder key is qualified by. The engine writes the
+# same prefix (`flux.armTextEncoderImatrix`), so ONE file can carry the encoder
+# and both transformers and the converter reads its own half out of it. Two
+# producers with two conventions is exactly the stale-key failure the
+# converter's "matched no linear" refusal exists to catch.
+COMPONENT = "text_encoder"
+
+
 def module_key(path: str) -> str:
-    """An mlx_lm module path -> the name `convert_ideogram4.emit_linear` writes.
+    """An mlx_lm module path -> the key the converter looks up, which is
+    `text_encoder/` + the name `emit_linear` writes.
 
     Returns "" for anything outside the text tower (the vision tower, and
     `lm_head`, which the encoder never runs because it stops at the taps)."""
@@ -90,7 +99,7 @@ def module_key(path: str) -> str:
             break
     if path.startswith("visual.") or path == "lm_head":
         return ""
-    return path
+    return f"{COMPONENT}/{path}"
 
 
 # ============================================================
@@ -318,7 +327,7 @@ def collect(args) -> int:
         "total_tokens": str(total),
         "seed": str(args.seed),
         "values": "mean-squared activation per INPUT channel (sum(x^2)/rows)",
-        "keys": "convert_ideogram4 module names (text tower, prefix stripped)",
+        "keys": "<component>/<module> — the same convention the engine writes",
         "holdout": "calibrated on split_docs(holdout=False); every 10th caption withheld",
     })
     print(f"wrote {out} — {len(arrays)} entries, {total} tokens", flush=True)
@@ -339,9 +348,13 @@ def self_test() -> int:
     # Naming: the imatrix is keyed by what the CONVERTER writes, so every
     # prefix spelling the converter probes must collapse to the same key.
     for pfx in ("language_model.", "model.language_model.", "model.", ""):
-        check(module_key(pfx + "layers.7.self_attn.q_proj") == "layers.7.self_attn.q_proj",
+        check(module_key(pfx + "layers.7.self_attn.q_proj") == "text_encoder/layers.7.self_attn.q_proj",
               f"prefix {pfx!r} did not strip")
-    check(module_key("embed_tokens") == "embed_tokens", "embed_tokens key")
+    check(module_key("embed_tokens") == "text_encoder/embed_tokens", "embed_tokens key")
+    # The engine writes this same prefix, so one collected file serves both
+    # flags. A convention that drifts between the two producers ships an
+    # uncalibrated encoder inside a pack that reads as calibrated.
+    check(module_key("layers.0.mlp.gate_proj").startswith(COMPONENT + "/"), "component prefix missing")
     # Never calibrated: the vision tower is not fetched and lm_head is not run.
     check(module_key("visual.blocks.0.attn.qkv") == "", "vision tower not excluded")
     check(module_key("model.visual.blocks.0.attn.qkv") == "", "prefixed vision tower not excluded")

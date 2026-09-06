@@ -20,6 +20,7 @@ const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const ideogram4 = @import("ideogram4.zig");
 const lora_mod = @import("lora.zig");
+const imatrix_mod = @import("imatrix.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
@@ -358,8 +359,8 @@ const Ideogram4Impl = struct {
         // written is a refusal at load rather than a surprise at save time.
         if (std.c.getenv("MLX_SERVE_IDEOGRAM_IMATRIX")) |env| {
             const path = std.mem.sliceTo(env, 0);
-            if (path.len != 0 and ideogram4.imatrix == null) {
-                ideogram4.imatrix = try ideogram4.Imatrix.init(allocator, path);
+            if (path.len != 0 and imatrix_mod.active == null) {
+                imatrix_mod.active = try imatrix_mod.Imatrix.init(allocator, path);
                 log.info("[image] Ideogram 4: collecting activation statistics into {s}\n", .{path});
             }
         }
@@ -375,6 +376,7 @@ const Ideogram4Impl = struct {
             log.info("[image] Ideogram 4 low-mem mode: text encoder loads per request\n", .{});
         } else {
             self.te = try loadTe(io, allocator, self.s, model_dir);
+            try armTeImatrix(&self.te.?, allocator);
         }
         errdefer if (self.te) |*t| t.deinit();
         self.cond = try ideogram4.loadTransformer(io, allocator, self.s, model_dir, "transformer");
@@ -413,6 +415,15 @@ const Ideogram4Impl = struct {
         log.info("[image] Ideogram 4: loading the unconditional transformer (guided render)\n", .{});
         self.uncond = try ideogram4.loadTransformer(self.io, self.allocator, self.s, self.model_dir, IDEOGRAM_UNCOND_DIR);
         return &self.uncond.?;
+    }
+
+    /// Arm the text encoder's projections when a collection is running. The
+    /// encoder is a THIRD of the pack and runs at 4-bit in every shipped
+    /// policy, so it is calibrated from the same file as the DiT.
+    fn armTeImatrix(te: *flux.TextEncoder, allocator: std.mem.Allocator) !void {
+        const im = imatrix_mod.active orelse return;
+        const n = try flux.armTextEncoderImatrix(te, im, "text_encoder", allocator);
+        if (n > 0) log.info("[image] Ideogram 4: text_encoder activation statistics armed ({d} projections)\n", .{n});
     }
 
     fn loadTe(io: std.Io, allocator: std.mem.Allocator, s: mlx.mlx_stream, model_dir: []const u8) !flux.TextEncoder {
@@ -521,6 +532,11 @@ const Ideogram4Impl = struct {
             if (self.te) |*t| break :blk try ideogram4.encodePrompt(t, ids, mask);
             var t = try loadTe(self.io, self.allocator, self.s, self.model_dir);
             defer t.deinit();
+            // Low-mem reloads the encoder per request, so it re-arms per
+            // request: registering fresh slots each time would make every
+            // reload a new set of keys, so `armTeImatrix` no-ops once a
+            // collector already holds this component.
+            try armTeImatrix(&t, self.allocator);
             break :blk try ideogram4.encodePrompt(&t, ids, mask);
         };
         // The unconditional checkpoint is loaded only if this run reads it.
@@ -529,7 +545,7 @@ const Ideogram4Impl = struct {
         // Written after EVERY generation, not at unload: a calibration run is
         // many minutes per image, and an interrupted one must keep what it
         // measured.
-        if (ideogram4.imatrix) |im| im.save() catch |e| log.warn("[image] imatrix save failed: {s}\n", .{@errorName(e)});
+        if (imatrix_mod.active) |im| im.save() catch |e| log.warn("[image] imatrix save failed: {s}\n", .{@errorName(e)});
         return img;
     }
 };

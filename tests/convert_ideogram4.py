@@ -862,6 +862,79 @@ def self_test() -> None:
     assert sizes["mixed_3_8"] < 16e9, sizes["mixed_3_8"]
     print("[self-test] pack size ordering OK: " + ", ".join(f"{k}={v / 1e9:.1f}GB" for k, v in sizes.items()))
 
+    # ── calibrated quantization ───────────────────────────────────────────
+    import numpy as np
+
+    from dsv4_imatrix import weighted_affine_quant, weighted_rel_err
+
+    rng = np.random.default_rng(7)
+    out_dim, in_dim, gs, bits = 64, 256, 64, 4
+    w = rng.standard_normal((out_dim, in_dim), dtype=np.float32)
+    # A realistic activation profile: most channels quiet, a few carrying the
+    # signal. On a live Ideogram DiT one layer-0 projection spans E[x^2] from
+    # 1e-15 to 46 across its 4608 inputs, which is the spread RTN is blind to.
+    ch = np.exp(rng.standard_normal(in_dim, dtype=np.float32) * 4.0).astype(np.float32)
+
+    def dequant(triples):
+        (qk, qs, qd), (sk, ss, sd), (bk, bs, bd) = triples
+        q = np.frombuffer(qd, dtype=np.uint32).reshape(qs)
+        sc = ((np.frombuffer(sd, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)).reshape(ss)
+        bi = ((np.frombuffer(bd, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)).reshape(bs)
+        per_word = 32 // bits
+        vals = np.zeros((qs[0], qs[1] * per_word), dtype=np.float32)
+        for i in range(per_word):
+            vals[:, i::per_word] = (q >> (bits * i)) & ((1 << bits) - 1)
+        g = vals.reshape(qs[0], -1, gs)
+        return (g * sc[..., None] + bi[..., None]).reshape(qs[0], -1)
+
+    calibrated = dequant(weighted_affine_quant(w, bits=bits, group_size=gs, ch_weights=ch))
+    rtn_q, rtn_s, rtn_b = mx.quantize(mx.array(w), group_size=gs, bits=bits)
+    rtn = np.asarray(mx.dequantize(rtn_q, rtn_s, rtn_b, group_size=gs, bits=bits).astype(mx.float32), dtype=np.float32)
+    e_cal = weighted_rel_err(w, calibrated, ch)
+    e_rtn = weighted_rel_err(w, rtn, ch)
+    # The claim the whole feature rests on: MLX's own minmax is candidate 0 of
+    # the search, so a calibrated pack can never be WORSE by the objective that
+    # reaches the output. A tiny slack absorbs the bf16 rounding of (s, b).
+    assert e_cal <= e_rtn * 1.001, (e_cal, e_rtn)
+    # And on a spread this wide it must be meaningfully better, or the file is
+    # being loaded and then ignored.
+    assert e_cal < e_rtn * 0.95, (e_cal, e_rtn)
+    print(f"[self-test] calibrated quant OK: weighted rel err {e_cal:.4e} vs RTN {e_rtn:.4e} "
+          f"({100 * (1 - e_cal / e_rtn):.1f}% lower)")
+
+    # The converter reads GEOMETRY, never a config block, so a calibrated
+    # triple has to solve back to the same (bits, group_size) as an RTN one.
+    tri = weighted_affine_quant(w, bits=bits, group_size=gs, ch_weights=ch)
+    q_mx = _mx_from_raw(*tri[0])
+    s_mx = _mx_from_raw(*tri[1])
+    assert q_mx.shape == rtn_q.shape and q_mx.dtype == rtn_q.dtype, (q_mx.shape, rtn_q.shape)
+    assert s_mx.shape == rtn_s.shape, (s_mx.shape, rtn_s.shape)
+    assert 32 * q_mx.shape[1] // in_dim == bits
+    assert in_dim // s_mx.shape[1] == gs
+    print("[self-test] calibrated packed geometry solves back OK")
+
+    # An imatrix that matches NOTHING must refuse by name. A stale key
+    # convention would otherwise ship an uncalibrated pack that reads as
+    # calibrated in the log and in config.json.
+    im = Imatrix(None, "probe")
+    im.weights = {"transformer/layers.0.attention.qkv": np.ones(in_dim, dtype=np.float32)}
+    assert im.get("layers.0.attention.qkv", in_dim) is None  # no component prefix
+    try:
+        im.report()
+        raise AssertionError("an imatrix matching nothing was accepted")
+    except SystemExit as e:
+        assert "matched no linear" in str(e), e
+    # A shape mismatch is a DIFFERENT checkpoint and is declined, not applied.
+    im2 = Imatrix(None, "probe", prefix="transformer/")
+    im2.weights = {"transformer/m": np.ones(in_dim + 1, dtype=np.float32)}
+    assert im2.get("m", in_dim) is None and im2.declined
+    # The hit path, with the prefix the DiT collector writes.
+    im3 = Imatrix(None, "probe", prefix="transformer/")
+    im3.weights = {"transformer/m": ch}
+    got = im3.get("m", in_dim)
+    assert got is not None and im3.hits == 1
+    print("[self-test] imatrix lookup + refusal OK")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -872,9 +945,11 @@ def main() -> None:
     ap.add_argument("--bulk-bits", type=int, help="override a mixed policy's attention/MLP width")
     ap.add_argument("--sensitive-bits", type=int, help="override a mixed policy's modulation/conditioning width")
     ap.add_argument("--te-bits", type=int, help="override a mixed policy's text-encoder width")
-    ap.add_argument("--te-imatrix", help="activation statistics for the text encoder "
-                                        "(tests/ideogram4_te_imatrix.py) — weights the quantizer's "
-                                        "error by E[x^2] per input channel instead of round-to-nearest")
+    ap.add_argument("--te-imatrix", help="activation statistics for the text encoder, keyed "
+                                        "'text_encoder/<module>' — weights the quantizer's error by "
+                                        "E[x^2] per input channel instead of round-to-nearest. The "
+                                        "engine collects every component into ONE file, so this and "
+                                        "--dit-imatrix are usually the same path")
     ap.add_argument("--dit-imatrix", help="activation statistics for BOTH transformers, keyed "
                                          "'<component>/<module>' (MLX_SERVE_IDEOGRAM_IMATRIX=<path> on a "
                                          "real generation) — the DiT bulk is where the 2-bit pack failed, "
@@ -905,7 +980,9 @@ def main() -> None:
         f"text_encoder={te_bits}-bit  (estimated pack ≈ {estimate_pack_bytes(args.precision, args.group_size) / 1e9:.1f} GB)"
     )
 
-    te_imatrix = Imatrix(args.te_imatrix, "text_encoder")
+    # Same `<component>/` convention as the DiT halves, so ONE file collected
+    # by the engine can serve `--te-imatrix` and `--dit-imatrix` alike.
+    te_imatrix = Imatrix(args.te_imatrix, "text_encoder", prefix="text_encoder/")
     convert_text_encoder(src, out, te_bits, args.group_size, te_imatrix)
     convert_vae(src, out, args.group_size)
     copy_tokenizer(src, out)

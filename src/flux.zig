@@ -12,6 +12,7 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const sse = @import("gen_sse.zig");
 const lora_mod = @import("lora.zig");
+const imatrix_mod = @import("imatrix.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -151,6 +152,13 @@ const QLinear = struct {
     // Fixed-capacity so attach/forward never allocate.
     lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
     lora_count: u8 = 0,
+    /// Activation-statistics collection (`imatrix.zig`), for a calibrated
+    /// re-quantization of the checkpoint this linear came from. `name` is the
+    /// module name the CONVERTER writes; `im_slot` is -1 unless something
+    /// armed this encoder, so an unarmed forward pays one comparison.
+    name: []u8 = &.{},
+    name_allocator: ?std.mem.Allocator = null,
+    im_slot: i32 = -1,
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8) !QLinear {
         const wk = try fmtKey(a, "{s}.weight", .{prefix});
@@ -166,6 +174,8 @@ const QLinear = struct {
             .scales = try ownWeight(w, sk),
             .biases = try ownWeight(w, bk),
             .add_bias = ownOpt(w, ak),
+            .name = try a.dupe(u8, prefix),
+            .name_allocator = a,
         };
         const geo = inferQuantGeometryOf(ql.w, ql.scales);
         ql.bits = geo.bits;
@@ -173,12 +183,19 @@ const QLinear = struct {
         return ql;
     }
     fn deinit(self: *QLinear) void {
+        if (self.name.len != 0) self.name_allocator.?.free(self.name);
         _ = mlx.mlx_array_free(self.w);
         _ = mlx.mlx_array_free(self.scales);
         _ = mlx.mlx_array_free(self.biases);
         if (self.add_bias) |b| _ = mlx.mlx_array_free(b);
     }
     fn forward(self: *const QLinear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        // The INPUT is the statistic, so it is read before the projection and
+        // before any LoRA delta — a calibrated re-quantization is of the base
+        // weight. Every other backend sharing this type is simply never armed.
+        if (imatrix_mod.active) |im| {
+            if (self.im_slot >= 0) im.observe(@intCast(self.im_slot), x, s) catch {};
+        }
         var o = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w, self.scales, self.biases, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
         if (self.add_bias) |b| {
@@ -402,6 +419,27 @@ const TeLayer = struct {
         self.down.deinit();
     }
 };
+
+/// Give every projection in a text encoder a slot in the armed collector, its
+/// name qualified by the component the CONVERTER writes it under
+/// (`text_encoder/layers.0.self_attn.q_proj`). Ideogram 4 is the only caller —
+/// every other backend sharing `QLinear` stays at `im_slot == -1`.
+pub fn armTextEncoderImatrix(te: *TextEncoder, im: *imatrix_mod.Imatrix, component: []const u8, allocator: std.mem.Allocator) !usize {
+    var n: usize = 0;
+    for (te.layers) |*l| {
+        inline for (.{ &l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down }) |ql| {
+            if (ql.name.len != 0 and ql.im_slot < 0) {
+                const q = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ component, ql.name });
+                if (ql.name_allocator) |na| na.free(ql.name);
+                ql.name = q;
+                ql.name_allocator = allocator;
+                ql.im_slot = try im.register(ql.name);
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
 
 pub const TextEncoder = struct {
     cfg: FluxConfig,
