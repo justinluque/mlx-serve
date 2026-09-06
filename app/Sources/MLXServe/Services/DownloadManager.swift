@@ -920,7 +920,20 @@ class DownloadManager: ObservableObject {
     /// once the mirrors actually carry the file — before then every tick
     /// alerted on a 404 nobody could fix.
     func startTurboLora(repoId: String, onFinish: @escaping @MainActor () -> Void = {}) {
-        startPackFile(repoId: repoId, fileName: TurboLoraFetch.fileName, onFinish: onFinish)
+        startTurboLora(source: TurboLoraFetch.h3(packRepo: repoId), packRepo: repoId, onFinish: onFinish)
+    }
+
+    /// The general form: fetch `source`'s file into `packRepo`'s dir under the
+    /// name the server resolves. H3's source IS its pack (nothing renamed);
+    /// Ideogram 4's is ostris' repo under the publisher's own filename, so the
+    /// two halves are separate parameters rather than one repo id.
+    func startTurboLora(source: TurboLoraFetch.Source, packRepo: String,
+                        onFinish: @escaping @MainActor () -> Void = {}) {
+        startPackFile(repoId: source.repoId,
+                      fileName: source.remoteFileName,
+                      packRepoId: packRepo,
+                      saveAs: TurboLoraFetch.fileName,
+                      onFinish: onFinish)
     }
 
     /// Fetch ONE file of a pack that is already on disk, beside its weights:
@@ -928,8 +941,21 @@ class DownloadManager: ObservableObject {
     /// (`fsq.safetensors`) for packs downloaded before cover mode — that one
     /// is TEMPORARY migration code (2026-08-22), to go once installs have
     /// re-downloaded. Same contract as `startTurboLora`.
-    func startPackFile(repoId: String, fileName: String, onFinish: @escaping @MainActor () -> Void = {}) {
-        if let running = activeTasks[repoId] {
+    /// `packRepoId` names the pack the file lands in when it is NOT the repo
+    /// the file comes from (Ideogram's adapter is published by ostris), and
+    /// `saveAs` renames it there when the publisher's name is not the one the
+    /// server resolves. Both default to the single-repo case, so every
+    /// existing caller is unchanged.
+    ///
+    /// The in-flight task is keyed on the PACK, not the source: the pane asks
+    /// "is my model fetching?" with its own repo id, and two packs sharing one
+    /// upstream adapter must not attach to a transfer landing in the other's
+    /// directory.
+    func startPackFile(repoId: String, fileName: String,
+                       packRepoId: String? = nil, saveAs: String? = nil,
+                       onFinish: @escaping @MainActor () -> Void = {}) {
+        let key = packRepoId ?? repoId
+        if let running = activeTasks[key] {
             Task { @MainActor in
                 _ = await running.value
                 onFinish()
@@ -939,9 +965,9 @@ class DownloadManager: ObservableObject {
         // The adapter belongs BESIDE the pack's weights, wherever those live —
         // a pack in a non-destination root must not grow a fragment dir in the
         // destination (it shadows the real pack and the server dies loading it).
-        let packDir = existingModelDir(for: repoId)
+        let packDir = existingModelDir(for: key)
         mediaBundleRepos.insert(repoId)
-        packFileFetches.insert(repoId)
+        packFileFetches.insert(key)
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.download(repoId: repoId,
@@ -949,11 +975,28 @@ class DownloadManager: ObservableObject {
                                 alertOnFailure: true,
                                 destDirOverride: packDir)
             self.finalizeCancelledPackFile(repoId: repoId, fileName: fileName, packDir: packDir)
-            self.packFileFetches.remove(repoId)
-            self.activeTasks.removeValue(forKey: repoId)
+            if !Task.isCancelled, let saveAs, saveAs != fileName {
+                Self.renamePackFile(dir: packDir ?? self.newLayoutDir(for: key), from: fileName, to: saveAs)
+            }
+            self.packFileFetches.remove(key)
+            self.activeTasks.removeValue(forKey: key)
             onFinish()
         }
-        activeTasks[repoId] = task
+        activeTasks[key] = task
+    }
+
+    /// Give a downloaded file the name the server resolves. Replaces an older
+    /// copy rather than failing onto it: a half-finished earlier attempt would
+    /// otherwise leave the pack holding a stale adapter under the live name.
+    /// A missing source is not an error here — the download itself already
+    /// alerted, and there is nothing to rename.
+    private static func renamePackFile(dir: String, from: String, to: String) {
+        let fm = FileManager.default
+        let src = (dir as NSString).appendingPathComponent(from)
+        let dst = (dir as NSString).appendingPathComponent(to)
+        guard fm.fileExists(atPath: src) else { return }
+        try? fm.removeItem(atPath: dst)
+        try? fm.moveItem(atPath: src, toPath: dst)
     }
 
     /// Repo ids whose `activeTasks` entry is a SINGLE-FILE fetch into a pack

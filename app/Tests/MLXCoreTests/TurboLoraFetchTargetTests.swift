@@ -113,4 +113,56 @@ final class TurboLoraFetchTargetTests: XCTestCase {
         XCTAssertTrue(strays.isEmpty, "left behind: \(strays)")
         XCTAssertFalse(fm.fileExists(atPath: DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)))
     }
+
+    // MARK: - A source that is not the pack (Ideogram 4)
+
+    private let ideogramPackRepo = "justintime47/fixture-ideogram-pack"
+
+    /// Ideogram's adapter is published by ostris, under ostris' filename, and
+    /// the server resolves exactly one name inside the pack. So the fetch has
+    /// three chances to go wrong that H3's never had: pull from the wrong
+    /// repo, write into the wrong directory, or land under a name nothing
+    /// reads. All three look identical from the pane — Turbo just keeps
+    /// offering to download.
+    func testIdeogramAdapterComesFromOstrisAndLandsInThePackUnderTheServersName() async throws {
+        let packDir = (tempRoot as NSString).appendingPathComponent("fixture-ideogram-pack")
+        try FileManager.default.createDirectory(atPath: packDir, withIntermediateDirectories: true)
+        try Data("{\"model_type\":\"ideogram4\"}".utf8)
+            .write(to: URL(fileURLWithPath: (packDir as NSString).appendingPathComponent("config.json")))
+        let source = TurboLoraFetch.ideogram4
+        HuggingFaceStubProtocol.serve(repo: source.repoId, files: [
+            (source.remoteFileName, Data("TURBOTIME".utf8)),
+        ])
+        let manager = DownloadManager(modelsRoot: tempRoot)
+
+        await withCheckedContinuation { cont in
+            manager.startTurboLora(source: source, packRepo: ideogramPackRepo) { cont.resume() }
+        }
+
+        let fm = FileManager.default
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: (packDir as NSString).appendingPathComponent(TurboLoraFetch.fileName))),
+                       Data("TURBOTIME".utf8),
+                       "the adapter is not in the pack under the name the server resolves")
+        XCTAssertFalse(fm.fileExists(atPath: (packDir as NSString).appendingPathComponent(source.remoteFileName)),
+                       "the publisher's filename was left behind — the server reads only one name, and a stray .safetensors is billed as pack weight")
+        // The source repo is somebody else's; its layout path must stay empty
+        // for the same reason H3's destination-root fragment killed the server.
+        XCTAssertFalse(fm.fileExists(atPath: DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: source.repoId)),
+                       "fetch created a dir for the SOURCE repo")
+        XCTAssertTrue(TurboLoraFetch.isOnDisk(modelDir: packDir),
+                      "the on-disk check must agree with where the fetch put it")
+    }
+
+    /// The two backends' sources differ in every field, which is the whole
+    /// reason `Source` exists — H3 downloads its pack's own file in place,
+    /// Ideogram renames someone else's into ours.
+    func testTheTwoTurboSourcesDifferAndOnlyH3NeedsNoRename() {
+        let h3 = TurboLoraFetch.h3(packRepo: repoId)
+        XCTAssertEqual(h3.repoId, repoId)
+        XCTAssertEqual(h3.remoteFileName, TurboLoraFetch.fileName)
+        let ideo = TurboLoraFetch.ideogram4
+        XCTAssertNotEqual(ideo.repoId, ideogramPackRepo)
+        XCTAssertNotEqual(ideo.remoteFileName, TurboLoraFetch.fileName)
+        XCTAssertTrue(ideo.remoteFileName.hasSuffix(".safetensors"))
+    }
 }

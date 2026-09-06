@@ -1871,6 +1871,11 @@ struct ImageGenRequest {
     /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
     /// Empty = none. Rows with an empty `path` are dropped before sending.
     var loras: [LoraAdapter] = []
+    /// Turbo (Ideogram 4): the CFG-distilled adapter in the pack. The server
+    /// pins guidance to 1.0 for it, which is where the unconditional 9.3B
+    /// checkpoint is neither forwarded nor loaded — so this is a speed AND a
+    /// memory setting, not just a step count.
+    var turbo: Bool = false
 }
 
 extension ImageModelPreset {
@@ -1958,6 +1963,18 @@ extension ImageModelPreset {
     /// (`magic_prompt`). The pane surfaces the toggle only where it does
     /// something — everywhere else the field is ignored.
     var supportsMagicPrompt: Bool { variant == .ideogram4 }
+
+    /// Whether `turbo` means anything here. Krea-2-Turbo, Mage-Flow Turbo and
+    /// FLUX.2 klein are distilled CHECKPOINTS — there is no adapter to attach
+    /// and no second branch to skip — so this is Ideogram 4's alone, mirroring
+    /// `ImageEngine.supportsTurbo` server-side, where every other backend
+    /// answers the field with a named 400.
+    var supportsTurbo: Bool { variant == .ideogram4 }
+
+    /// Steps the Turbo adapter is trained for. Its card claims usable images
+    /// at 2; 8 is its own name (`ideogram_turbo_8_v1`) and the conservative
+    /// end, which is also the server's default for a turbo request.
+    var turboSteps: Int { 8 }
 
     /// The fixed step count for a distilled preset (its `.good` profile).
     var fixedSteps: Int { settings(.good).steps }

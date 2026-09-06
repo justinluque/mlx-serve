@@ -481,11 +481,17 @@ struct H3RunHistory: Codable {
 /// Where the Turbo distillation adapter comes from, and whether this request
 /// needs one fetched.
 ///
-/// The adapter is allowlisted in the H3 bundle, so a pack downloaded from now
-/// on arrives with it. Everyone who already has the pack does NOT — and they
-/// are precisely the people who will turn Turbo on. Re-downloading 69 GB to
-/// collect one 744 MB file is not an answer, so the app fetches that file into
-/// the pack it already has, from the same repo the pack came from.
+/// The H3 adapter is allowlisted in the H3 bundle, so a pack downloaded from
+/// now on arrives with it. Everyone who already has the pack does NOT — and
+/// they are precisely the people who will turn Turbo on. Re-downloading 69 GB
+/// to collect one 744 MB file is not an answer, so the app fetches that file
+/// into the pack it already has.
+///
+/// Ideogram 4's adapter is the same idea one step further out: it is not
+/// published by us at all (ostris trained it), so the file comes from a
+/// DIFFERENT repo than the pack and under a different name. The server
+/// resolves exactly one name, so the fetch renames on arrival — which is why
+/// a source is a (repo, remote name) pair rather than just a repo id.
 enum TurboLoraFetch {
     /// The name the SERVER resolves (`<pack dir>/turbo_lora.safetensors`) and
     /// the bundle allowlists. One constant so a rename cannot land the file
@@ -493,8 +499,33 @@ enum TurboLoraFetch {
     static let fileName = "turbo_lora.safetensors"
 
     /// Roughly what it costs, for the sentence shown before it starts. The
-    /// file is 744 MB; this is only ever prose.
+    /// H3 file is 744 MB; this is only ever prose.
     static let approxMB = 744
+
+    /// Where one backend's adapter is published. `repoId` is the SOURCE, never
+    /// the destination: the pack it lands in is passed separately, because for
+    /// Ideogram they are different repos and writing to the source's layout
+    /// path is exactly the fragment-dir failure this fetch already survived.
+    struct Source: Equatable {
+        let repoId: String
+        /// Its name in THAT repo — renamed to `fileName` on arrival when they
+        /// differ.
+        let remoteFileName: String
+        let approxMB: Int
+    }
+
+    /// H3's adapter ships in the pack's own mirror under the name the server
+    /// reads, so source and destination coincide and nothing is renamed.
+    static func h3(packRepo: String) -> Source {
+        Source(repoId: packRepo, remoteFileName: fileName, approxMB: approxMB)
+    }
+
+    /// Ideogram 4's: ostris' `ideogram_4_turbotime_lora`, a CFG-distilled LoRA
+    /// whose own card is explicit that it wants "no CFG and no unconditional
+    /// model" — which is the branch the server then never loads.
+    static let ideogram4 = Source(repoId: "ostris/ideogram_4_turbotime_lora",
+                                  remoteFileName: "ideogram_4_turbotime_v1.safetensors",
+                                  approxMB: 847)
 
     enum Decision: Equatable {
         /// The adapter is on disk — generate.

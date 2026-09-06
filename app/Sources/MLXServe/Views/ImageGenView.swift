@@ -36,6 +36,7 @@ struct ImageGenView: View {
     /// Ideogram 4 only — see `ImageModelPreset.supportsMagicPrompt`.
     @State private var magicPrompt: Bool = true
     @State private var magicPromptModel: String = ""
+    @State private var turbo: Bool = false
     /// Whether the caption the rewriter produced is expanded under the image.
     /// Collapsed by default — it is long, and the image is the answer.
     @State private var showRevisedPrompt: Bool = false
@@ -498,6 +499,40 @@ struct ImageGenView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+            // Turbo is a memory setting as much as a speed one: the adapter is
+            // CFG-distilled, so the server runs it at guidance 1.0, where the
+            // negative branch is multiplied by exactly zero — the second 9.3B
+            // checkpoint is neither forwarded nor loaded.
+            if model.supportsTurbo {
+                Toggle("Turbo (distilled \(model.turboSteps)-step sampling)", isOn: $turbo)
+                    .font(.caption)
+                    .help("Runs ostris' TurboTime adapter: \(model.turboSteps) steps instead of 20, and no classifier-free guidance — which also means Ideogram's second (unconditional) 9.3B transformer is never loaded, about 4 GB less resident. Slightly softer detail than a full guided render. The adapter is not part of the pack; it downloads once, the first time you turn this on.")
+                    .onChange(of: turbo) { _, on in
+                        guard !hydrating else { return }
+                        // Snap steps into the mode's own schedule: 8 is what the
+                        // adapter is distilled for, the tier's count is the
+                        // guided default.
+                        steps = on ? model.turboSteps : model.settings(quality).steps
+                        persist()
+                        // Fetch the moment it is asked for rather than at
+                        // Generate: 847 MB discovered thirty seconds into a job
+                        // reads as a hang. The off-flip CANCELS an in-flight
+                        // fetch, or a briefly-ticked box downloads it anyway
+                        // with nothing on screen saying so.
+                        if on, turboFetchDecision == .fetch {
+                            downloads.startTurboLora(source: TurboLoraFetch.ideogram4, packRepo: model.repo)
+                        } else if !on {
+                            downloads.cancelTurboLora(repoId: model.repo)
+                        }
+                    }
+                if turboFetchDecision == .fetch {
+                    Text("Turbo needs a \(TurboLoraFetch.ideogram4.approxMB) MB adapter that isn't part of the pack — it downloads once from ostris, and Generate waits for it.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else if turboFetchDecision == .unavailableRemotely {
+                    Text("Turbo runs on the Mac hosting this model; it needs the adapter in ITS copy of the pack.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
@@ -923,6 +958,9 @@ struct ImageGenView: View {
         customWidthText = String(s.customWidth)
         customHeightText = String(s.customHeight)
         magicPrompt = s.magicPrompt
+        // Turbo is restored BEFORE steps are read back below, the same order
+        // H3's pane needs: a saved 8 must not bounce to a tier's 20.
+        turbo = s.turbo && model.supportsTurbo
         // Repair a saved DISPLAY LABEL (what the old free-text field invited)
         // into the id the server can actually resolve.
         magicPromptModel = MagicPromptRewriter.normalize(s.magicPromptModel, in: server.allModels)
@@ -951,6 +989,7 @@ struct ImageGenView: View {
         s.loras = loras
         s.magicPrompt = magicPrompt
         s.magicPromptModel = magicPromptModel
+        s.turbo = turbo
         s.save()
     }
 
@@ -965,6 +1004,10 @@ struct ImageGenView: View {
     }
 
     private func applyQualityDefaults() {
+        // A quality tier describes a FULL render — Ideogram's 12/20/48 are the
+        // guided schedule's, one per sampler preset — so picking one turns
+        // turbo off rather than leaving a distilled adapter on a 48-step run.
+        turbo = false
         steps = model.settings(quality).steps
     }
 
@@ -991,7 +1034,8 @@ struct ImageGenView: View {
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             condGain: condGain,
             condWeightsText: condWeightsText,
-            loras: loras
+            loras: loras,
+            turbo: turboEngaged
         )
         persist()  // final capture — the agent's generate_image reuses these
 
@@ -1004,7 +1048,34 @@ struct ImageGenView: View {
             return
         }
 
+        // Belt-and-braces with the toggle's own fetch: turbo can be persisted
+        // ON from a previous session, or the fetch it started can still be in
+        // flight. `startTurboLora` attaches to a running transfer rather than
+        // starting a second one, so both paths converge on one download.
+        if turboFetchDecision == .fetch {
+            downloads.startTurboLora(source: TurboLoraFetch.ideogram4, packRepo: model.repo) {
+                service.generate(req, server: server)
+            }
+            return
+        }
+
         service.generate(req, server: server)
+    }
+
+    /// Turbo as the REQUEST sees it: a saved toggle on a model that cannot use
+    /// it must not reach the wire, where every other image backend answers the
+    /// field with a named 400.
+    private var turboEngaged: Bool { turbo && model.supportsTurbo }
+
+    /// Whether this pane's current selection needs the Turbo adapter fetched.
+    /// The file lives in the pack, so a LAN model's is not ours to complete.
+    private var turboFetchDecision: TurboLoraFetch.Decision {
+        TurboLoraFetch.decide(
+            turboRequested: turbo,
+            backendSupportsTurbo: model.supportsTurbo,
+            isRemote: lanModel != nil,
+            fileOnDisk: TurboLoraFetch.isOnDisk(modelDir: ServerManager.resolveModelDir(repo: model.repo))
+        )
     }
 
     private func showLogWindow() {

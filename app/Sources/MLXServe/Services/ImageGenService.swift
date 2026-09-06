@@ -242,6 +242,11 @@ final class ImageGenService: ObservableObject {
                 json["magic_prompt_model"] = rewriter
             }
         }
+        // Turbo: sent only where the preset DECLARES it and the user asked —
+        // on every other backend it is a named 400, and `false` would be one
+        // too. The server pins guidance 1.0 itself, so nothing else is sent
+        // with it (a `guidance_scale` beside it is refused as a contradiction).
+        if request.model.supportsTurbo && request.turbo { json["turbo"] = true }
         if request.condGain != 1.0 { json["cond_gain"] = request.condGain }
         if !request.condWeightsText.trimmingCharacters(in: .whitespaces).isEmpty,
            let weights = ImageGenRequest.parseCondWeights(request.condWeightsText),

@@ -95,6 +95,22 @@ final class Ideogram4PresetTests: XCTestCase {
             XCTAssertEqual(p.condWeightCount, 0, "\(p.id)")
             // The one control that is Ideogram-only.
             XCTAssertTrue(p.supportsMagicPrompt, "\(p.id)")
+            // Turbo: the CFG-distilled adapter, and the only image backend
+            // with a second branch worth skipping (`ImageEngine.supportsTurbo`).
+            XCTAssertTrue(p.supportsTurbo, "\(p.id)")
+            // The step count the adapter is trained for, and the server's own
+            // default for a turbo request — the two must not drift.
+            XCTAssertEqual(p.turboSteps, 8, "\(p.id)")
+        }
+    }
+
+    /// And nothing else claims Turbo either: Krea-2-Turbo, Mage-Flow Turbo and
+    /// klein are distilled CHECKPOINTS, with no adapter to attach and no
+    /// unconditional branch to skip. The server answers the field with a named
+    /// 400 on all of them.
+    func testTurboIsOfferedNowhereElse() {
+        for p in ImageModelPreset.all where p.variant != .ideogram4 {
+            XCTAssertFalse(p.supportsTurbo, "\(p.id)")
         }
     }
 
@@ -134,6 +150,31 @@ final class Ideogram4RequestBodyTests: XCTestCase {
         // rewrite a caption the user deliberately hand-wrote.
         let off = ImageGenService.requestJson(for: request(p, magic: false), modelName: "m", seed: 1)
         XCTAssertEqual(off["magic_prompt"] as? Bool, false)
+    }
+
+    /// `turbo` is a NAMED 400 on every other image backend and `false` is one
+    /// too, so it rides only when the preset declares it AND the user asked.
+    func testTurboIsSentOnlyWhereItIsDeclaredAndAskedFor() {
+        let ideo = ImageModelPreset.all.first { $0.variant == .ideogram4 }!
+        var on = request(ideo)
+        on.turbo = true
+        XCTAssertEqual(ImageGenService.requestJson(for: on, modelName: "m", seed: 1)["turbo"] as? Bool, true)
+
+        var off = request(ideo)
+        off.turbo = false
+        XCTAssertNil(ImageGenService.requestJson(for: off, modelName: "m", seed: 1)["turbo"],
+                     "an unasked turbo must be ABSENT, not false — false is a 400 on the backends that do not take it")
+
+        // A settings blob carrying turbo from an Ideogram session, replayed on
+        // a model that cannot take it: the flag must not reach the wire.
+        let other = ImageModelPreset.all.first { $0.variant != .ideogram4 }!
+        var carried = ImageGenRequest(model: other, prompt: "x", width: 1024, height: 1024, steps: 8)
+        carried.turbo = true
+        XCTAssertNil(ImageGenService.requestJson(for: carried, modelName: "m", seed: 1)["turbo"])
+
+        // The server pins guidance itself; the app must not send a second
+        // opinion beside it (the two together are a named 400).
+        XCTAssertNil(ImageGenService.requestJson(for: on, modelName: "m", seed: 1)["guidance_scale"])
     }
 
     func testTheRewriterModelRidesAlongOnlyWhenNamedAndEnabled() {
