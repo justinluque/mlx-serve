@@ -14,6 +14,8 @@
 //! the one impure part — actually running the chat model.
 
 const std = @import("std");
+const json_schema = @import("json_schema.zig");
+const json_grammar = @import("json_grammar.zig");
 
 /// The reference's `magic_prompt_system_prompts/v1.txt`, vendored verbatim.
 /// Sections are `[META]`, `[SYSTEM]`, `[USER]`.
@@ -193,6 +195,97 @@ pub fn looksLikeCaption(prompt: []const u8) bool {
         if (std.mem.indexOf(u8, t, key) != null) return true;
     }
     return false;
+}
+
+// ── Caption schema (grammar-constrained decoding) ─────────────────────────
+
+/// The output contract as a JSON Schema, for the server's grammar-constrained
+/// sampler.
+///
+/// The verifier below is a POST-hoc check that warns and moves on; this is the
+/// same contract enforced token by token, so the failure modes it warns about
+/// (an answer that is not JSON, a caption cut a closer short, a preamble in
+/// front of the `{`) cannot occur at all. What it deliberately does NOT
+/// enforce is key ORDER — the grammar accepts a declared key at any position,
+/// the prompt asks for one order, and the verifier warns when they differ.
+///
+/// Keys are exactly the vendored `[SYSTEM]` block's "exactly three top-level
+/// keys" contract, pinned to that file by a test — a prompt revision that adds
+/// a key would otherwise silently mask it out of reach of the model.
+pub const caption_schema_json =
+    \\{"type":"object","additionalProperties":false,
+    \\ "required":["aspect_ratio","high_level_description","compositional_deconstruction"],
+    \\ "properties":{
+    \\  "aspect_ratio":{"type":"string"},
+    \\  "high_level_description":{"type":"string"},
+    \\  "compositional_deconstruction":{"type":"object","additionalProperties":false,
+    \\   "required":["background","elements"],
+    \\   "properties":{
+    \\    "background":{"type":"string"},
+    \\    "elements":{"type":"array","items":{"type":"object","additionalProperties":false,
+    \\     "required":["type","desc"],
+    \\     "properties":{
+    \\      "type":{"enum":["obj","text"]},
+    \\      "bbox":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"integer"}},
+    \\      "text":{"type":"string"},
+    \\      "desc":{"type":"string"}}}}}}}}
+;
+
+/// Parse `caption_schema_json`. The caller owns the result and must keep it
+/// alive for as long as anything built from it (a `json_schema.Schema` borrows
+/// nothing, but the grammar builder reads the value during `init`).
+pub fn captionSchemaValue(allocator: std.mem.Allocator) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, caption_schema_json, .{});
+}
+
+/// The top-level keys the vendored `[SYSTEM]` block's OUTPUT CONTRACT names,
+/// read out of the first `{...}` example in its first fenced block. Writes
+/// into `buf` and returns the filled prefix; every name borrows `raw`.
+///
+/// This exists so the schema above can be pinned to the prompt that is
+/// actually shipped rather than to a comment about it.
+pub fn contractTopLevelKeys(raw: []const u8, buf: *[8][]const u8) [][]const u8 {
+    const open = std.mem.indexOf(u8, raw, "{\"") orelse return buf[0..0];
+    var n: usize = 0;
+    var depth: usize = 0;
+    var i = open;
+    var in_str = false;
+    var key_start: ?usize = null;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (in_str) {
+            if (c == '\\') {
+                i += 1;
+                continue;
+            }
+            if (c != '"') continue;
+            in_str = false;
+            if (key_start) |ks| {
+                // A string that closes at depth 1 and is followed by ':' is a
+                // top-level key; anything else is a value.
+                if (depth == 1 and i + 1 < raw.len and raw[i + 1] == ':' and n < buf.len) {
+                    buf[n] = raw[ks..i];
+                    n += 1;
+                }
+                key_start = null;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => {
+                in_str = true;
+                key_start = i + 1;
+            },
+            '{', '[' => depth += 1,
+            '}', ']' => {
+                depth -= 1;
+                if (depth == 0) break;
+            },
+            '\n' => if (depth == 0) break,
+            else => {},
+        }
+    }
+    return buf[0..n];
 }
 
 // ── Caption verifier ──────────────────────────────────────────────────────
@@ -697,4 +790,88 @@ test "aspect_ratio is a key the vendored prompt asks for, not an unknown one" {
     // A non-string aspect ratio is still worth saying out loud.
     const bad = verify(a, "{\"aspect_ratio\":169,\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}");
     try testing.expect(bad.count >= 1);
+}
+
+test "the caption schema is exactly the vendored contract's top-level keys" {
+    // The mask is built from `caption_schema_json` while the model is reading
+    // the vendored [SYSTEM] block. A prompt revision that renames or adds a
+    // top-level key would put that key out of the sampler's reach entirely —
+    // the model would be asked for something the grammar rejects at its first
+    // byte — so the two are pinned to each other rather than to a comment.
+    const a = testing.allocator;
+    var kbuf: [8][]const u8 = undefined;
+    const contract = contractTopLevelKeys(parseSections(system_prompt_v1).system, &kbuf);
+    try testing.expectEqual(@as(usize, 3), contract.len);
+
+    var parsed = try captionSchemaValue(a);
+    defer parsed.deinit();
+    const props = parsed.value.object.get("properties").?.object;
+    const required = parsed.value.object.get("required").?.array;
+    try testing.expectEqual(contract.len, props.count());
+    try testing.expectEqual(contract.len, required.items.len);
+    for (contract, 0..) |key, i| {
+        try testing.expect(props.get(key) != null);
+        try testing.expectEqualStrings(key, required.items[i].string);
+    }
+}
+
+test "the caption schema is a schema the grammar can enforce, and a real caption fits it" {
+    const a = testing.allocator;
+    var parsed = try captionSchemaValue(a);
+    defer parsed.deinit();
+    var schema = try json_schema.parse(a, parsed.value);
+    defer schema.deinit();
+
+    const caption =
+        \\{"aspect_ratio":"16:9","high_level_description":"A red barn in a wheat field.","compositional_deconstruction":{"background":"a wheat field under overcast daylight","elements":[{"type":"obj","bbox":[100,200,800,900],"desc":"a weathered red barn"},{"type":"text","bbox":[10,10,90,400],"text":"HARVEST","desc":"painted sign, café lettering"}]}}
+    ;
+    // Anything the grammar accepts must also verify clean — the two contracts
+    // are the same one, written twice.
+    var rep = verify(a, caption);
+    try testing.expect(rep.ok());
+
+    var g = try json_grammar.Grammar.init(a, &schema);
+    defer g.deinit();
+    for (caption) |c| try testing.expect(try g.acceptByte(c));
+    try testing.expect(g.isComplete());
+}
+
+test "the caption grammar refuses the shapes the rewriter actually failed on" {
+    const a = testing.allocator;
+    var parsed = try captionSchemaValue(a);
+    defer parsed.deinit();
+    var schema = try json_schema.parse(a, parsed.value);
+    defer schema.deinit();
+
+    const rejected = [_][]const u8{
+        // A fence or any preamble before the object — the whole reason
+        // `stripCodeFences` exists.
+        "```json\n{",
+        // Reasoning in front of the caption.
+        "Okay",
+        // A top-level key the renderer was never trained on.
+        "{\"style\":",
+        // An element type outside the two the contract names.
+        "{\"aspect_ratio\":\"1:1\",\"compositional_deconstruction\":{\"elements\":[{\"type\":\"i",
+        // A fractional bbox coordinate — the grid is integer.
+        "{\"aspect_ratio\":\"1:1\",\"compositional_deconstruction\":{\"elements\":[{\"bbox\":[10.",
+    };
+    for (rejected) |bad| {
+        var g = try json_grammar.Grammar.init(a, &schema);
+        defer g.deinit();
+        var accepted = true;
+        for (bad) |c| {
+            accepted = try g.acceptByte(c);
+            if (!accepted) break;
+        }
+        if (accepted) std.debug.print("grammar accepted what it must reject: {s}\n", .{bad});
+        try testing.expect(!accepted);
+    }
+
+    // A caption cut short mid-object is INCOMPLETE, not accepted-as-final:
+    // that is what tells the token budget it truncated.
+    var g = try json_grammar.Grammar.init(a, &schema);
+    defer g.deinit();
+    for ("{\"aspect_ratio\":\"1:1\"") |c| try testing.expect(try g.acceptByte(c));
+    try testing.expect(!g.isComplete());
 }

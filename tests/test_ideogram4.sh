@@ -82,9 +82,13 @@ grep -q '"state"' "$TMP/load.json" || fail "[3] load failed: $(head -c 300 "$TMP
 grep -q "\[ideogram4\] transformer:" "$TMP/server.log" \
   && echo "PASS: [3a] the conditional transformer loaded" \
   || fail "[3a] no conditional transformer load line"
+# The unconditional branch is LAZY: it is only read at guidance != 1.0, and a
+# CFG-distilled (turbo) request runs every step at 1.0, so loading ~5 GB of
+# second checkpoint up front is memory a turbo user never touches. It must not
+# be resident yet.
 grep -q "\[ideogram4\] unconditional_transformer:" "$TMP/server.log" \
-  && echo "PASS: [3b] the unconditional transformer loaded (asymmetric CFG)" \
-  || fail "[3b] no unconditional transformer load line — CFG would be one-sided"
+  && fail "[3b] the unconditional transformer loaded at model load — it is lazy" \
+  || echo "PASS: [3b] the unconditional transformer waits for a guided render"
 grep -q "text encoder: .*taps=13" "$TMP/server.log" \
   && echo "PASS: [3c] the text encoder taps 13 layers" \
   || fail "[3c] text encoder did not report 13 taps"
@@ -93,6 +97,25 @@ MODEL_ID=$(basename "$IDEO")
 
 # ── 4. Generate. A hand-written caption so the rewriter is not in the loop.
 CAPTION='{"high_level_description":"A red barn in a wheat field.","compositional_deconstruction":{"background":"a wheat field under a blue sky","elements":[{"type":"obj","bbox":[200,150,850,900],"desc":"a red wooden barn"}]}}'
+
+# ── 4b. CFG off, and it runs FIRST: [4] below renders at the default
+#        guidance, which is what pulls the second checkpoint in. guidance_scale
+#        1.0 weights the negative branch by exactly zero, so the second forward
+#        is skipped and the checkpoint is never loaded — the mechanism the turbo
+#        adapter rides on, and only observable before anything guided has run.
+req() { python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"prompt":sys.argv[2],"size":sys.argv[3],"steps":int(sys.argv[4]),"seed":7,"magic_prompt":False,"guidance_scale":float(sys.argv[5])}))' "$@"; }
+req "$MODEL_ID" "$CAPTION" 512x512 8 1.0 > "$TMP/cfgoff.json"
+api /v1/images/generations -H 'Content-Type: application/json' --data-binary @"$TMP/cfgoff.json" > "$TMP/cfgoff_resp.json"
+python3 -c "import json,sys; d=json.load(open('$TMP/cfgoff_resp.json')); sys.exit(0 if 'data' in d else 1)" \
+  && echo "PASS: [4b] a guidance-1.0 render returns an image" \
+  || fail "[4b] guidance_scale 1.0 did not render: $(head -c 200 "$TMP/cfgoff_resp.json")"
+grep -q "guidance 1.0: CFG off" "$TMP/server.log" \
+  && echo "PASS: [4b] and it logged the skipped branch" \
+  || fail "[4b] no 'CFG off' line — the negative forward still ran"
+grep -q "\[ideogram4\] unconditional_transformer:" "$TMP/server.log" \
+  && fail "[4b] a CFG-off render loaded the unconditional checkpoint anyway" \
+  || echo "PASS: [4b] and the unconditional checkpoint stayed off the GPU"
+
 python3 - "$CAPTION" > "$TMP/gen.json" <<'PY'
 import json,sys
 print(json.dumps({"model": sys.argv[2] if len(sys.argv)>2 else None}))
@@ -121,6 +144,15 @@ PY
 [ $? -eq 0 ] || FAILED=1
 grep -q "magic prompt skipped" "$TMP/server.log" && echo "PASS: [4a] magic_prompt:false was honoured" || true
 
+# ── 4c. A GUIDED render is what pulls it in — once, and then it is kept.
+req "$MODEL_ID" "$CAPTION" 512x512 8 7.0 > "$TMP/guided.json"
+api /v1/images/generations -H 'Content-Type: application/json' --data-binary @"$TMP/guided.json" > "$TMP/guided_resp.json"
+api /v1/images/generations -H 'Content-Type: application/json' --data-binary @"$TMP/guided.json" > /dev/null
+LOADS=$(grep -c "\[ideogram4\] unconditional_transformer:" "$TMP/server.log")
+[ "$LOADS" = "1" ] \
+  && echo "PASS: [4c] a guided render loads the unconditional checkpoint exactly once" \
+  || fail "[4c] the unconditional checkpoint loaded $LOADS times across two guided renders"
+
 # ── 5. Magic prompt: a bare sentence is rewritten before conditioning.
 if [ -n "$CHAT" ]; then
   api /v1/load-model -H 'Content-Type: application/json' -d "{\"model\":\"$CHAT\"}" >/dev/null
@@ -139,6 +171,16 @@ if [ -n "$CHAT" ]; then
   else
     fail "[5] no magic-prompt line in the log at all"
   fi
+  # The caption contract is a JSON schema this server can enforce token by
+  # token, so the rewrite is masked: a fence, a preamble or a dropped closer is
+  # unreachable rather than repaired afterwards.
+  grep -q "\[grammar\] enforcing JSON schema" "$TMP/server.log" \
+    && echo "PASS: [5d] the rewrite decoded under the caption schema mask" \
+    || fail "[5d] no grammar mask on the rewrite — the caption was free-form"
+  grep -q "rewriter output is not JSON" "$TMP/server.log" \
+    && fail "[5d] a masked rewrite still returned non-JSON" \
+    || echo "PASS: [5d] and every masked rewrite parsed"
+
   # The rewriter model was just loaded by name, so "unavailable" here is a
   # RESOLUTION bug, not the design's non-fatal tolerance.
   grep -q "rewriter model unavailable" "$TMP/server.log" \
@@ -200,7 +242,43 @@ else
 fi
 kill -0 $SRV 2>/dev/null && echo "PASS: [6a] the server survived it" || fail "[6a] the server died on a bad LoRA path"
 
-# ── 7. Unload frees both transformers.
+# ── 6b. Turbo: the adapter is resolved INSIDE the pack, under the same name
+#        H3's is. Absent, it is a named 400 that says where to put it — never
+#        a silent full-guidance render at the turbo step count.
+if [ -f "$IDEO/turbo_lora.safetensors" ]; then
+  python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"prompt":sys.argv[2],"size":"512x512","seed":7,"magic_prompt":False,"turbo":True}))' "$MODEL_ID" "$CAPTION" > "$TMP/turbo_req.json"
+  api /v1/images/generations -H 'Content-Type: application/json' --data-binary @"$TMP/turbo_req.json" > "$TMP/turbo.json"
+  python3 -c "import json,sys; d=json.load(open('$TMP/turbo.json')); sys.exit(0 if 'data' in d else 1)" \
+    && echo "PASS: [6b] a turbo render returns an image" \
+    || fail "[6b] turbo did not render: $(head -c 200 "$TMP/turbo.json")"
+  grep -q "steps=8 turbo=true guidance=1.0" "$TMP/server.log" \
+    && echo "PASS: [6b] turbo took the 8-step default at guidance 1.0" \
+    || fail "[6b] turbo did not pin steps/guidance: $(grep -m1 'turbo=' "$TMP/server.log")"
+  grep -q "turbo included" "$TMP/server.log" \
+    && echo "PASS: [6b] and the adapter attached" \
+    || fail "[6b] the turbo adapter did not attach"
+else
+  CODE=$(curl -s -o "$TMP/turbo.json" -w '%{http_code}' -m 60 \
+    -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"turbo\":true}")
+  if [ "$CODE" = "400" ] && grep -q "turbo_lora.safetensors" "$TMP/turbo.json"; then
+    echo "PASS: [6b] turbo without the adapter is a 400 naming the file"
+  else
+    fail "[6b] expected a named 400 for a missing turbo adapter, got $CODE: $(head -c 200 "$TMP/turbo.json")"
+  fi
+fi
+
+# 6c. Turbo and a real guidance are two different models — named, not resolved.
+CODE=$(curl -s -o "$TMP/conflict.json" -w '%{http_code}' -m 60 \
+  -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"turbo\":true,\"guidance_scale\":7.0}")
+if [ "$CODE" = "400" ] && grep -qi "guidance" "$TMP/conflict.json"; then
+  echo "PASS: [6c] turbo + guidance_scale 7 is a named 400"
+else
+  fail "[6c] expected a named 400 for turbo+guidance, got $CODE: $(head -c 200 "$TMP/conflict.json")"
+fi
+
+# ── 7. Unload frees whatever is resident — one transformer or two.
 api /v1/unload-model -H 'Content-Type: application/json' -d "{\"model\":\"$MODEL_ID\"}" > "$TMP/unload.json"
 grep -q '"state":"unloaded"' "$TMP/unload.json" \
   && echo "PASS: [7] unloaded" \

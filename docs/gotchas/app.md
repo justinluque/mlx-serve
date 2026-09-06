@@ -733,3 +733,34 @@ Things found on the way:
 - Tool cards rendered the engine's `**name**(k: v…)` summary string (values cut at 80 chars) and could never show more than it had thrown away. Cards read `SerializedToolCall` from the message before the summary; results pair by index.
 - `bg1` is reassigned on every launch and the registry knows only the name, so a week-old card asking "is bg1 alive?" was told yes about today's process and offered to kill it. Ownership = last announcement in the transcript, and `isAlive(handle:sessionId:)` scopes it to the chat.
 - The first draft bound Compact mode to ⌃C. Menu key equivalents run before `keyDown`, and SwiftTerm handles Control only in `keyDown`, so ⌃C in an embedded sandbox terminal would have toggled the setting instead of sending SIGINT. Interface shortcuts carry ⌘ (⌘⌥1/2/3, ⌘⌥C).
+
+## The Ideogram Turbo adapter is somebody else's file (2026-09-06)
+
+H3's Turbo adapter ships in the pack's own mirror, under the name the server
+reads, so `startTurboLora(repoId:)` could take one repo id and mean three
+things at once: where the file comes from, where it goes, and what it is
+called. Ideogram 4's adapter is ostris' `ideogram_4_turbotime_lora` — a
+separate repo, a separate filename (`ideogram_4_turbotime_v1.safetensors`),
+landing in a pack we publish. Collapsing those onto one id has three distinct
+failure modes, and from the pane all three look identical (Turbo keeps
+offering to download):
+
+- pull from the pack's repo, which has no adapter;
+- write into the SOURCE's layout dir, which is the fragment-dir failure that
+  killed the server in 2026-08 wearing a different hat;
+- land under the publisher's filename, which the server never looks for — and
+  which `modelDiskBytes` then bills as pack weight.
+
+So `TurboLoraFetch.Source` is a (repo, remote filename, size) triple, `fileName`
+stays the ONE name the server resolves, and `startPackFile` grew
+`packRepoId`/`saveAs`. The in-flight task keys on the PACK rather than the
+source: panes ask "is my model fetching?" with their own repo id, and two
+Ideogram packs sharing one upstream adapter must not attach to a transfer
+landing in the other one's directory.
+
+The toggle sells memory, not just speed. Turbo pins `guidance_scale` to 1.0
+server-side, which is exactly where the unconditional 9.3B checkpoint is
+neither forwarded nor loaded — about 4.2 GB less resident on the mixed_3_8
+pack, on top of 20 steps becoming 8. That is worth saying in the help text: a
+user reading "distilled sampling" reasons about time, and the reason this
+toggle can make a pack fit at all is residency.

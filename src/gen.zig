@@ -297,6 +297,14 @@ const PAD_TOKEN_FLUX: i32 = 151643; // Qwen2/3 pad token
 const FLUX_SEQ_LEN: usize = 512; // mflux Qwen3 tokenizer max_length
 
 /// FLUX.2 image backend internals (the original `ImageEngine` body verbatim).
+/// The pack subfolder holding Ideogram's SECOND 9.3B checkpoint (asymmetric
+/// CFG). One spelling here: it is both a load path and the residency term
+/// `estimatePeakResidentBytesIn` subtracts, and those two drifting apart is
+/// how a pack passes the gate and then cannot render. Discovery names the same
+/// folder in its completeness marker (`model_discovery.requiredMediaMarker`),
+/// which a test pins to this constant.
+pub const IDEOGRAM_UNCOND_DIR = "unconditional_transformer";
+
 /// Holds the three sub-models + tokenizer; owned by the `ImageBackend` union.
 /// Ideogram 4: two 9.3B transformers (asymmetric CFG), a 13-tap Qwen3-VL-8B
 /// encoder, and the Flux2 KL autoencoder. Residency is the defining constraint
@@ -308,7 +316,12 @@ const Ideogram4Impl = struct {
     s: mlx.mlx_stream,
     te: ?flux.TextEncoder,
     cond: ideogram4.Transformer,
-    uncond: ideogram4.Transformer,
+    /// The unconditional 9.3B checkpoint — LAZY. It is only ever read at
+    /// guidance != 1.0, and a CFG-distilled (Turbo) request runs every step at
+    /// 1.0, so loading it up front would hold ~5 GB that such a request never
+    /// touches. Loaded on the first render that actually needs it, on the
+    /// inference thread, and then kept.
+    uncond: ?ideogram4.Transformer,
     vae: flux.Vae,
     /// The Flux2 autoencoder ships BOTH halves and Ideogram publishes both, so
     /// img2img is available — but a pack converted without the encoder half
@@ -354,8 +367,8 @@ const Ideogram4Impl = struct {
         errdefer if (self.te) |*t| t.deinit();
         self.cond = try ideogram4.loadTransformer(io, allocator, self.s, model_dir, "transformer");
         errdefer self.cond.deinit();
-        self.uncond = try ideogram4.loadTransformer(io, allocator, self.s, model_dir, "unconditional_transformer");
-        errdefer self.uncond.deinit();
+        self.uncond = null;
+        errdefer if (self.uncond) |*u| u.deinit();
         self.vae = try flux.loadVae(io, allocator, self.s, model_dir);
         errdefer self.vae.deinit();
         self.vae_enc = flux.loadVaeEncoder(io, allocator, self.s, model_dir) catch |e| blk: {
@@ -366,8 +379,28 @@ const Ideogram4Impl = struct {
         const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{model_dir});
         defer allocator.free(tok_dir);
         self.tok = try tok_mod.loadTokenizerAny(io, allocator, tok_dir);
-        log.info("[image] Ideogram 4 ready (cond + uncond transformers, Flux2 VAE)\n", .{});
+        log.info("[image] Ideogram 4 ready (conditional transformer + Flux2 VAE; the unconditional branch loads on the first guided render)\n", .{});
         return self;
+    }
+
+    /// Bring the unconditional checkpoint in. Called only from the render path
+    /// and only when `ideogram4.usesCfg` said the run reads it.
+    fn ensureUncond(self: *Ideogram4Impl) !*ideogram4.Transformer {
+        if (self.uncond) |*u| return u;
+        // A deferred stage prices itself where it ALLOCATES: the load gate
+        // billed what loading actually took, so this checkpoint's ~4 GB is
+        // this request's to justify. Refused by NAME with the fix in it — on a
+        // machine that cannot hold both branches, a guided render is one
+        // field away from being a turbo render that fits.
+        const need = uncondDiskBytes(self.io, self.model_dir);
+        const avail = metrics.getAvailableMemBytes();
+        if (need != 0 and avail != 0 and avail < deferredStageRequirementBytes(need)) {
+            log.err("[image] Ideogram 4: a guided render needs {d} MB for the unconditional transformer (weights {d} MB + warmup headroom) and {d} MB is available\n", .{ deferredStageRequirementBytes(need) >> 20, need >> 20, avail >> 20 });
+            return error.UnconditionalWontFit;
+        }
+        log.info("[image] Ideogram 4: loading the unconditional transformer (guided render)\n", .{});
+        self.uncond = try ideogram4.loadTransformer(self.io, self.allocator, self.s, self.model_dir, IDEOGRAM_UNCOND_DIR);
+        return &self.uncond.?;
     }
 
     fn loadTe(io: std.Io, allocator: std.mem.Allocator, s: mlx.mlx_stream, model_dir: []const u8) !flux.TextEncoder {
@@ -377,6 +410,16 @@ const Ideogram4Impl = struct {
             .rope_theta = 5_000_000.0,
             .tag = "ideogram4",
         });
+    }
+
+    /// On-disk bytes of the unconditional checkpoint — the deferred stage's
+    /// bill, and the term `estimatePeakResidentBytesIn` subtracts so the two
+    /// answers cannot drift apart.
+    fn uncondDiskBytes(io: std.Io, model_dir: []const u8) u64 {
+        if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+        var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
+        defer dir.close(io);
+        return subdirSafetensorsBytes(io, dir, IDEOGRAM_UNCOND_DIR);
     }
 
     /// Pull `chat_prefix`/`chat_suffix` out of the pack's config.json. Absent
@@ -404,7 +447,7 @@ const Ideogram4Impl = struct {
     fn deinit(self: *Ideogram4Impl) void {
         if (self.te) |*t| t.deinit();
         self.cond.deinit();
-        self.uncond.deinit();
+        if (self.uncond) |*u| u.deinit();
         self.vae.deinit();
         if (self.vae_enc) |*e| e.deinit();
         self.tok.deinit();
@@ -440,6 +483,13 @@ const Ideogram4Impl = struct {
         }
 
         var opts = ideogram4.GenOpts{ .steps = steps };
+        // `guidance_scale` 1.0 means "the weights already carry the guidance"
+        // — a CFG-distilled adapter (the Turbo LoRA) — and takes the polish
+        // tail with it, since a guided tail would pull the second checkpoint
+        // back in for two steps and undo the point. Above 1.0 the tail keeps
+        // the reference's 3.0 polish, capped by the request so it can never
+        // exceed the bulk.
+        if (gen_opts.guidance) |g| ideogram4.applyGuidance(&opts, g);
         // img2img: VAE-encode the (already target-sized) source to its latent
         // MEAN. `ideogram4.generateFromCond` owns the patchify and the
         // normalization — both differ from FLUX's on the same autoencoder.
@@ -461,7 +511,9 @@ const Ideogram4Impl = struct {
             defer t.deinit();
             break :blk try ideogram4.encodePrompt(&t, ids, mask);
         };
-        return ideogram4.generateFromCond(&self.cond, &self.uncond, &self.vae, cond_enc, ids.len, seed, height, width, opts, progress);
+        // The unconditional checkpoint is loaded only if this run reads it.
+        const uncond: ?*ideogram4.Transformer = if (ideogram4.usesCfg(opts)) try self.ensureUncond() else null;
+        return ideogram4.generateFromCond(&self.cond, uncond, &self.vae, cond_enc, ids.len, seed, height, width, opts, progress);
     }
 };
 
@@ -782,6 +834,10 @@ pub const ImageGenOpts = struct {
     /// vision tower, so it resizes from the source bytes. Primary first. Empty =
     /// not a MageFlow edit.
     edit_image_bytes: []const []const u8 = &.{},
+    /// Classifier-free guidance weight (Ideogram 4). Null = the backend's own
+    /// schedule. 1.0 = no CFG: the unconditional branch is never forwarded and
+    /// never loaded, which is what a CFG-distilled adapter wants.
+    guidance: ?f32 = null,
     /// Conditioning rebalance: global gain × per-tapped-layer weights
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
@@ -885,6 +941,49 @@ pub const ImageEngine = struct {
     /// model-id string.
     pub fn wantsStructuredCaption(self: *const ImageEngine) bool {
         return self.backend == .ideogram4;
+    }
+
+    /// The name a CFG-distilled adapter is resolved under inside a pack, and
+    /// the ONE constant that spelling lives in. Same convention (and same
+    /// filename) as MiniMax-H3's Turbo LoRA: neither adapter ships with its
+    /// model, so both are dropped beside the weights the pack already has.
+    pub const turbo_lora_file = "turbo_lora.safetensors";
+
+    /// True when `guidance_scale` reaches the sampler. Ideogram 4 alone runs a
+    /// classifier-free pair (its negative branch is a whole second
+    /// checkpoint); the rest are distilled and would drop the field silently.
+    pub fn honorsGuidanceScale(self: *const ImageEngine) bool {
+        return self.backend == .ideogram4;
+    }
+
+    /// True when `turbo` means anything for this backend. Krea-2-Turbo,
+    /// MageFlow Turbo and FLUX.2 klein are distilled CHECKPOINTS — there is no
+    /// adapter to attach and no second branch to skip — so the flag is
+    /// Ideogram 4's alone, and every other backend answers a named 400 rather
+    /// than silently ignoring it.
+    pub fn supportsTurbo(self: *const ImageEngine) bool {
+        return self.backend == .ideogram4;
+    }
+
+    /// The pack's Turbo adapter path, or null when it is not on disk (caller
+    /// frees). Probed per request, never cached at load: the file can land in
+    /// the folder while the server is up, and a stale "no" would 400 a
+    /// capability that exists.
+    pub fn turboLoraPath(self: *const ImageEngine, a: std.mem.Allocator) ?[]u8 {
+        const dir, const io = switch (self.backend) {
+            .ideogram4 => |i| .{ i.model_dir, i.io },
+            else => return null,
+        };
+        const p = std.fs.path.join(a, &.{ dir, turbo_lora_file }) catch return null;
+        const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch {
+            a.free(p);
+            return null;
+        };
+        if (st.size == 0) {
+            a.free(p);
+            return null;
+        }
+        return p;
     }
 
     /// True when the edit backend consumes RAW reference bytes (`edit_image_bytes`)
@@ -2092,6 +2191,27 @@ fn ltxPadWithBos(allocator: std.mem.Allocator, enc: []const u32, bos: i32, pad_l
 // already resolved + refcounted by the connection thread.
 // ════════════════════════════════════════════════════════════════════════
 
+/// Steps + guidance for one image request. Pure, because the two fields
+/// constrain each other: `turbo` IS "the guidance is already in the weights",
+/// so it pins `guidance_scale` to 1.0 (where the unconditional branch is never
+/// forwarded and never loaded) and moves the step default to the 8 the adapter
+/// was distilled at. A request that asks for both turbo and a real guidance is
+/// asking for two different models — named, not silently resolved.
+fn imagePlan(turbo: bool, req_steps: ?u64, req_guidance: ?f64) error{ GuidanceOutOfRange, TurboGuidanceConflict }!struct { steps: u32, guidance: ?f32 } {
+    if (req_guidance) |g| {
+        if (!(g >= 1.0 and g <= 20.0)) return error.GuidanceOutOfRange;
+        if (turbo and g != 1.0) return error.TurboGuidanceConflict;
+    }
+    return .{
+        // Every other image backend here is a few-step distilled checkpoint,
+        // hence the 4. Turbo's 8 is the adapter's own name
+        // (`ideogram_turbo_8_v1`) and the conservative end of its range — its
+        // model card claims usable images at 2 — never a floor.
+        .steps = @intCast(req_steps orelse (if (turbo) @as(u64, 8) else 4)),
+        .guidance = if (turbo) 1.0 else if (req_guidance) |g| @floatCast(g) else null,
+    };
+}
+
 /// POST /v1/images/generations — base64 PNG (or SSE progress + complete).
 pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *ImageEngine) !void {
     const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
@@ -2121,7 +2241,33 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 4);
+
+    // Turbo: the CFG-distilled adapter, resolved inside the pack under the
+    // same name H3's is (`turbo_lora.safetensors`) — neither ships with its
+    // model, so both are dropped beside the weights. It bakes the guidance
+    // into the conditional weights, which is why it forces `guidance_scale`
+    // to 1.0: at 1.0 the unconditional 9.3B checkpoint is neither forwarded
+    // nor loaded, and that halved denoise is most of what Turbo buys.
+    const turbo = sse.bodyWantsTrue(body, "turbo");
+    if (turbo and !engine.supportsTurbo())
+        return sendError(conn, 400, "'turbo' is an Ideogram 4 field — this backend's checkpoint is already distilled, so there is no adapter to attach");
+    const turbo_lora: ?[]u8 = if (turbo) engine.turboLoraPath(allocator) else null;
+    defer if (turbo_lora) |p| allocator.free(p);
+    if (turbo and turbo_lora == null)
+        return sendError(conn, 400, "this pack has no " ++ ImageEngine.turbo_lora_file ++ " — download ideogram_4_turbotime_v1.safetensors from hf.co/ostris/ideogram_4_turbotime_lora into the model folder under that name");
+    // Classifier-free guidance. Ideogram 4 is the only backend here that runs
+    // a real CFG pair (its negative branch is a SECOND checkpoint), so it is
+    // the only one that can honor the field — everywhere else it would be a
+    // silently-dropped knob.
+    const req_guidance = extractJsonFloat(body, "guidance_scale");
+    if (req_guidance != null and !engine.honorsGuidanceScale())
+        return sendError(conn, 400, "'guidance_scale' applies to Ideogram 4 — the other image backends are distilled and run no guidance pair");
+    const plan = imagePlan(turbo, extractJsonInt(body, "steps"), req_guidance) catch |err| switch (err) {
+        error.GuidanceOutOfRange => return sendError(conn, 400, "'guidance_scale' must be in [1,20]"),
+        error.TurboGuidanceConflict => return sendError(conn, 400, "'turbo' bakes the guidance into the weights and runs at guidance_scale 1.0 — drop one of the two"),
+    };
+    const steps = plan.steps;
+    const guidance = plan.guidance;
 
     // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
@@ -2302,21 +2448,38 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         };
         defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
 
+        // Turbo takes the FIRST slot, matching H3's stack, and leaves the
+        // request's own style adapters in their given order behind it. It is
+        // one of the eight, so a full stack plus turbo is a named 400 rather
+        // than a silently dropped adapter.
         var lora_paths: [lora_mod.MAX_LORAS][]const u8 = undefined;
-        for (lora_path_bufs[0..lora_n], 0..) |p, i| lora_paths[i] = p;
-        const matched = engine.setLoras(lora_paths[0..lora_n], lora_scales[0..lora_n]) catch |err| switch (err) {
+        var scales: [lora_mod.MAX_LORAS]f32 = undefined;
+        var n: usize = 0;
+        if (turbo_lora) |tp| {
+            if (lora_n >= lora_mod.MAX_LORAS)
+                return sendError(conn, 400, "too many LoRA adapters (max 8, and 'turbo' takes one of the slots)");
+            lora_paths[0] = tp;
+            scales[0] = 1.0;
+            n = 1;
+        }
+        for (lora_path_bufs[0..lora_n], lora_scales[0..lora_n]) |p, sc| {
+            lora_paths[n] = p;
+            scales[n] = sc;
+            n += 1;
+        }
+        const matched = engine.setLoras(lora_paths[0..n], scales[0..n]) catch |err| switch (err) {
             error.LoraNoMatch => return sendError(conn, 400, "LoRA(s) have no modules matching this model's DiT — wrong LoRA for this architecture?"),
             error.BadLoraPath => return sendError(conn, 400, "'lora_path'/'lora_paths' must be absolute path(s) to .safetensors file(s)"),
             error.TooManyLoras => return sendError(conn, 400, "too many LoRA adapters requested"),
             error.OutOfMemory => return err,
             else => return sendError(conn, 400, "failed to load a LoRA file"),
         };
-        if (lora_n > 0)
-            log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, lora_n });
+        if (n > 0)
+            log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s){s}\n", .{ matched, n, if (turbo_lora != null) " (turbo included)" else "" });
     }
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[image] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
+    log.info("[image] generating {d}x{d} steps={d} turbo={} guidance={?d:.1} stream={}: {d} chars\n", .{ width, height, steps, turbo, guidance, want_stream, prompt.len });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
@@ -2334,6 +2497,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     const gen_opts = ImageGenOpts{
         .init_image = init_img, // null in edit mode
         .strength = strength,
+        .guidance = guidance,
         .edit_images = edit_imgs[0..edit_imgs_n],
         .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
@@ -2345,6 +2509,14 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         if (err == error.Cancelled) {
             log.info("[image] generation cancelled — client disconnected\n", .{});
             return;
+        }
+        if (err == error.UnconditionalWontFit) {
+            const msg = "guided rendering needs Ideogram's second (unconditional) 9.3B checkpoint and there is not enough free memory for it — retry with \"turbo\":true or \"guidance_scale\":1.0, which skip that branch entirely, or free memory";
+            if (want_stream) {
+                sse.sendError(conn, msg);
+                return;
+            }
+            return sendError(conn, 503, msg);
         }
         log.err("[image] generation failed: {}\n", .{err});
         if (want_stream) {
@@ -4289,6 +4461,17 @@ pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []co
         if (sum == 0) return 0; // unknown dir -> never block
         return sum + MUSIC3_GEN_BUFFER_BYTES;
     }
+    if (std.mem.eql(u8, model_type, "ideogram4")) {
+        // The unconditional 9.3B checkpoint is a DEFERRED stage, not part of
+        // the load: `Ideogram4Impl.ensureUncond` brings it in on the first
+        // GUIDED render, and a CFG-distilled (turbo) request never asks for
+        // it at all. Billing it here refuses, on a 24 GB Mac, exactly the
+        // configuration that fits — so the gate bills what load allocates and
+        // the deferred stage prices itself against free memory when it runs.
+        const sum = sumSafetensorsIn(io, dir);
+        if (sum == 0) return 0; // unknown dir -> never block
+        return sum -| subdirSafetensorsBytes(io, dir, IDEOGRAM_UNCOND_DIR);
+    }
     if (std.mem.eql(u8, model_type, "AudioVideo")) {
         // Both variants ship; only one is ever loaded. Subtract the smaller so
         // an asymmetric future pack still bills its larger one.
@@ -4299,6 +4482,27 @@ pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []co
         return ltxPeakBytes(sumSafetensorsIn(io, dir), spare, 0);
     }
     return sumSafetensorsIn(io, dir);
+}
+
+/// What a DEFERRED stage must find free before it allocates.
+///
+/// Deliberately the SAME shape as the load gate's
+/// `scheduler.loadRequirementBytes`: a stage that arrives on the first request
+/// instead of at load does not get a cheaper bar than the identical bytes
+/// would have been held to at load time — that would just move an OOM from a
+/// clean refusal into the middle of a denoise. A drift test in `scheduler.zig`
+/// (which can see both) pins the two together.
+pub fn deferredStageRequirementBytes(weights_bytes: u64) u64 {
+    const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
+    const headroom: u64 = @min(weights_bytes / 8, HEADROOM_CAP) + 1024 * 1024 * 1024;
+    return weights_bytes +| headroom;
+}
+
+/// Sum of the `.safetensors` under ONE subdirectory of `dir` (0 when absent).
+fn subdirSafetensorsBytes(io: std.Io, dir: std.Io.Dir, name: []const u8) u64 {
+    var sub = dir.openDir(io, name, .{ .iterate = true }) catch return 0;
+    defer sub.close(io);
+    return sumSafetensorsIn(io, sub);
 }
 
 /// Sum of the `.safetensors` under an absolute path, or 0 if it is not
@@ -6088,4 +6292,72 @@ test "the caption is streamed before the first denoise step, not with the image"
 
     // No rewrite = no event at all.
     try std.testing.expect(try revisedPromptEvent(a, null) == null);
+}
+
+test "turbo pins guidance to 1.0, moves the step default, and refuses the contradiction" {
+    // guidance 1.0 is the whole mechanism: it is where `ideogram4.usesCfg` is
+    // false, so the unconditional 9.3B checkpoint is never forwarded and
+    // `Ideogram4Impl.ensureUncond` is never reached.
+    const t = try imagePlan(true, null, null);
+    try std.testing.expectEqual(@as(u32, 8), t.steps);
+    try std.testing.expectEqual(@as(f32, 1.0), t.guidance.?);
+    try std.testing.expect(!ideogram4.usesCfg(.{ .guidance = t.guidance.?, .guidance_cleanup = t.guidance.? }));
+
+    // An explicit step count still wins — turbo only moves the DEFAULT.
+    try std.testing.expectEqual(@as(u32, 12), (try imagePlan(true, 12, null)).steps);
+    // Redundant but consistent: turbo + the value turbo would have set.
+    try std.testing.expectEqual(@as(f32, 1.0), (try imagePlan(true, null, 1.0)).guidance.?);
+
+    // Without turbo, guidance is the request's or the backend's own schedule.
+    const off = try imagePlan(false, null, null);
+    try std.testing.expectEqual(@as(u32, 4), off.steps);
+    try std.testing.expect(off.guidance == null);
+    try std.testing.expectEqual(@as(f32, 7.0), (try imagePlan(false, null, 7.0)).guidance.?);
+
+    try std.testing.expectError(error.TurboGuidanceConflict, imagePlan(true, null, 7.0));
+    try std.testing.expectError(error.GuidanceOutOfRange, imagePlan(false, null, 0.0));
+    try std.testing.expectError(error.GuidanceOutOfRange, imagePlan(false, null, 20.5));
+}
+
+test "a request-set guidance never leaves the polish tail guided above it" {
+    // The tail runs at `guidance_cleanup`, which defaults to 3.0. At
+    // guidance 1.0 an unclamped tail would pull the unconditional checkpoint
+    // back in for the last two steps — loading 9.3B of weights to undo
+    // exactly the thing the request asked for.
+    for ([_]f32{ 1.0, 2.0, 7.0 }) |g| {
+        var opts = ideogram4.GenOpts{ .steps = 8 };
+        ideogram4.applyGuidance(&opts, g);
+        try std.testing.expect(opts.guidance_cleanup <= opts.guidance);
+        try std.testing.expectEqual(g == 1.0, !ideogram4.usesCfg(opts));
+    }
+}
+
+test "the unconditional checkpoint is a deferred stage: not billed at load, priced where it loads" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // A pack shaped like the real one: the conditional transformer, and the
+    // second 9.3B checkpoint in its own folder.
+    const cond: [4096]u8 = @splat('x');
+    const uncond: [2048]u8 = @splat('x');
+    try tmp.dir.createDirPath(io, "transformer");
+    try tmp.dir.createDirPath(io, IDEOGRAM_UNCOND_DIR);
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer/model.safetensors", .data = &cond });
+    try tmp.dir.writeFile(io, .{ .sub_path = IDEOGRAM_UNCOND_DIR ++ "/model.safetensors", .data = &uncond });
+
+    // The load gate bills what LOAD allocates. Billing the deferred branch
+    // here refuses, on a machine that can hold one checkpoint, exactly the
+    // turbo configuration that never touches the second one.
+    const billed = estimatePeakResidentBytesIn(io, tmp.dir, "ideogram4");
+    try std.testing.expectEqual(@as(u64, cond.len), billed);
+    // Every other media type still bills its whole directory.
+    try std.testing.expectEqual(@as(u64, cond.len + uncond.len), estimatePeakResidentBytesIn(io, tmp.dir, "flux2"));
+    // And the subtracted term is the same one `ensureUncond` prices itself by.
+    try std.testing.expectEqual(@as(u64, uncond.len), subdirSafetensorsBytes(io, tmp.dir, IDEOGRAM_UNCOND_DIR));
+
+    // Discovery's completeness marker names the same folder — a rename that
+    // touched one spelling and not the other would leave the residency term
+    // silently zero.
+    try std.testing.expect(std.mem.startsWith(u8, discovery.requiredMediaMarker("ideogram4").?, IDEOGRAM_UNCOND_DIR ++ "/"));
 }

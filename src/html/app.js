@@ -325,7 +325,7 @@
   var REQUEST_FIELDS = [
     'Request fields (JSON bodies unless noted):',
     'POST /v1/chat/completions — model, messages[{role,content}], stream, max_tokens, temperature, top_p, top_k, tools, tool_choice, response_format, reasoning_effort or enable_thinking, stream_options.include_usage.',
-    'POST /v1/images/generations — model, prompt, size ("1024x1024"), steps, seed, stream; mode:"edit"|"variation" with image (base64) and ref_images[] for editing; returns {data:[{b64_json}]}.',
+    'POST /v1/images/generations — model, prompt, size ("1024x1024"), steps, seed, stream; mode:"edit"|"variation" with image (base64) and ref_images[] for editing; lora_paths/lora_scales; Ideogram 4: turbo (pack-local turbo_lora.safetensors), guidance_scale, magic_prompt, magic_prompt_model; returns {data:[{b64_json}]}.',
     'POST /v1/images/edits — multipart/form-data, NOT JSON. Accepted fields: model, prompt, image[] (repeat the field once per reference file), size. REJECTED with a 400, never list these as options: mask (the editors are maskless), n greater than 1, response_format "url", any output_format other than png, stream.',
     'POST /v1/audio/speech — model, input, optional ref_audio (base64 WAV) to clone a voice, stream; returns audio/wav bytes.',
     'POST /v1/audio/music-generations — model, prompt (style/genre/mood, required), lyrics, duration_seconds (10-600), vocal_language, bpm, seed, stream; returns audio/wav bytes.',

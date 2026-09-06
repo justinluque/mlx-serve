@@ -6643,6 +6643,42 @@ fn magicPromptRewrite(
     var mrope_pos = local_mrope.pos;
     defer if (mrope_pos) |p| allocator.free(p);
 
+    // Grammar-constrained decoding. The output contract is ONE JSON object
+    // against a schema this server can already enforce token by token, so the
+    // rewriter's whole failure class — a fence, a preamble, a refusal
+    // sentence, a caption cut a closer short — is made unreachable instead of
+    // caught afterwards. The repair + verify pass below stays: the mask
+    // guarantees structure, never that the model finished inside its budget.
+    var sc: generate_mod.SchemaConstraint = undefined;
+    var sc_init = false;
+    defer if (sc_init) sc.deinit();
+    var sampling = generate_mod.SamplingParams{ .temperature = 1.0, .top_p = 0.95 };
+    if (ideogram_prompt.captionSchemaValue(allocator)) |schema_parsed| {
+        defer schema_parsed.deinit();
+        // The token→bytes table is per-MODEL and cached on it; a rewriter this
+        // server has never masked for pays for it once.
+        if (lm.grammarTokenBytes(allocator, io)) |tb| {
+            if (sc.initFromValue(allocator, schema_parsed.value, tb)) {
+                sc_init = true;
+                sampling.constraint = &sc.constraint;
+                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+            } else |err| {
+                log.warn("[ideogram4] magic prompt: caption schema would not compile ({s}); rewriting unconstrained\n", .{@errorName(err)});
+            }
+        } else |err| {
+            log.warn("[ideogram4] magic prompt: no token table for '{s}' ({s}); rewriting unconstrained\n", .{ resolved_id, @errorName(err) });
+        }
+    } else |err| {
+        log.warn("[ideogram4] magic prompt: caption schema would not parse ({s}); rewriting unconstrained\n", .{@errorName(err)});
+    }
+    // A mask is a content-only contract, so it forces thinking off (#331).
+    // This rewrite has thinking off either way — the prompt file's [META]
+    // block says `thinking_mode: disabled`, and a reasoning preamble is what a
+    // fence-stripper cannot rescue — but the gate is consulted here like at
+    // every other mask site so the pairing scan stays honest.
+    var mp_enable_thinking = false;
+    if (schemaMasksThinking(sc_init, false)) mp_enable_thinking = false;
+
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| sch.complete(s);
     // Ownership of `vision_arr`/`local_mrope.pos` transfers to the slot the
@@ -6663,11 +6699,8 @@ fn magicPromptRewrite(
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
-        .sampling = .{ .temperature = 1.0, .top_p = 0.95 },
-        // `thinking_mode: disabled` in the prompt file's [META] block: the
-        // output contract is ONE minified JSON object, and a reasoning
-        // preamble is what a fence-stripper cannot rescue.
-        .enable_thinking = false,
+        .sampling = sampling,
+        .enable_thinking = mp_enable_thinking,
         .eos_token_ids = config.eosTokenSlice(),
         .max_tokens = MAGIC_PROMPT_MAX_TOKENS,
         .timeout_ns = getTimeoutNs(),

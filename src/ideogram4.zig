@@ -312,6 +312,37 @@ pub const SamplerParameters = struct {
     }
 };
 
+/// Apply a request's `guidance_scale` to the sampler options.
+///
+/// The polish tail is CAPPED by the bulk rather than left at the preset's 3.0:
+/// at guidance 1.0 an unclamped tail would pull the unconditional checkpoint
+/// back in for the last steps — loading 9.3B of weights to undo exactly what
+/// the request asked for. Above 1.0 the cap is inert and the reference's
+/// 7.0/3.0 schedule stands.
+pub fn applyGuidance(opts: *GenOpts, g: f32) void {
+    opts.guidance = g;
+    opts.guidance_cleanup = @min(g, opts.guidance_cleanup);
+}
+
+/// Whether a run needs the unconditional branch at all.
+///
+/// CFG blends `pos·gw + neg·(1−gw)`, so a step at gw == 1.0 multiplies the
+/// negative velocity by EXACTLY zero — the second 9.3B forward is dead weight,
+/// not a small contribution. That is the whole shape of a CFG-distilled
+/// adapter (the Turbo LoRA bakes the guidance into the conditional weights and
+/// is run at gw 1.0), and it is what lets `unconditional_transformer/` stay
+/// off the GPU entirely for those requests.
+///
+/// Asked of the OPTIONS, not of the loop: img2img shortens the loop, and a
+/// decision that changed with `strength` would mean loading a checkpoint in
+/// the middle of a denoise.
+pub fn usesCfg(opts: GenOpts) bool {
+    if (opts.guidance != 1.0) return true;
+    // An explicit zero-length polish tail never reads `guidance_cleanup`.
+    if (opts.cleanup_steps) |c| if (c == 0) return false;
+    return opts.guidance_cleanup != 1.0;
+}
+
 /// Inverse standard-normal CDF (Acklam's rational approximation). Relative
 /// error stays under ~1.15e-9 across the open interval, which is four orders
 /// tighter than anything a 12–48-step noise schedule can resolve; the
@@ -986,12 +1017,13 @@ pub fn encodePrompt(te: *flux.TextEncoder, ids: []const i32, mask: []const i32) 
     return enc;
 }
 
-/// The full pipeline: encode → denoise (cond + uncond per step) → VAE decode.
+/// The full pipeline: encode → denoise (cond, plus uncond per step whenever
+/// the step's guidance is not 1.0) → VAE decode.
 /// Returns [1,3,H,W] f32 in [0,1], matching every other image backend.
 pub fn generate(
     te: *flux.TextEncoder,
     cond: *Transformer,
-    uncond: *Transformer,
+    uncond: ?*Transformer,
     vae: *flux.Vae,
     ids: []const i32,
     mask: []const i32,
@@ -1012,7 +1044,11 @@ pub fn generate(
 /// never be re-derived from the array alone.
 pub fn generateFromCond(
     cond: *Transformer,
-    uncond: *Transformer,
+    /// The unconditional checkpoint, or null when the caller resolved
+    /// `usesCfg(opts)` false and never loaded it. A step that then asks for
+    /// gw != 1.0 is `error.UnconditionalRequired`, never a silent CFG-off
+    /// render.
+    uncond: ?*Transformer,
     vae: *flux.Vae,
     enc_owned: mlx.mlx_array,
     n_text: usize,
@@ -1042,6 +1078,10 @@ pub fn generateFromCond(
         opts.mu orelse preset.mu,
         opts.sigma orelse preset.std,
     );
+
+    if (!usesCfg(opts)) {
+        log.info("[ideogram4] guidance 1.0: CFG off — the unconditional branch is skipped ({s})\n", .{if (uncond == null) "never loaded" else "loaded, idle"});
+    }
 
     var rope = try buildRope(a, cond.cfg, n_text, grid_h, grid_w, s);
     defer rope.deinit();
@@ -1099,20 +1139,30 @@ pub fn generateFromCond(
 
         const pos_v = try cond.forward(enc, z, t_val, &rope);
         defer _ = mlx.mlx_array_free(pos_v);
-        const neg_v = try uncond.forward(null, z, t_val, &img_rope);
-        defer _ = mlx.mlx_array_free(neg_v);
 
         const gw: f32 = if (i < cleanup) opts.guidance_cleanup else opts.guidance;
-        const gwa = mlx.mlx_array_new_float(gw);
-        defer _ = mlx.mlx_array_free(gwa);
-        const omg = mlx.mlx_array_new_float(1.0 - gw);
-        defer _ = mlx.mlx_array_free(omg);
-        const pw = try mulA(pos_v, gwa, s);
-        defer _ = mlx.mlx_array_free(pw);
-        const nw = try mulA(neg_v, omg, s);
-        defer _ = mlx.mlx_array_free(nw);
-        const v = try addA(pw, nw, s);
-        defer _ = mlx.mlx_array_free(v);
+        // gw == 1.0 weights the negative branch by zero, so the blend IS the
+        // conditional velocity and the second forward is skipped — the same
+        // bytes out for half the denoise.
+        var blended: ?mlx.mlx_array = null;
+        defer if (blended) |b| {
+            _ = mlx.mlx_array_free(b);
+        };
+        if (gw != 1.0) {
+            const u = uncond orelse return error.UnconditionalRequired;
+            const neg_v = try u.forward(null, z, t_val, &img_rope);
+            defer _ = mlx.mlx_array_free(neg_v);
+            const gwa = mlx.mlx_array_new_float(gw);
+            defer _ = mlx.mlx_array_free(gwa);
+            const omg = mlx.mlx_array_new_float(1.0 - gw);
+            defer _ = mlx.mlx_array_free(omg);
+            const pw = try mulA(pos_v, gwa, s);
+            defer _ = mlx.mlx_array_free(pw);
+            const nw = try mulA(neg_v, omg, s);
+            defer _ = mlx.mlx_array_free(nw);
+            blended = try addA(pw, nw, s);
+        }
+        const v = blended orelse pos_v;
 
         const dta = mlx.mlx_array_new_float(@floatCast(s_val - t_val));
         defer _ = mlx.mlx_array_free(dta);
@@ -1284,6 +1334,23 @@ test "guidance schedule is loop-index ordered: the LAST steps polish at 3.0" {
     // Every preset's cleanup count matches the reference's schedules.
     try testing.expectEqual(@as(u32, 1), SamplerPreset.turbo_12.params().cleanup_steps);
     try testing.expectEqual(@as(u32, 3), SamplerPreset.quality_48.params().cleanup_steps);
+}
+
+test "guidance 1.0 is the whole CFG-off condition" {
+    // The Turbo (CFG-distilled) adapter runs every step at gw 1.0, where the
+    // negative branch is weighted by exactly zero. Reading that off the
+    // options is what lets `unconditional_transformer/` never be loaded, so a
+    // wrong answer here is either a wasted 9.3B checkpoint or a render that
+    // asks for a branch that isn't there.
+    try testing.expect(!usesCfg(.{ .guidance = 1.0, .guidance_cleanup = 1.0 }));
+    try testing.expect(usesCfg(.{}));
+    try testing.expect(usesCfg(.{ .guidance = 7.0, .guidance_cleanup = 3.0 }));
+    // The polish tail is the half that gets forgotten: gw 1.0 for the bulk
+    // with a guided cleanup still needs the branch.
+    try testing.expect(usesCfg(.{ .guidance = 1.0, .guidance_cleanup = 3.0 }));
+    // ...unless the tail is explicitly empty, in which case nothing reads it.
+    try testing.expect(!usesCfg(.{ .guidance = 1.0, .guidance_cleanup = 3.0, .cleanup_steps = 0 }));
+    try testing.expect(usesCfg(.{ .guidance = 1.0, .guidance_cleanup = 3.0, .cleanup_steps = 1 }));
 }
 
 test "a step count picks the preset whose mu/std were measured with it" {

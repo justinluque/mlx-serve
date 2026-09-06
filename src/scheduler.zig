@@ -3166,6 +3166,17 @@ pub fn loadRequirementBytes(weights_bytes: u64) u64 {
     return weights_bytes + headroom;
 }
 
+test "a deferred stage is held to the same bar as a load" {
+    // Ideogram's unconditional checkpoint is loaded by the first GUIDED render
+    // rather than at model load, so the load gate never prices it. The bar it
+    // prices itself by must be this one: a cheaper bar would only move an OOM
+    // out of a clean 503 and into the middle of a denoise.
+    const GB: u64 = 1024 * 1024 * 1024;
+    for ([_]u64{ 0, 1, 512 * 1024 * 1024, 4 * GB, 40 * GB, 400 * GB }) |bytes| {
+        try std.testing.expectEqual(loadRequirementBytes(bytes), gen_mod.deferredStageRequirementBytes(bytes));
+    }
+}
+
 test "a refusal quotes the number it actually compared" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;

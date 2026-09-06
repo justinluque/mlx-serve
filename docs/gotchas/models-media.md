@@ -2037,3 +2037,47 @@ client, so it is additive - and still rides the final body for non-streaming
 callers. The app shows it under the progress bar while the steps tick, with a
 button that puts the caption in the prompt box and turns the rewrite off,
 which is the documented way to take control of bbox and palette.
+
+## The unconditional branch is dead weight at guidance 1.0 — so it is a deferred stage (2026-09-06)
+
+Ideogram 4's negative branch is a whole second 9.3B checkpoint, and the blend
+is `v = gw·v_pos + (1−gw)·v_neg`. At `gw == 1.0` the second term is multiplied
+by EXACTLY zero — not approximately, not "small" — so the second forward
+produces bytes that are then discarded. Every step of a CFG-distilled render
+(ostris' `ideogram_turbo_8_v1`, which bakes the guidance into the conditional
+weights) runs there. Skipping it is not an approximation, it is dropping a
+multiply-by-zero: the outputs are identical, the denoise is half as long.
+
+The interesting half is residency, not speed. `unconditional_transformer/` is
+4.2 GB of the mixed_3_8 pack's 12.6 GB, and the load gate was billing all of
+it against a machine that would never touch it. That made the honest bill and
+the honest plan disagree: a 24 GB Mac with a browser open was refused a pack
+whose turbo configuration fits comfortably. So the checkpoint became a DEFERRED
+STAGE, in the shape H3's staging already uses:
+
+- `Ideogram4Impl.uncond` is `?ideogram4.Transformer`, null at load.
+- `estimatePeakResidentBytesIn` for `ideogram4` bills the directory MINUS that
+  subfolder — what loading actually allocates.
+- `ensureUncond` prices itself where it allocates: on-disk bytes + 10% against
+  `getAvailableMemBytes`, refusing by NAME (`error.UnconditionalWontFit` → a
+  503 that says the fix is `"turbo":true` or `"guidance_scale":1.0`).
+
+The half that is easy to get wrong is the polish tail. Guidance is per-step and
+in loop-index order, and the presets finish at gw 3.0. A request that set
+`guidance_scale: 1.0` and left `guidance_cleanup` at its default would run its
+last two steps guided — loading 4.2 GB of second checkpoint to undo exactly
+what the request asked for, and it would look like the lazy load "not working".
+`ideogram4.applyGuidance` caps the tail by the bulk, and `usesCfg` reads BOTH
+(plus the case where the tail is explicitly zero-length, where nothing reads
+`guidance_cleanup` at all). Asking the OPTIONS rather than the loop matters
+too: img2img shortens the loop, and a decision that changed with `strength`
+would mean loading a checkpoint in the middle of a denoise.
+
+**Turbo is the H3 convention, not a new one.** Neither the H3 Turbo LoRA nor
+the Ideogram one ships with its model, so both are resolved as
+`<model_dir>/turbo_lora.safetensors` and both answer a named 400 that says
+where to put the file. `"turbo": true` then pins `guidance_scale` to 1.0 (which
+is what makes the branch skippable), moves the step default to the adapter's
+own 8, and takes LoRA slot 0 ahead of the request's style adapters. Turbo plus
+a real `guidance_scale` is two different models in one request: named, never
+silently resolved (`imagePlan`).

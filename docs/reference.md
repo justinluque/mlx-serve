@@ -506,6 +506,32 @@ so the tap axis ends up innermost. Same shape, different vector.
 text tokens at all. `v = gw·v_pos + (1−gw)·v_neg`. This is the defining
 residency fact: the DiT bill is 2 × 9.3B, not 9.3B.
 
+**CFG off, and the second checkpoint with it.** At gw 1.0 that blend weights
+the negative velocity by EXACTLY zero, so the second forward is skipped
+(`ideogram4.usesCfg` → `generateFromCond`'s `uncond: ?*Transformer`) — same
+bytes out, half the denoise. The checkpoint is therefore a DEFERRED STAGE:
+`Ideogram4Impl.uncond` is null at load and `ensureUncond` brings it in on the
+first guided render, so `estimatePeakResidentBytesIn` bills the pack MINUS
+`unconditional_transformer/` (what load actually allocates) and the deferred
+stage prices ITSELF against free memory when it runs, refusing by name with
+the one-field fix in the message. On a 24 GB Mac that is the difference
+between a pack that loads and one that does not: 4.2 GB of the 12.6 GB pack.
+`guidance_scale` (Ideogram only — every other image backend here is distilled
+and would drop the field silently) caps the polish tail by the bulk
+(`applyGuidance`), so guidance 1.0 cannot leave two guided steps behind that
+pull the branch back in.
+
+**Turbo.** `"turbo": true` resolves `<model_dir>/turbo_lora.safetensors` — the
+same filename and the same convention as MiniMax-H3's Turbo LoRA, because
+neither adapter ships with its model and both are dropped beside the weights
+the pack already has. It is a CFG-distilled adapter (ostris' ai-toolkit
+`ideogram_turbo_8_v1`: rank-128 LoRA on all 34 layers × qkv/o/w1/w2/w3/adaln),
+so the flag pins `guidance_scale` to 1.0 and moves the step default to the 8 it
+was distilled at, and it takes LoRA slot 0 with the request's own style
+adapters stacked behind it. Absent file, a non-Ideogram backend, or turbo plus
+a real `guidance_scale` are all named 400s (`imagePlan` owns the numeric
+policy).
+
 **Sampler.** Euler flow-matching on a resolution-aware logit-normal schedule:
 `mean = mu + 0.5·ln(pixels / 512²)`, clamped to a log-SNR window, walked from
 t=1 down to t=0. Guidance is per-step and in LOOP-INDEX order — index 0 is the
@@ -535,8 +561,17 @@ where FLUX.2's is `[channel, ph, pw]`.
 - Every failure is non-fatal and falls back to the raw prompt.
 - A prompt that already looks like a caption is passed through untouched, so
   hand-written layout control is never silently rewritten.
+- The rewrite decodes under a GRAMMAR MASK built from the same contract
+  (`ideogram4_prompt.caption_schema_json`, pinned by test to the vendored
+  `[SYSTEM]` block's own three top-level keys): a fence, a reasoning preamble,
+  an unknown key, a bad element `type` and a caption cut short are unreachable
+  rather than repaired afterwards. The mask enforces STRUCTURE only —
+  `json_grammar` parses `pattern`, `minimum` and `maximum` and never consults
+  them, so the `W:H` spelling and the 0–1000 bbox grid stay the prompt's job
+  and the verifier's.
 - The caption verifier (`ideogram4_prompt.verify`) reports warnings, including
-  key ORDER, because JSON key order is preserved in the text the model sees.
+  key ORDER (which the grammar deliberately does not constrain), because JSON
+  key order is preserved in the text the model sees.
 
 **LoRA.** Stacked and summed at forward time like every other backend
 (`lora.Arch.ideogram4`), attached to the CONDITIONAL transformer only — the

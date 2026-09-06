@@ -2067,7 +2067,6 @@ contract.
 Guards: `tests/test_json_schema_thinking.sh` (all three surfaces + stream arm
 + mask-engagement count) and the server.zig source scan pairing every
 `[grammar] enforcing` site with a gate call.
-
 ## A parsed JSON map must grow with the arena that owns it
 
 `gen.withRewrittenPrompt` splices the magic-prompt caption back into an image
@@ -2100,3 +2099,41 @@ Fix is one line (`parsed.arena.allocator()`). The guards are the sweep test
 (`a rewritten body survives a hash-map grow at any key count`) and a textual
 class scan (`no parsed JSON object is mutated with a non-arena allocator`)
 over gen/chat/lan/server, which is red on revert.
+## The magic-prompt rewrite is a schema request, so it decodes under the mask (2026-09-06)
+
+Ideogram 4's caption contract is one minified JSON object with three top-level
+keys, and this server already enforces JSON schemas token by token
+(`generate.SchemaConstraint` → `json_grammar`). The rewriter was asking a chat
+model for that shape in prose and then cleaning up afterwards: strip a fence,
+split a reasoning preamble off the front, complete one dropped closer, verify,
+and fall back to the raw sentence when none of that worked. Every one of those
+repairs exists because a real checkpoint did the thing — but they are all
+recoveries from an output the sampler was free to produce.
+
+`ideogram4_prompt.caption_schema_json` is the same contract as a schema, and
+`magicPromptRewrite` builds a `SchemaConstraint` from it before submitting. A
+fence, a preamble, an unknown top-level key, an element `type` outside
+`obj|text`, a fractional bbox coordinate and a caption that simply stops are
+now unreachable rather than repaired. The repair-and-verify pass stays: the
+mask guarantees structure, never that the model finished inside its token
+budget.
+
+Two things the mask deliberately does NOT do:
+
+- **Key order.** The grammar accepts a declared key at any position. The prompt
+  asks for one order and the verifier warns when they differ, because order is
+  a training-distribution property, not a validity one.
+- **String and number CONTENT.** `json_schema` parses `pattern`, `minimum` and
+  `maximum`; `json_grammar` never consults any of them. A `W:H` pattern on
+  `aspect_ratio` and a 0–1000 bound on bbox coordinates would compile, look
+  enforced in the schema, and hold nothing — the first draft of this shipped
+  both, and the tests that were supposed to prove them caught it. They came
+  back out. A constraint that only appears to hold is worse than a documented
+  gap; the `pattern` and range gaps are the verifier's job until the grammar
+  grows the NFA and digit-prefix arms to carry them.
+
+The pin is `contractTopLevelKeys`: the schema's properties and `required` are
+compared against the keys of the OUTPUT CONTRACT example inside the vendored
+`[SYSTEM]` block. A prompt revision that adds or renames a top-level key would
+otherwise put that key out of the sampler's reach entirely — the model asked
+for something the grammar rejects at its first byte.
