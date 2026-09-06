@@ -3,8 +3,10 @@
 
     python tests/convert_ideogram4.py \
         --src ideogram-ai/ideogram-4-fp8 \
-        --out ~/.mlx-serve/models/justintime47/Ideogram-4-MLX-Serve-mixed_3_8 \
-        --precision mixed_3_8
+        --out ~/.mlx-serve/models/justintime47/Ideogram-4-MLX-Serve-mixed_4_8_iq \
+        --precision mixed_3_8 --bulk-bits 4 \
+        --te-imatrix ~/claude-tmp/ideogram_imatrix.safetensors \
+        --dit-imatrix ~/claude-tmp/ideogram_imatrix.safetensors
 
 FP8 is the canonical source. NF4 dequant only exists inside `bitsandbytes`,
 which needs a CUDA host — there is no way to unpack a bitsandbytes NF4

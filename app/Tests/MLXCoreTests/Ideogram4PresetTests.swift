@@ -14,16 +14,20 @@ final class Ideogram4PresetTests: XCTestCase {
     /// The catalog ships only packs that RENDER. A `mixed_2_8` build was
     /// published here and withdrawn: 2-bit affine on the DiT bulk renders a
     /// woven grid texture at every prompt, seed and resolution, while
-    /// `mixed_3_8` renders the same prompts correctly — so 3 bits is the floor
-    /// and the converter refuses to mint another one (`MIN_BULK_BITS` in
+    /// a 3-bit bulk rendered them — so 3 bits is the floor and the converter
+    /// refuses to mint another one (`MIN_BULK_BITS` in
     /// `tests/convert_ideogram4.py`). A quantization the catalog offers is a
     /// promise that it works; a smaller download is not worth breaking it.
-    /// Two sizes ship: `mixed_3_8` for the 24 GB / 6-GB-not-guaranteed floor,
-    /// `mixed_4_8` for a Mac with more headroom to spend on quality.
+    ///
+    /// ONE pack ships now. The two RTN builds it replaces were a size ladder,
+    /// and the calibrated 4-bit/te-4 build dominates both: it renders text the
+    /// 3-bit bulk visibly mangled at 1024² (live A/B, same prompt and seed)
+    /// while costing 3 GB less than the 8-bit-encoder pack. A ladder whose
+    /// bottom rung is worse at the model's headline capability is not a
+    /// choice, it is a trap.
     func testTheCatalogShipsOnlyThePacksThatRender() {
         XCTAssertEqual(presets.map(\.repo), [
-            "justintime47/Ideogram-4-MLX-Serve-mixed_3_8",
-            "justintime47/Ideogram-4-MLX-Serve-mixed_4_8",
+            "justintime47/Ideogram-4-MLX-Serve-mixed_4_8_iq",
         ])
         for p in ImageModelPreset.all {
             XCTAssertFalse(p.repo.hasSuffix("_2_8"), "\(p.id) is a withdrawn 2-bit pack")
@@ -323,7 +327,7 @@ final class MagicPromptChoicesFromServerTests: XCTestCase {
           "state":"unloaded","bytes_resident":0,"bytes_on_disk":5950219560,"context_length":262144,
           "max_model_len":262144,"capabilities":["chat","tool_use","streaming","json_schema","vision"],
           "input_modalities":["text","image","video"],"meta":{"architecture":"qwen3_5","engine":"mlx"}},
-         {"id":"justintime47/Ideogram-4-MLX-Serve-mixed_3_8","object":"model","loaded":false,
+         {"id":"justintime47/Ideogram-4-MLX-Serve-mixed_4_8_iq","object":"model","loaded":false,
           "state":"unloaded","bytes_resident":0,"bytes_on_disk":13406659256,"context_length":0,
           "max_model_len":0,"capabilities":["image"],"meta":{"architecture":"ideogram4","engine":"mlx"}},
          {"id":"mlx-community/bge-small-en-v1.5-8bit","object":"model","loaded":false,

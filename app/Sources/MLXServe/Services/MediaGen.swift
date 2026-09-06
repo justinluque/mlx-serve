@@ -445,35 +445,22 @@ struct ImageModelPreset: Identifiable, Hashable {
     // 2-bit affine on the DiT bulk renders a woven-grid artifact at every
     // prompt (`MIN_BULK_BITS` in the converter refuses it now).
     //
-    // Two presets: `mixed_3_8` (bulk 3-bit) is sized to fit a 24 GB Mac with
-    // 6 GB not guaranteed by the system, with real headroom left for
-    // activations. `mixed_4_8` (bulk 4-bit, text encoder 8-bit — the
-    // reference `mixed` policy) is the quality point for a Mac with more
-    // headroom to spend; both hold the modulation/conditioning tier at
-    // 8-bit regardless.
-    static let ideogram4_mixed_3_8 = ImageModelPreset(
-        id: "justintime47/ideogram-4-mixed-3-8",
-        name: "Ideogram 4 mixed 3/8-bit (~13 GB)",
+    // ONE pack ships: the bulk at 4-bit and the text encoder at 4-bit, both
+    // CALIBRATED (`--te-imatrix`/`--dit-imatrix` — activation-weighted
+    // quantization against statistics collected from real renders, rather
+    // than round-to-nearest). It replaces the two RTN packs that shipped
+    // before: it renders text the 3-bit bulk visibly mangled at 1024² while
+    // costing 3 GB less than the 8-bit-encoder build, and at guidance 1.0
+    // the unconditional checkpoint is never loaded at all — about 10 GB
+    // resident for a turbo render.
+    static let ideogram4_mixed_4_8_iq = ImageModelPreset(
+        id: "justintime47/iIdeogram-4-IQ4_M",
+        name: "Ideogram 4 IQ4-M (4.7 bpw, ~15 GB)",
         variant: .ideogram4,
         configName: "ideogram4",
-        repo: "justintime47/Ideogram-4-MLX-Serve-mixed_3_8",
-        approxDownloadGB: 13,
-        approxRAMGB: 18,
-        resolutions: ideogramResolutions,
-        defaultResolution: ideogramResolutions[0],
-        qualityProfiles: ideogramQuality,
-        defaultQuality: .good,
-        description: ideogramDescription
-    )
-
-    static let ideogram4_mixed_4_8 = ImageModelPreset(
-        id: "justintime47/ideogram-4-mixed-4-8",
-        name: "Ideogram 4 mixed 4/8-bit (~19 GB)",
-        variant: .ideogram4,
-        configName: "ideogram4",
-        repo: "justintime47/Ideogram-4-MLX-Serve-mixed_4_8",
-        approxDownloadGB: 19,
-        approxRAMGB: 24,
+        repo: "justintime47/justintime47/Ideogram-4-IQ4_M",
+        approxDownloadGB: 16,
+        approxRAMGB: 21,
         resolutions: ideogramResolutions,
         defaultResolution: ideogramResolutions[0],
         qualityProfiles: ideogramQuality,
@@ -487,9 +474,8 @@ struct ImageModelPreset: Identifiable, Hashable {
         .flux2Klein4B_Q4,                              // 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
-        .ideogram4_mixed_3_8,                          // 13
         .krea2Turbo,                                   // 15
-        .ideogram4_mixed_4_8,                          // 18
+        .ideogram4_mixed_4_8_iq,                       // 16
     ]
 }
 
