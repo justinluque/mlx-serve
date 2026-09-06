@@ -829,6 +829,18 @@ pub fn parseMagicPromptFields(allocator: std.mem.Allocator, body: []const u8, ou
 /// JSON object — which the caller treats as "do not rewrite" rather than as a
 /// request failure.
 pub fn withRewrittenPrompt(allocator: std.mem.Allocator, body: []const u8, caption: []const u8) ![]u8 {
+    return withRewrittenPromptAndRevision(allocator, body, caption, caption);
+}
+
+/// Replace the renderer prompt while retaining the complete generated caption
+/// for `revised_prompt`. The latter is the client-visible record of what the
+/// magic prompt model produced, including layout-only fields.
+pub fn withRewrittenPromptAndRevision(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    renderer_caption: []const u8,
+    revised_caption: []const u8,
+) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.NotAnObject;
@@ -839,11 +851,36 @@ pub fn withRewrittenPrompt(allocator: std.mem.Allocator, body: []const u8, capti
     // real image body carries more than that.
     const arena = parsed.arena.allocator();
     var obj = parsed.value.object;
-    try obj.put(arena, "prompt", .{ .string = caption });
+    try obj.put(arena, "prompt", .{ .string = renderer_caption });
     // Echoed back so a client can see what was actually rendered — the whole
     // point of a rewriter is that the caption is not what the user typed.
-    try obj.put(arena, "revised_prompt", .{ .string = caption });
+    try obj.put(arena, "revised_prompt", .{ .string = revised_caption });
     return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = obj }, .{});
+}
+
+/// Remove magic-prompt layout hints from the copy sent to the image renderer.
+/// The rewrite model needs these fields to plan composition, but Ideogram's
+/// renderer consumes the remaining caption semantics. This is only called for
+/// generated captions; user-provided structured captions stay untouched.
+pub fn stripMagicPromptLayoutFields(allocator: std.mem.Allocator, caption: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, caption, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.NotAnObject;
+
+    var root = parsed.value.object;
+    _ = root.orderedRemove("aspect_ratio");
+    if (root.get("compositional_deconstruction")) |cd| {
+        if (cd == .object) {
+            if (cd.object.get("elements")) |elements| {
+                if (elements == .array) {
+                    for (elements.array.items) |*element| {
+                        if (element.* == .object) _ = element.object.orderedRemove("bbox");
+                    }
+                }
+            }
+        }
+    }
+    return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = root }, .{});
 }
 
 /// Per-request image-generation options shared by both backends.
@@ -6186,6 +6223,41 @@ test "a rewritten body keeps every other field and echoes the caption back" {
     try std.testing.expectEqualStrings("ideogram4", o.get("model").?.string);
     try std.testing.expectEqualStrings("1024x768", o.get("size").?.string);
     try std.testing.expectEqual(@as(i64, 7), o.get("seed").?.integer);
+}
+
+test "magic prompt layout fields are stripped only from the renderer copy" {
+    const a = std.testing.allocator;
+    const caption =
+        \\{"aspect_ratio":"2:3","high_level_description":"A barn","compositional_deconstruction":{"background":"field","elements":[{"type":"obj","bbox":[100,200,800,900],"desc":"barn"},{"type":"text","bbox":[10,20,30,40],"text":"HI","desc":"sign"}]}}
+    ;
+    const renderer = try stripMagicPromptLayoutFields(a, caption);
+    defer a.free(renderer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, renderer, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("aspect_ratio") == null);
+    const elements = root.get("compositional_deconstruction").?.object.get("elements").?.array;
+    try std.testing.expect(elements.items[0].object.get("bbox") == null);
+    try std.testing.expect(elements.items[1].object.get("bbox") == null);
+    try std.testing.expectEqualStrings("barn", elements.items[0].object.get("desc").?.string);
+
+    const body = "{\"prompt\":\"a barn\",\"size\":\"1024x1536\"}";
+    const out = try withRewrittenPromptAndRevision(a, body, renderer, caption);
+    defer a.free(out);
+    var rewritten = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer rewritten.deinit();
+    try std.testing.expectEqualStrings(renderer, rewritten.value.object.get("prompt").?.string);
+    try std.testing.expectEqualStrings(caption, rewritten.value.object.get("revised_prompt").?.string);
+}
+
+test "user captions are not changed unless the magic prompt path calls stripping" {
+    const a = std.testing.allocator;
+    const user_caption = "{\"aspect_ratio\":\"1:1\",\"compositional_deconstruction\":{\"elements\":[{\"type\":\"obj\",\"bbox\":[0,0,1000,1000],\"desc\":\"subject\"}]}}";
+    const out = try withRewrittenPrompt(a, "{\"prompt\":\"x\"}", user_caption);
+    defer a.free(out);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(user_caption, parsed.value.object.get("prompt").?.string);
 }
 
 test "a rewritten body survives a hash-map grow at any key count" {

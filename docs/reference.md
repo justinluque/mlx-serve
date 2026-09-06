@@ -561,6 +561,9 @@ where FLUX.2's is `[channel, ph, pw]`.
 - Every failure is non-fatal and falls back to the raw prompt.
 - A prompt that already looks like a caption is passed through untouched, so
   hand-written layout control is never silently rewritten.
+- For a generated magic-prompt caption only, the renderer receives a copy with
+  `aspect_ratio` and element `bbox` fields removed. The full generated caption
+  remains in `revised_prompt`; user-provided structured captions are unchanged.
 - The rewrite decodes under a GRAMMAR MASK built from the same contract
   (`ideogram4_prompt.caption_schema_json`, pinned by test to the vendored
   `[SYSTEM]` block's own three top-level keys): a fence, a reasoning preamble,

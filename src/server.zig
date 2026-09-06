@@ -6846,7 +6846,12 @@ fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const
         return .{ .attempted = true };
     };
     defer allocator.free(cap);
-    const rewritten = media_mod.withRewrittenPrompt(allocator, body, cap) catch |err| {
+    const renderer_caption = media_mod.stripMagicPromptLayoutFields(allocator, cap) catch |err| {
+        log.warn("[ideogram4] magic prompt: renderer caption cleanup failed ({s}); using the raw prompt\n", .{@errorName(err)});
+        return .{ .attempted = true };
+    };
+    defer allocator.free(renderer_caption);
+    const rewritten = media_mod.withRewrittenPromptAndRevision(allocator, body, renderer_caption, cap) catch |err| {
         log.warn("[ideogram4] magic prompt: body rewrite failed ({s}); using the raw prompt\n", .{@errorName(err)});
         return .{ .attempted = true };
     };
