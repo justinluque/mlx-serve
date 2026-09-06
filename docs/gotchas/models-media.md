@@ -2081,3 +2081,60 @@ is what makes the branch skippable), moves the step default to the adapter's
 own 8, and takes LoRA slot 0 ahead of the request's style adapters. Turbo plus
 a real `guidance_scale` is two different models in one request: named, never
 silently resolved (`imagePlan`).
+
+## Calibrating Ideogram 4: an LM can be pushed text, a DiT cannot (2026-09-06)
+
+`convert_ideogram4.py` quantized everything with a bare `mx.quantize`:
+round-to-nearest on a min/max group, spending the same precision on a channel
+the model barely excites as on one carrying the prompt. The repo already had a
+calibrated quantizer — `dsv4_imatrix.weighted_affine_quant`, which weights the
+reconstruction error by E[x^2] per input channel and takes MLX's own minmax as
+candidate 0, so it can never do worse than RTN — but it had only ever been
+pointed at language models. This model is demonstrably quant-sensitive (the
+withdrawn 2-bit bulk pack rendered a woven grid at every prompt), so it is
+exactly the checkpoint worth calibrating.
+
+The two halves need opposite harnesses, and that is the whole story.
+
+**The text encoder is an LM, so it is calibrated like one.** It is a stock
+Qwen3-VL-8B text stack; `tests/ideogram4_te_imatrix.py` loads the SOURCE
+checkpoint's `text_encoder/` under mlx_lm, wraps every `nn.Linear` and
+accumulates `sum(x^2)`. What is NOT reusable from the LM collectors is the
+corpus: Ideogram was trained exclusively on structured JSON captions, so
+calibrating on chat or prose weights channels this encoder never excites in
+service. `--captions` takes real rewrites; the synthetic generator spans
+subjects, palettes, bbox digit runs, text elements and non-ASCII signage, and
+the self-test asserts every generated caption satisfies the contract the
+renderer is given — a corpus that drifts off-schema is a calibration for a
+distribution the model never sees, and nothing downstream can tell.
+
+**The DiT cannot be calibrated that way at all.** Its activations depend on the
+latents and the timestep, so there is no text to push through a reference tree;
+you have to run the actual denoise loop. The reference is torch and gated, the
+bf16 pair is ~37 GB, and the only thing on this machine that runs the model is
+this engine — so the statistics are collected HERE, in `ideogram4.Imatrix`,
+during real generations (`MLX_SERVE_IDEOGRAM_IMATRIX=<path>`). Three details
+are load-bearing:
+
+- **The key names the COMPONENT.** The two transformers ship identical module
+  names, so without a `<component>/` prefix the conditional and unconditional
+  branches accumulate into the same slots and the file describes neither —
+  and both halves look like plausible statistics.
+- **The slot is an index on the linear, not a name lookup.** `IgLinear.im_slot`
+  is assigned once at arm time; the forward's cost when unarmed is one
+  comparison, and when armed it never hashes a string per projection per step.
+- **The statistic is the INPUT, taken before the projection and before any
+  LoRA delta.** A calibrated re-quantization is of the BASE weight; an
+  adapter's contribution is not part of what the pack stores.
+
+The honest caveat is in the file's own metadata: it is collected through a
+QUANTIZED pack, because that is the only Ideogram DiT that runs on Apple
+Silicon. An activation second moment is far more stable to weight noise than
+the weights are, but it is an approximation, and the check is a fixed point —
+re-collect on the calibrated pack and the statistics should barely move.
+
+Both paths share one refusal: an imatrix that matches NOTHING is a named error,
+never a silent fallback to RTN. A stale key convention would otherwise ship an
+uncalibrated pack that reads as calibrated in the log and in `config.json`
+(`quantization.text_encoder_calibration` / `transformer_calibration`, which is
+why they are recorded — two packs at the same widths are not the same weights).

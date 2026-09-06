@@ -129,6 +129,144 @@ fn fmtKey(a: std.mem.Allocator, comptime f: []const u8, args: anytype) ![]u8 {
     return std.fmt.allocPrint(a, f, args);
 }
 
+// ── Activation statistics (opt-in, diagnostic) ──
+
+/// Per-input-channel mean-squared activation for every projection in a DiT,
+/// accumulated across REAL generations.
+///
+/// `tests/convert_ideogram4.py` quantizes with a bare `mx.quantize` —
+/// round-to-nearest on a min/max group, which spends the same precision on a
+/// channel the model barely excites as on one carrying the prompt. Weighting
+/// the quantizer's error by E[x^2] per input channel needs that expectation,
+/// and for a DiT there is nowhere else to get it: its activations depend on
+/// the latents and the timestep, so unlike a language model it cannot be
+/// calibrated by pushing text through a reference tree. This engine is the
+/// only thing on the machine that runs the model, so the statistics are
+/// collected HERE, on real prompts, real seeds and the real sampler.
+///
+/// Armed by `MLX_SERVE_IDEOGRAM_IMATRIX=<abs path>` and off otherwise — the
+/// cost when off is one null check per projection. Keys are
+/// `<component>/<module>` (`transformer/layers.0.attention.qkv`), which is
+/// what the converter looks up, so ONE file calibrates both checkpoints.
+///
+/// Collected through a QUANTIZED pack, because that is the only Ideogram DiT
+/// that runs here: an activation second moment is far more stable to weight
+/// noise than the weights are, but it is a real approximation and the file
+/// says so. The check is a fixed point — re-collect on the calibrated pack and
+/// the statistics should barely move.
+pub const Imatrix = struct {
+    allocator: std.mem.Allocator,
+    path: []u8,
+    /// BORROWED from each `IgLinear.name`, which outlives the collector.
+    keys: std.ArrayList([]const u8) = .empty,
+    acc: std.ArrayList(mlx.mlx_array) = .empty,
+    rows: std.ArrayList(u64) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator, path: []const u8) !*Imatrix {
+        const self = try allocator.create(Imatrix);
+        self.* = .{ .allocator = allocator, .path = try allocator.dupe(u8, path) };
+        return self;
+    }
+
+    pub fn deinit(self: *Imatrix) void {
+        for (self.acc.items) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+        self.keys.deinit(self.allocator);
+        self.acc.deinit(self.allocator);
+        self.rows.deinit(self.allocator);
+        self.allocator.free(self.path);
+        self.allocator.destroy(self);
+    }
+
+    /// Reserve a slot for `name`. The slot INDEX lives on the linear, so the
+    /// hot path never looks a string up.
+    pub fn register(self: *Imatrix, name: []const u8) !i32 {
+        try self.keys.append(self.allocator, name);
+        try self.acc.append(self.allocator, .{ .ctx = null });
+        try self.rows.append(self.allocator, 0);
+        return @intCast(self.keys.items.len - 1);
+    }
+
+    /// Accumulate `sum(x^2)` over every row of one projection's input.
+    ///
+    /// In f32 deliberately: the sum runs over every token of every step of
+    /// every generation, and a bf16 accumulator saturates long before the
+    /// statistic converges.
+    pub fn observe(self: *Imatrix, slot: usize, x: mlx.mlx_array, s: S) !void {
+        const shape = mlx.getShape(x);
+        if (shape.len == 0) return;
+        const in_dim = shape[shape.len - 1];
+        const f = try astype(x, .float32, s);
+        defer _ = mlx.mlx_array_free(f);
+        const flat = try reshape(f, &[_]c_int{ -1, in_dim }, s);
+        defer _ = mlx.mlx_array_free(flat);
+        const sq = try mulA(flat, flat, s);
+        defer _ = mlx.mlx_array_free(sq);
+        var sum = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_sum_axis(&sum, sq, 0, false, s));
+        const prev = self.acc.items[slot];
+        if (prev.ctx == null) {
+            self.acc.items[slot] = sum;
+        } else {
+            const merged = try addA(prev, sum, s);
+            _ = mlx.mlx_array_free(sum);
+            _ = mlx.mlx_array_free(prev);
+            self.acc.items[slot] = merged;
+        }
+        _ = mlx.mlx_array_eval(self.acc.items[slot]);
+        self.rows.items[slot] += @intCast(@divExact(numel(shape), in_dim));
+    }
+
+    fn numel(shape: []const c_int) c_int {
+        var n: c_int = 1;
+        for (shape) |d| n *= d;
+        return n;
+    }
+
+    /// Write `sum(x^2)/rows` — the MEAN square, which is the weight
+    /// `weighted_affine_quant` consumes unchanged. Called after every
+    /// generation rather than at unload: a long calibration run that is
+    /// interrupted keeps everything it had measured.
+    pub fn save(self: *Imatrix) !void {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        var written: usize = 0;
+        for (self.keys.items, self.acc.items, self.rows.items) |name, a, rows| {
+            if (a.ctx == null or rows == 0) continue;
+            const den = mlx.mlx_array_new_float(@floatFromInt(rows));
+            defer _ = mlx.mlx_array_free(den);
+            var mean = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(mean);
+            try mlx.check(mlx.mlx_divide(&mean, a, den, self.streamOf()));
+            _ = mlx.mlx_array_eval(mean);
+            const key = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{name}, 0);
+            defer self.allocator.free(key);
+            _ = mlx.mlx_map_string_to_array_insert(map, key.ptr, mean);
+            written += 1;
+        }
+        const path = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{self.path}, 0);
+        defer self.allocator.free(path);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        _ = mlx.mlx_map_string_to_string_insert(meta, "values", "mean-squared activation per INPUT channel (sum(x^2)/rows)");
+        _ = mlx.mlx_map_string_to_string_insert(meta, "keys", "<component>/<module>, the names convert_ideogram4.py emits");
+        _ = mlx.mlx_map_string_to_string_insert(meta, "collected_on", "a QUANTIZED pack — the only Ideogram DiT that runs on Apple Silicon");
+        try mlx.check(mlx.mlx_save_safetensors(path.ptr, map, meta));
+        log.info("[ideogram4] imatrix: {d} projections -> {s}\n", .{ written, self.path });
+    }
+
+    fn streamOf(self: *const Imatrix) S {
+        _ = self;
+        return mlx.mlx_default_gpu_stream_new();
+    }
+};
+
+/// The process-wide collector, or null. Written once at load from the
+/// environment and read on the inference thread, which is the only thread that
+/// ever calls a forward.
+pub var imatrix: ?*Imatrix = null;
+
 // ── Linear: affine-quantized at any width, or dense bf16, plus stacked LoRA ──
 
 /// One projection. The converter quantizes attention/MLP but can leave the
@@ -147,6 +285,16 @@ pub const IgLinear = struct {
     // Runtime adapters (non-owning; gen.zig's lora.Stack owns the arrays).
     lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
     lora_count: u8 = 0,
+    /// The allocator `name` came from, so `deinit` can hand it back without
+    /// every holder of a linear having to remember which one built it.
+    name_allocator: ?std.mem.Allocator = null,
+    /// This projection's module name, the same one the converter writes.
+    /// OWNED. Cheap (a few KB across a whole DiT) and unconditional, so
+    /// arming the collector cannot depend on load order.
+    name: []u8 = &.{},
+    /// Its slot in the armed `Imatrix`, or -1. An index rather than a lookup:
+    /// the hot path must not hash a string per projection per step.
+    im_slot: i32 = -1,
 
     /// `in_features` is the module's logical input width, which is the only
     /// way to solve (bits, group_size) out of the packed geometry.
@@ -174,6 +322,8 @@ pub const IgLinear = struct {
                 .add_bias = ownOpt(w, ak),
                 .bits = @intCast(@divExact(32 * w_cols, in_features)),
                 .group_size = @intCast(@divExact(in_features, s_cols)),
+                .name = try a.dupe(u8, prefix),
+                .name_allocator = a,
             };
         }
         const raw = try ownWeight(w, wk);
@@ -183,10 +333,11 @@ pub const IgLinear = struct {
         const tc = try contig(t, s);
         defer _ = mlx.mlx_array_free(tc);
         const wt = try astype(tc, .bfloat16, s);
-        return .{ .quantized = false, .w = wt, .add_bias = ownOpt(w, ak) };
+        return .{ .quantized = false, .w = wt, .add_bias = ownOpt(w, ak), .name = try a.dupe(u8, prefix), .name_allocator = a };
     }
 
     pub fn deinit(self: *IgLinear) void {
+        if (self.name.len != 0) self.name_allocator.?.free(self.name);
         _ = mlx.mlx_array_free(self.w);
         if (self.quantized) {
             _ = mlx.mlx_array_free(self.scales);
@@ -196,6 +347,12 @@ pub const IgLinear = struct {
     }
 
     pub fn forward(self: *const IgLinear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        // The statistic is the INPUT, so it is taken before the projection and
+        // whatever LoRA rides on it — a calibrated re-quantization is of the
+        // BASE weight, and an adapter's delta is not part of what it stores.
+        if (imatrix) |im| {
+            if (self.im_slot >= 0) im.observe(@intCast(self.im_slot), x, s) catch {};
+        }
         var o = mlx.mlx_array_new();
         if (self.quantized) {
             try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w, self.scales, self.biases, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
@@ -892,6 +1049,46 @@ fn configFrom(w: *const Weights, a: std.mem.Allocator, base: Config) Config {
 }
 
 /// Load one Ideogram 4 transformer from `<model_dir>/<subdir>`.
+/// Every projection in one transformer, in load order. The ONE place that
+/// knows the shape of the tree — a new linear that is not listed here is
+/// simply never calibrated, which is why `armImatrix` counts what it
+/// registered against the config's own layer count.
+fn eachLinear(d: *Transformer, ctx: anytype, comptime f: fn (@TypeOf(ctx), *IgLinear) anyerror!void) !void {
+    inline for (.{ "input_proj", "llm_cond_proj", "t_mlp_in", "t_mlp_out", "adaln_proj", "final_linear", "final_adaln" }) |name| {
+        try f(ctx, &@field(d, name));
+    }
+    for (d.layers) |*b| {
+        inline for (.{ &b.qkv, &b.o, &b.w1, &b.w2, &b.w3, &b.adaln_modulation }) |l| try f(ctx, l);
+    }
+}
+
+/// Prefix every projection's name with the component it belongs to. The two
+/// transformers ship IDENTICAL module names, so without this the conditional
+/// and unconditional branches would accumulate into the same slots and the
+/// file would describe neither.
+fn qualifyNames(d: *Transformer, allocator: std.mem.Allocator, subdir: []const u8) !void {
+    const Ctx = struct { a: std.mem.Allocator, sub: []const u8 };
+    try eachLinear(d, Ctx{ .a = allocator, .sub = subdir }, struct {
+        fn apply(c: Ctx, l: *IgLinear) !void {
+            if (l.name.len == 0) return;
+            const q = try std.fmt.allocPrint(c.a, "{s}/{s}", .{ c.sub, l.name });
+            c.a.free(l.name);
+            l.name = q;
+        }
+    }.apply);
+}
+
+/// Give every projection a slot in the armed collector. Idempotent per
+/// transformer: a second call would double-register, so it runs once at load.
+pub fn armImatrix(d: *Transformer, im: *Imatrix) !void {
+    try eachLinear(d, im, struct {
+        fn apply(m: *Imatrix, l: *IgLinear) !void {
+            if (l.name.len == 0) return;
+            l.im_slot = try m.register(l.name);
+        }
+    }.apply);
+}
+
 pub fn loadTransformer(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8, subdir: []const u8) !Transformer {
     const dir = try fmtKey(allocator, "{s}/{s}", .{ model_dir, subdir });
     defer allocator.free(dir);
@@ -947,6 +1144,11 @@ pub fn loadTransformer(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir
             .ffn_norm2 = try ld.norm(&w, allocator, pfx, "ffn_norm2.weight"),
             .adaln_modulation = try ld.lin(&w, allocator, pfx, "adaln_modulation", d.cfg.adaln_dim, s),
         };
+    }
+    try qualifyNames(&d, allocator, subdir);
+    if (imatrix) |im| {
+        try armImatrix(&d, im);
+        log.info("[ideogram4] {s}: activation statistics armed ({d} projections)\n", .{ subdir, d.cfg.num_layers * 6 + 7 });
     }
     return d;
 }
@@ -1584,4 +1786,60 @@ test "ideogram4 fixture" {
     // numerical: getting them wrong is a factor, not a rounding.
     try testing.expect(cos_v > 0.995);
     try testing.expect(rms_v > 0.95 and rms_v < 1.05);
+}
+
+test "an imatrix slot is per PROJECTION, and its key names the component" {
+    // The two transformers ship identical module names. Without the component
+    // qualifier the conditional and unconditional branches accumulate into the
+    // same slots and the file describes neither — and nothing downstream can
+    // tell, because both halves are plausible statistics.
+    const a = testing.allocator;
+    var im = try Imatrix.init(a, "/tmp/unused.safetensors");
+    defer im.deinit();
+
+    var cond = IgLinear{ .quantized = false, .w = .{ .ctx = null }, .name = try a.dupe(u8, "layers.0.attention.qkv"), .name_allocator = a };
+    var unc = IgLinear{ .quantized = false, .w = .{ .ctx = null }, .name = try a.dupe(u8, "layers.0.attention.qkv"), .name_allocator = a };
+    defer a.free(cond.name);
+    defer a.free(unc.name);
+    for ([_]struct { l: *IgLinear, sub: []const u8 }{
+        .{ .l = &cond, .sub = "transformer" },
+        .{ .l = &unc, .sub = "unconditional_transformer" },
+    }) |c| {
+        const q = try std.fmt.allocPrint(a, "{s}/{s}", .{ c.sub, c.l.name });
+        a.free(c.l.name);
+        c.l.name = q;
+        c.l.im_slot = try im.register(c.l.name);
+    }
+    try testing.expect(cond.im_slot != unc.im_slot);
+    try testing.expectEqualStrings("transformer/layers.0.attention.qkv", im.keys.items[@intCast(cond.im_slot)]);
+    try testing.expectEqualStrings("unconditional_transformer/layers.0.attention.qkv", im.keys.items[@intCast(unc.im_slot)]);
+    // Unarmed is the default and must stay free: an unregistered projection
+    // carries -1 and the forward's check is one comparison.
+    const idle = IgLinear{ .quantized = false, .w = .{ .ctx = null } };
+    try testing.expectEqual(@as(i32, -1), idle.im_slot);
+    try testing.expectEqual(@as(usize, 0), idle.name.len);
+}
+
+test "every projection the converter quantizes is one the collector can reach" {
+    // `eachLinear` is hand-written, so a projection added to the block and not
+    // listed there is simply never calibrated — silently, since the pack still
+    // converts and still renders. Pin the two lists against each other by
+    // NAME: these are exactly the module suffixes `convert_ideogram4.py`
+    // quantizes (BULK_SUFFIXES + the sensitive tier).
+    const src = @embedFile("ideogram4.zig");
+    const start = std.mem.indexOf(u8, src, "fn eachLinear(").?;
+    const body = src[start .. start + 900];
+    for ([_][]const u8{ "&b.qkv", "&b.o", "&b.w1", "&b.w2", "&b.w3", "&b.adaln_modulation" }) |m| {
+        if (std.mem.indexOf(u8, body, m) == null) {
+            std.debug.print("eachLinear does not reach {s}\n", .{m});
+            return error.ProjectionUnreachable;
+        }
+    }
+    // And the block's own field list carries nothing else that is an IgLinear:
+    // a seventh projection would be uncalibrated and unnoticed.
+    var n: usize = 0;
+    inline for (@typeInfo(Block).@"struct".field_types) |F| {
+        if (F == IgLinear) n += 1;
+    }
+    try testing.expectEqual(@as(usize, 6), n);
 }

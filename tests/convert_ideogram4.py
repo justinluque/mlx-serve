@@ -392,12 +392,95 @@ def estimate_pack_bytes(precision: str, group_size: int = 64) -> float:
     return 2 * dit + te + VAE_BYTES
 
 
-def emit_linear(out: dict[str, mx.array], module: str, weight: torch.Tensor, bias: torch.Tensor | None, bits: int | None, group_size: int) -> int:
+class Imatrix:
+    """Per-input-channel activation statistics, or nothing at all.
+
+    `mx.quantize` is round-to-nearest on a min/max group: it spends the same
+    precision on a channel the model barely excites as on one carrying the
+    prompt. An imatrix weights the reconstruction error by E[x^2] per input
+    channel, which is exactly the term that reaches the output. Collected by
+    `tests/ideogram4_te_imatrix.py` (encoder) on the distribution this model is
+    actually given — structured JSON captions.
+
+    Absent, every lookup misses and the converter is byte-for-byte the RTN
+    build. Present, a file that matches NOTHING is a named refusal rather than
+    a silent fallback: a stale key convention would otherwise ship an
+    uncalibrated pack that looks calibrated in the log.
+    """
+
+    def __init__(self, path: str | None, label: str, prefix: str = ""):
+        self.label = label
+        # The two transformers share every module name, so a DiT file keys
+        # `<component>/<module>` and each conversion looks up its own half.
+        self.prefix = prefix
+        self.weights: dict[str, "np.ndarray"] = {}
+        self.hits = 0
+        self.misses: list[str] = []
+        self.declined: list[str] = []
+        if not path:
+            return
+        import numpy as np  # noqa: F401  (only the calibrated path needs it)
+
+        raw = mx.load(str(Path(path).expanduser()))
+        for k, v in raw.items():
+            self.weights[k] = np.asarray(v.astype(mx.float32), dtype=np.float32)
+        log(f"[{label}] imatrix: {len(self.weights)} entries from {path}")
+
+    def get(self, module: str, in_features: int):
+        if not self.weights:
+            return None
+        w = self.weights.get(self.prefix + module)
+        if w is None:
+            self.misses.append(self.prefix + module)
+            return None
+        if w.shape != (in_features,):
+            # A shape mismatch is a DIFFERENT checkpoint, not a bad channel:
+            # calibrating with it would be arithmetic on the wrong axis.
+            self.declined.append(f"{module}: imatrix {w.shape} vs in_features {in_features}")
+            return None
+        self.hits += 1
+        return w
+
+    def report(self) -> None:
+        if not self.weights:
+            return
+        log(f"[{self.label}] calibrated {self.hits} linears, {len(self.misses)} uncalibrated, "
+            f"{len(self.declined)} declined")
+        for d in self.declined[:5]:
+            log(f"[{self.label}] declined {d}")
+        if self.hits == 0:
+            sys.exit(f"{self.label}: the imatrix matched no linear in this checkpoint "
+                     f"(first misses: {self.misses[:3]}). Keys must be converter module names "
+                     f"like 'layers.0.self_attn.q_proj' (DiT keys carry a "
+                     f"'<component>/' prefix) — re-collect rather than shipping an "
+                     f"uncalibrated pack that reads as calibrated.")
+
+
+def _mx_from_raw(kind: str, shape, data: bytes) -> mx.array:
+    """One of `weighted_affine_quant`'s raw triples -> an mx array `write_shards`
+    can hold. bf16 arrives as u16 bit patterns; widening to f32 and casting back
+    is exact, and avoids depending on an `mx.array.view` spelling."""
+    import numpy as np
+
+    if kind == "U32":
+        return mx.array(np.frombuffer(data, dtype=np.uint32).reshape(shape).copy())
+    u16 = np.frombuffer(data, dtype=np.uint16).reshape(shape)
+    f32 = (u16.astype(np.uint32) << 16).view(np.float32)
+    return mx.array(f32.copy()).astype(mx.bfloat16)
+
+
+def emit_linear(out: dict[str, mx.array], module: str, weight: torch.Tensor, bias: torch.Tensor | None, bits: int | None, group_size: int, imatrix: "Imatrix | None" = None) -> int:
     """Write one linear as either a quantized triple or a dense weight.
 
     A width that does not divide the input evenly stays DENSE rather than being
     silently rounded — `IgLinear` solves (bits, group_size) back out of the
     packed geometry, so a mismatched pack would be read as a different width.
+
+    With an imatrix entry for this module the (scale, bias) search is
+    activation-WEIGHTED (`dsv4_imatrix.weighted_affine_quant`, which takes
+    MLX's own minmax as candidate 0 and so can never do worse than
+    `mx.quantize`); without one it is plain RTN, and the geometry is identical
+    either way.
     """
     w = to_mx(weight)
     in_features = w.shape[1]
@@ -406,6 +489,19 @@ def emit_linear(out: dict[str, mx.array], module: str, weight: torch.Tensor, bia
     if bits is None or in_features % group_size != 0:
         out[f"{module}.weight"] = w
         return 0
+    ch = imatrix.get(module, in_features) if imatrix is not None else None
+    if ch is not None:
+        import numpy as np
+
+        from dsv4_imatrix import weighted_affine_quant
+
+        w32 = np.asarray(w.astype(mx.float32), dtype=np.float32)
+        (qk, qs, qd), (sk, ss, sd), (bk, bs, bd) = weighted_affine_quant(
+            w32, bits=bits, group_size=group_size, ch_weights=ch)
+        out[f"{module}.weight"] = _mx_from_raw(qk, qs, qd)
+        out[f"{module}.scales"] = _mx_from_raw(sk, ss, sd)
+        out[f"{module}.biases"] = _mx_from_raw(bk, bs, bd)
+        return bits
     q, s, b = mx.quantize(w, group_size=group_size, bits=bits)
     out[f"{module}.weight"] = q
     out[f"{module}.scales"] = s
@@ -448,7 +544,7 @@ def write_shards(out_dir: Path, tensors: dict[str, mx.array], basename: str = "m
 # ── components ────────────────────────────────────────────────────────────
 
 
-def convert_transformer(src: Path, out: Path, subfolder: str, precision: str, default_bits: int, group_size: int) -> None:
+def convert_transformer(src: Path, out: Path, subfolder: str, precision: str, default_bits: int, group_size: int, imatrix_path: str | None = None) -> None:
     """One Ideogram4Transformer. Module paths pass through UNCHANGED — the
     reference loads its own state dict with `load_state_dict`, so upstream key
     names already are the module tree `ideogram4.zig` reads.
@@ -458,6 +554,7 @@ def convert_transformer(src: Path, out: Path, subfolder: str, precision: str, de
     lazy graph doesn't quietly re-accumulate the whole transformer anyway."""
     comp = LazyComponent(src, subfolder, "diffusion_pytorch_model")
     log(f"[{subfolder}] source: {quant_kind(comp.keys)}")
+    imatrix = Imatrix(imatrix_path, subfolder, prefix=f"{subfolder}/")
     tensors: dict[str, mx.array] = {}
     counts: dict[str, int] = {}
     consumed: set[str] = set()
@@ -487,7 +584,7 @@ def convert_transformer(src: Path, out: Path, subfolder: str, precision: str, de
             counts["dense-table"] = counts.get("dense-table", 0) + 1
         else:
             bits = bits_for(module, precision, default_bits)
-            got = emit_linear(tensors, module, w, b, bits, group_size)
+            got = emit_linear(tensors, module, w, b, bits, group_size, imatrix)
             key = f"{got}-bit" if got else "dense"
             counts[key] = counts.get(key, 0) + 1
 
@@ -507,12 +604,13 @@ def convert_transformer(src: Path, out: Path, subfolder: str, precision: str, de
         log(f"[warn] {subfolder}: passthrough of unrecognized tensor {k}")
 
     log(f"[{subfolder}] {counts}")
+    imatrix.report()
     write_shards(out / subfolder, tensors)
     del comp, tensors
     gc.collect()
 
 
-def convert_text_encoder(src: Path, out: Path, te_bits: int, group_size: int) -> None:
+def convert_text_encoder(src: Path, out: Path, te_bits: int, group_size: int, imatrix: "Imatrix | None" = None) -> None:
     """Qwen3-VL-8B, TEXT TOWER ONLY, renamed into the flat layout
     `flux.loadTextEncoderWith` reads.
 
@@ -581,13 +679,15 @@ def convert_text_encoder(src: Path, out: Path, te_bits: int, group_size: int) ->
             # mlx-serve dequantizes this table once at load, so it MUST
             # ship quantized — the loader reads `.scales`/`.biases`
             # unconditionally.
-            emit_linear(tensors, module, w, None, te_bits, group_size)
+            emit_linear(tensors, module, w, None, te_bits, group_size, imatrix)
         else:
-            emit_linear(tensors, module, w, b, te_bits, group_size)
+            emit_linear(tensors, module, w, b, te_bits, group_size, imatrix)
         mx.eval(*(v for kk, v in tensors.items() if kk.startswith(module + ".")))
         del w, b
 
     log(f"[text_encoder] {n_layers} layers kept, {dropped} tensors dropped (vision tower / lm_head, never loaded)")
+    if imatrix is not None:
+        imatrix.report()
     write_shards(out / "text_encoder", tensors)
     del comp, tensors
     gc.collect()
@@ -772,6 +872,13 @@ def main() -> None:
     ap.add_argument("--bulk-bits", type=int, help="override a mixed policy's attention/MLP width")
     ap.add_argument("--sensitive-bits", type=int, help="override a mixed policy's modulation/conditioning width")
     ap.add_argument("--te-bits", type=int, help="override a mixed policy's text-encoder width")
+    ap.add_argument("--te-imatrix", help="activation statistics for the text encoder "
+                                        "(tests/ideogram4_te_imatrix.py) — weights the quantizer's "
+                                        "error by E[x^2] per input channel instead of round-to-nearest")
+    ap.add_argument("--dit-imatrix", help="activation statistics for BOTH transformers, keyed "
+                                         "'<component>/<module>' (MLX_SERVE_IDEOGRAM_IMATRIX=<path> on a "
+                                         "real generation) — the DiT bulk is where the 2-bit pack failed, "
+                                         "so it is the tier most worth calibrating")
     ap.add_argument("--self-test", action="store_true", help="run the policy/size unit tests and exit (no checkpoint needed)")
     args = ap.parse_args()
     if args.self_test:
@@ -798,11 +905,12 @@ def main() -> None:
         f"text_encoder={te_bits}-bit  (estimated pack ≈ {estimate_pack_bytes(args.precision, args.group_size) / 1e9:.1f} GB)"
     )
 
-    convert_text_encoder(src, out, te_bits, args.group_size)
+    te_imatrix = Imatrix(args.te_imatrix, "text_encoder")
+    convert_text_encoder(src, out, te_bits, args.group_size, te_imatrix)
     convert_vae(src, out, args.group_size)
     copy_tokenizer(src, out)
-    convert_transformer(src, out, "transformer", args.precision, default_bits, args.group_size)
-    convert_transformer(src, out, "unconditional_transformer", args.precision, default_bits, args.group_size)
+    convert_transformer(src, out, "transformer", args.precision, default_bits, args.group_size, args.dit_imatrix)
+    convert_transformer(src, out, "unconditional_transformer", args.precision, default_bits, args.group_size, args.dit_imatrix)
 
     prefix, suffix = chat_framing(src, out)
     config = {
@@ -811,7 +919,14 @@ def main() -> None:
         "source_repo": args.src,
         "precision": args.precision,
         "widths": MIXED_POLICIES.get(args.precision, {"flat": default_bits}),
-        "quantization": {"mode": "affine", "group_size": args.group_size},
+        "quantization": {
+            "mode": "affine",
+            "group_size": args.group_size,
+            # What a pack was CALIBRATED with is part of what it is: two packs
+            # at the same widths are not the same weights.
+            "text_encoder_calibration": "imatrix" if args.te_imatrix else "rtn",
+            "transformer_calibration": "imatrix" if args.dit_imatrix else "rtn",
+        },
     }
     if prefix or suffix:
         config["chat_prefix"] = prefix

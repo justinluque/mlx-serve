@@ -352,6 +352,18 @@ const Ideogram4Impl = struct {
         errdefer allocator.free(self.model_dir);
         self.s = mlx.mlx_default_gpu_stream_new();
 
+        // Activation statistics for a calibrated re-quantization. Armed BEFORE
+        // the transformers load, because arming is what gives each projection
+        // its slot. Off by default and free when off; a path that cannot be
+        // written is a refusal at load rather than a surprise at save time.
+        if (std.c.getenv("MLX_SERVE_IDEOGRAM_IMATRIX")) |env| {
+            const path = std.mem.sliceTo(env, 0);
+            if (path.len != 0 and ideogram4.imatrix == null) {
+                ideogram4.imatrix = try ideogram4.Imatrix.init(allocator, path);
+                log.info("[image] Ideogram 4: collecting activation statistics into {s}\n", .{path});
+            }
+        }
+
         self.chat_prefix = &.{};
         self.chat_suffix = &.{};
         errdefer allocator.free(self.chat_prefix);
@@ -513,7 +525,12 @@ const Ideogram4Impl = struct {
         };
         // The unconditional checkpoint is loaded only if this run reads it.
         const uncond: ?*ideogram4.Transformer = if (ideogram4.usesCfg(opts)) try self.ensureUncond() else null;
-        return ideogram4.generateFromCond(&self.cond, uncond, &self.vae, cond_enc, ids.len, seed, height, width, opts, progress);
+        const img = try ideogram4.generateFromCond(&self.cond, uncond, &self.vae, cond_enc, ids.len, seed, height, width, opts, progress);
+        // Written after EVERY generation, not at unload: a calibration run is
+        // many minutes per image, and an interrupted one must keep what it
+        // measured.
+        if (ideogram4.imatrix) |im| im.save() catch |e| log.warn("[image] imatrix save failed: {s}\n", .{@errorName(e)});
+        return img;
     }
 };
 
