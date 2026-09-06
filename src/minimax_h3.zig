@@ -2192,7 +2192,7 @@ pub const Model = struct {
                 var n: usize = 0;
                 for (st.files[0..st.count], st.scales[0..st.count], 0..) |*fl, user_scale, fi| {
                     const e = fl.find(key) orelse continue;
-                    rb[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
+                    rb[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale, .kind = e.kind };
                     n += 1;
                     cnt[fi] += 1;
                 }

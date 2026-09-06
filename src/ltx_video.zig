@@ -1960,7 +1960,7 @@ fn loraRefsFor(comp: *const Component, base: []const u8, out: *[lora_mod.MAX_LOR
     var n: usize = 0;
     for (stack.files[0..stack.count], stack.scales[0..stack.count]) |*f, user_scale| {
         const e = f.find(mod) orelse (if (alias) |al| f.find(al) else null) orelse continue;
-        out[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
+        out[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale, .kind = e.kind };
         n += 1;
     }
     return out[0..n];

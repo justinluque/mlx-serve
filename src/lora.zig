@@ -50,6 +50,13 @@
 //! only the per-term shape differs. `Ref.kind`/`Entry.kind` selects which
 //! math `delta()` runs; the fused-split fan-out (`Split`, BFL's packed QKV)
 //! is LoRA-only for now — see `deltaLokr`'s doc comment.
+//!
+//! A LoKr's SCALE is alpha/lora_dim like LyCORIS', but its divisor is the
+//! LoKr rank, which is not a dimension of w1 and is often absent from the
+//! file entirely — see `lokrScale`, and the pure-white frame that taught us.
+//! Tensors that modify the delta's magnitude or shape and that we cannot
+//! honor (`scalar`, `dora_scale`, `lokr_t2`) refuse their module BY NAME
+//! rather than ride along as no-ops.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -69,8 +76,8 @@ pub const Ref = struct {
     kind: Kind = .lora,
 };
 
-pub const Role = enum { a, b, w1, w2, w1a, w1b, w2a, w2b, alpha };
-pub const KeyInfo = struct { module: []const u8, role: Role, flat: bool = false };
+pub const Role = enum { a, b, w1, w2, w1a, w1b, w2a, w2b, alpha, unsupported };
+pub const KeyInfo = struct { module: []const u8, role: Role, flat: bool = false, suffix: []const u8 = "" };
 
 /// Classify one safetensors key: strip a wrapper prefix and a matrix-role
 /// suffix, and report which flavor of prefix was stripped.
@@ -125,6 +132,18 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
         .{ ".lokr_w2_a", Role.w2a },
         .{ ".lokr_w2_b", Role.w2b },
         .{ ".alpha", Role.alpha },
+        // Tensors that modify the delta's magnitude or shape and that we
+        // cannot honor. They are CLASSIFIED rather than ignored so the module
+        // carrying them is refused by name: `scalar` (LyCORIS `use_scalar`,
+        // which carries the whole trained magnitude — with it BOTH w1 and w2
+        // are kaiming-initialized, so treating it as 1 applies a full-strength
+        // Kronecker product), `dora_scale` (weight decomposition, which
+        // renormalizes the BASE weight), `lokr_t2` (Tucker/CP, where w2 is an
+        // einsum over three tensors, not `w2_a @ w2_b`). Guessing at any of
+        // them is the same class of bug as guessing at alpha.
+        .{ ".lokr_t2", Role.unsupported },
+        .{ ".dora_scale", Role.unsupported },
+        .{ ".scalar", Role.unsupported },
     };
     inline for (suffixes) |sf| {
         if (std.mem.endsWith(u8, k, sf[0])) {
@@ -134,7 +153,7 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
             } else {
                 if (std.mem.endsWith(u8, m, ".to_out.0")) m = m[0 .. m.len - 2];
             }
-            return .{ .module = m, .role = sf[1], .flat = flat };
+            return .{ .module = m, .role = sf[1], .flat = flat, .suffix = sf[0] };
         }
     }
     return null;
@@ -562,7 +581,7 @@ pub const Entry = struct {
     module: []u8, // owned
     at: mlx.mlx_array, // bf16
     bt: mlx.mlx_array, // bf16
-    scale: f32, // alpha/rank (LoRA) or alpha/w1.shape[0] (LoKr) when the file carries alpha, else 1.0
+    scale: f32, // alpha/rank — see the LoRA branch of `loadFile` and `lokrScale`
     kind: Kind = .lora,
 };
 
@@ -647,6 +666,13 @@ const Partial = struct {
     w2_a: mlx.mlx_array = .{ .ctx = null },
     w2_b: mlx.mlx_array = .{ .ctx = null },
     alpha: ?f32 = null,
+    /// LyCORIS' `lora_dim` — the alpha DIVISOR — recovered from a factored
+    /// pair's INNER dimension, the only place a LoKr's rank survives into a
+    /// checkpoint at all. Null for a full (unfactorized) pack. See `lokrScale`.
+    rank: ?f32 = null,
+    /// Suffix of a modifier tensor we cannot honor (`.scalar`, `.dora_scale`,
+    /// `.lokr_t2`). Present ⇒ the module is refused by name.
+    unsupported: ?[]const u8 = null,
     flat: bool = false,
 };
 
@@ -666,6 +692,36 @@ fn alphaRatio(alpha: ?f32, rank: ?f32) ?f32 {
     const rk = rank orelse return null;
     if (!std.math.isFinite(al) or al <= 0 or !std.math.isFinite(rk) or rk <= 0) return null;
     return al / rk;
+}
+
+/// A LoKr's net scale and where it came from, mirroring LyCORIS'
+/// `LokrModule.scale = alpha / lora_dim`.
+///
+/// The divisor is the LoKr RANK. It is emphatically NOT a dimension of w1:
+/// w1 is [out_l, in_m] from LyCORIS' `factorization(dim, factor)`, so its row
+/// count is a factorization leg — 8 at `factor 8`, 48 for a 3072-wide output
+/// at `factor -1` — and it VARIES per module, since an FFN and an attention
+/// projection in the SAME file factor differently. One alpha yielding several
+/// different scales is the tell that the divisor was never a rank. Dividing by
+/// it shipped a pure white frame: the common full-matrix LoKr recipe writes
+/// `network_dim = network_alpha = 1e10`, whose true scale is 1.0, and
+/// `1e10 / 8` put a 1.25e9 delta into every one of 204 modules.
+///
+/// The rank survives into a checkpoint ONLY as a factored pair's inner
+/// dimension (`Partial.rank`). A full (unfactorized) pack carries none, so a
+/// per-module `alpha` alone cannot produce a scale there — alpha is half of a
+/// pair, and its other half lives in file metadata (`ss_network_dim`, PEFT
+/// `r`) or nowhere. Hence the precedence: a COMPLETE per-module pair
+/// (alpha + derived rank) is the most specific answer and wins; the file's own
+/// declared pair is the fallback; 1.0 is what is left. That last rung is not a
+/// shrug — LyCORIS defaults `alpha = lora_dim`, so 1.0 is the true scale of
+/// every adapter that never overrode it, the full-matrix recipe included.
+const LokrScale = struct { value: f32, source: []const u8 };
+
+fn lokrScale(alpha: ?f32, rank: ?f32, file_scale: ?f32) LokrScale {
+    if (alphaRatio(alpha, rank)) |v| return .{ .value = v, .source = "the module's own alpha over its factored rank" };
+    if (file_scale) |v| return .{ .value = v, .source = "the file's declared alpha/dim metadata" };
+    return .{ .value = 1.0, .source = "no factored rank and no metadata dim, so alpha alone cannot scale it (LyCORIS defaults alpha == lora_dim)" };
 }
 
 fn parseNum(text: ?[]const u8) ?f32 {
@@ -858,6 +914,10 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
                 gop.value_ptr.alpha = scalarValue(value, s);
                 _ = mlx.mlx_array_free(value);
             },
+            .unsupported => {
+                gop.value_ptr.unsupported = info.suffix;
+                _ = mlx.mlx_array_free(value);
+            },
         }
     }
 
@@ -870,6 +930,7 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         }
         entries.deinit(allocator);
     }
+    var lokr_logged = false;
     var it = partials.iterator();
     while (it.next()) |e| {
         const p = e.value_ptr;
@@ -880,11 +941,24 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
             const fa = @field(p.*, trip[1]);
             const fb = @field(p.*, trip[2]);
             if (@field(p.*, trip[0]).ctx == null and fa.ctx != null and fb.ctx != null) {
+                // The pair's inner dimension IS LyCORIS' `lora_dim`
+                // (`lokr_*_a` is [rows, dim], `lokr_*_b` is [dim, cols]), and
+                // the fold destroys it — read it here or lose the only rank
+                // the checkpoint carries. w1 and w2 share one `lora_dim`, so
+                // the first one seen answers for both.
+                if (p.rank == null) p.rank = @floatFromInt(mlx.getShape(fa)[1]);
                 @field(p.*, trip[0]) = foldFactors(fa, fb, s) catch |err| blk: {
                     log.warn("[lora] {s}: could not fold {s} ({s})\n", .{ std.fs.path.basename(path), trip[1], @errorName(err) });
                     break :blk .{ .ctx = null };
                 };
             }
+        }
+        // A modifier we cannot honor changes the delta, so attaching the
+        // module without it is a wrong delta, not a partial one. Refuse by
+        // name — the same rule as a missing factor below.
+        if (p.unsupported) |sfx| {
+            log.warn("[lora] {s}: module '{s}' carries '{s}', which this loader cannot honor — skipped (attaching it would apply the delta as if that tensor were 1)\n", .{ std.fs.path.basename(path), e.key_ptr.*, sfx });
+            continue;
         }
         const is_lora = p.a.ctx != null and p.b.ctx != null;
         const is_lokr = p.w1.ctx != null and p.w2.ctx != null;
@@ -951,14 +1025,12 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
             // for LoRA's B would require slicing INSIDE the Kronecker
             // product, not just one factor. Not implemented: refuse rather
             // than silently attach a corrupted delta to a fused target.
-            const w1_rows: c_int = mlx.getShape(p.w1)[0]; // w1 [p,q]
-            // LyCORIS' own convention (kohya-ss `lokr.py`): the "rank" a
-            // LoKr's alpha divides by is w1's row count, not the traditional
-            // LoRA rank — there is no lower-rank factor to read one off of.
-            const scale: f32 = if (p.alpha) |al|
-                al / @as(f32, @floatFromInt(w1_rows))
-            else
-                file_scale orelse 1.0;
+            const sc = lokrScale(p.alpha, p.rank, file_scale);
+            if (!lokr_logged) {
+                lokr_logged = true;
+                log.info("[lora] {s}: LoKr scale {d:.6} — {s}\n", .{ std.fs.path.basename(path), sc.value, sc.source });
+            }
+            const scale: f32 = sc.value;
             for (matches) |m| {
                 if (m.split != .none) {
                     log.warn("[lora] {s}: LoKr target '{s}' needs a fused-output split, which LoKr does not support yet — skipped\n", .{ std.fs.path.basename(path), m.canon });
@@ -1743,4 +1815,192 @@ test "loadFile rejects a MISSING file before mlx can kill the process" {
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, buf[0..root_len], .generic));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "rel/lora.safetensors", .generic));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "", .generic));
+}
+
+// ── LoKr scale (issue: a pure white frame) ──────────────────────────────
+
+test "lokrScale never divides alpha by a factorization leg" {
+    // The live failure, exactly: a full-matrix Ideogram 4 LoKr whose every
+    // module carries alpha 1e10 (LyCORIS' `network_dim = network_alpha = 1e10`
+    // recipe, i.e. the alpha == lora_dim DEFAULT written out) over a w1 of
+    // [8,8]. Dividing by w1's rows gave 1.25e9 and rendered pure white; the
+    // honest answer with no rank and no metadata is 1.0.
+    const big: f32 = 9999220736.0; // the bf16 value actually stored in the file
+    const full = lokrScale(big, null, null);
+    try testing.expectEqual(@as(f32, 1.0), full.value);
+    try testing.expect(full.value < big / 8.0); // the old formula, by name
+
+    // A per-module alpha with a DERIVED rank is a complete pair, so it is the
+    // most specific answer and outranks the file's declaration.
+    const pair = lokrScale(8.0, 4.0, 0.5);
+    try testing.expectEqual(@as(f32, 2.0), pair.value);
+
+    // Alpha alone is half a pair. Without a rank it cannot scale anything, so
+    // the file's own alpha/dim declaration answers instead of a guess.
+    try testing.expectEqual(@as(f32, 0.25), lokrScale(big, null, 0.25).value);
+    // ...and with neither, 1.0 — never alpha, never alpha/<some dimension>.
+    try testing.expectEqual(@as(f32, 1.0), lokrScale(null, null, null).value);
+
+    // Junk in either half falls through rather than producing inf/NaN/0.
+    try testing.expectEqual(@as(f32, 1.0), lokrScale(8.0, 0.0, null).value);
+    try testing.expectEqual(@as(f32, 1.0), lokrScale(std.math.inf(f32), 4.0, null).value);
+    try testing.expectEqual(@as(f32, 1.0), lokrScale(std.math.nan(f32), 4.0, null).value);
+    try testing.expectEqual(@as(f32, 1.0), lokrScale(-8.0, 4.0, null).value);
+
+    // Each rung says which one it took — a scale this load-bearing is logged.
+    try testing.expect(!std.mem.eql(u8, pair.source, full.source));
+}
+
+/// Write one LoKr module's tensors into `dir_path/lokr.safetensors` and return
+/// the absolute path (caller frees). Shapes mirror the real Ideogram 4 adapter:
+/// w1 is the tiny factorization leg, w2 carries the width.
+fn writeLokrFixture(
+    dir_path: []const u8,
+    module: []const u8,
+    tensors: []const struct { suffix: []const u8, rows: c_int, cols: c_int },
+    alpha: ?f32,
+) ![:0]u8 {
+    const map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+
+    var kbuf: [256]u8 = undefined;
+    var vals: [4096]f32 = undefined;
+    for (tensors) |spec| {
+        const n: usize = @intCast(spec.rows * spec.cols);
+        for (vals[0..n], 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) * 0.125;
+        const shape = [_]c_int{ spec.rows, spec.cols };
+        const arr = mlx.mlx_array_new_data(&vals, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(arr);
+        const key = try std.fmt.bufPrintSentinel(&kbuf, "diffusion_model.{s}{s}", .{ module, spec.suffix }, 0);
+        try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, arr));
+    }
+    if (alpha) |al| {
+        const arr = mlx.mlx_array_new_float(al);
+        defer _ = mlx.mlx_array_free(arr);
+        const key = try std.fmt.bufPrintSentinel(&kbuf, "diffusion_model.{s}.alpha", .{module}, 0);
+        try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, arr));
+    }
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/lokr.safetensors", .{dir_path}, 0);
+    errdefer testing.allocator.free(path);
+    try mlx.check(mlx.mlx_save_safetensors(path.ptr, map, meta));
+    return path;
+}
+
+test "loadFile scales a full-matrix LoKr by 1.0, not by w1's row count" {
+    // End-to-end over a real safetensors file shaped like the adapter that
+    // rendered white: alpha 1e10, w1 [8,8], w2 [6,4] (so out = 48, in = 32).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    const path = try writeLokrFixture(buf[0..root_len], "layers.0.attention.o", &.{
+        .{ .suffix = ".lokr_w1", .rows = 8, .cols = 8 },
+        .{ .suffix = ".lokr_w2", .rows = 6, .cols = 4 },
+    }, 9999220736.0);
+    defer testing.allocator.free(path);
+
+    var f = try loadFile(testing.allocator, path, .ideogram4);
+    defer f.deinit();
+    try testing.expectEqual(@as(usize, 1), f.entries.len);
+    const e = f.entries[0];
+    try testing.expectEqualStrings("layers.0.attention.o", e.module);
+    try testing.expectEqual(Kind.lokr, e.kind);
+    // The whole bug in one assertion: 1.0, not 1.25e9.
+    try testing.expectEqual(@as(f32, 1.0), e.scale);
+    // w1 stays [p,q]; w2 arrives TRANSPOSED as [c,r] for `deltaLokr`.
+    try testing.expectEqual(@as(c_int, 8), mlx.getShape(e.at)[0]);
+    try testing.expectEqual(@as(c_int, 4), mlx.getShape(e.bt)[0]);
+    try testing.expectEqual(@as(c_int, 6), mlx.getShape(e.bt)[1]);
+}
+
+test "loadFile reads a FACTORED LoKr's rank off the pair it folds" {
+    // w2 = w2_a [6,4] @ w2_b [4,4]: the inner 4 is LyCORIS' lora_dim, and the
+    // fold is the last moment it exists. alpha 8 over rank 4 = 2.0.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    const path = try writeLokrFixture(buf[0..root_len], "layers.1.feed_forward.w1", &.{
+        .{ .suffix = ".lokr_w1", .rows = 8, .cols = 8 },
+        .{ .suffix = ".lokr_w2_a", .rows = 6, .cols = 4 },
+        .{ .suffix = ".lokr_w2_b", .rows = 4, .cols = 4 },
+    }, 8.0);
+    defer testing.allocator.free(path);
+
+    var f = try loadFile(testing.allocator, path, .ideogram4);
+    defer f.deinit();
+    try testing.expectEqual(@as(usize, 1), f.entries.len);
+    try testing.expectEqual(@as(f32, 2.0), f.entries[0].scale);
+    // Folded to the full [6,4], then transposed to [4,6].
+    try testing.expectEqual(@as(c_int, 4), mlx.getShape(f.entries[0].bt)[0]);
+    try testing.expectEqual(@as(c_int, 6), mlx.getShape(f.entries[0].bt)[1]);
+}
+
+test "loadFile refuses a module whose magnitude modifier it cannot honor" {
+    // LyCORIS `use_scalar` initializes BOTH w1 and w2 non-zero and puts the
+    // entire trained magnitude in `scalar`. Attaching w1⊗w2 as if scalar were
+    // 1 is a second route to the same white frame, so the module is refused by
+    // name instead of riding along.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    const path = try writeLokrFixture(buf[0..root_len], "layers.2.attention.o", &.{
+        .{ .suffix = ".lokr_w1", .rows = 8, .cols = 8 },
+        .{ .suffix = ".lokr_w2", .rows = 6, .cols = 4 },
+        .{ .suffix = ".scalar", .rows = 1, .cols = 1 },
+    }, null);
+    defer testing.allocator.free(path);
+
+    var f = try loadFile(testing.allocator, path, .ideogram4);
+    defer f.deinit();
+    try testing.expectEqual(@as(usize, 0), f.entries.len);
+
+    // The classifier is what makes the refusal possible — an unknown suffix
+    // would be dropped on the floor and the module would look complete.
+    try testing.expectEqual(Role.unsupported, parseKey("diffusion_model.m.scalar").?.role);
+    try testing.expectEqual(Role.unsupported, parseKey("diffusion_model.m.dora_scale").?.role);
+    try testing.expectEqual(Role.unsupported, parseKey("diffusion_model.m.lokr_t2").?.role);
+    try testing.expectEqualStrings(".scalar", parseKey("diffusion_model.m.scalar").?.suffix);
+}
+
+test "every inlined Ref built from an Entry carries that Entry's kind" {
+    // Class guard. `Stack.findAll` copies `.kind`, but two backends inline it
+    // for their own per-file bookkeeping and both silently defaulted to
+    // `.lora` — a LoKr on H3 or LTX ran the (x@A)@B math over Kronecker
+    // factors. The defect is the CALLER SHAPE (a Ref literal assembled field
+    // by field), so the scan is over the shape, not the two known sites.
+    const needle = ".at = " ++ "e.at";
+    inline for (.{
+        .{ "lora.zig", @embedFile("lora.zig") },
+        .{ "minimax_h3.zig", @embedFile("minimax_h3.zig") },
+        .{ "ltx_video.zig", @embedFile("ltx_video.zig") },
+        .{ "flux.zig", @embedFile("flux.zig") },
+        .{ "krea.zig", @embedFile("krea.zig") },
+        .{ "ideogram4.zig", @embedFile("ideogram4.zig") },
+    }) |f| {
+        var at: usize = 0;
+        var seen: usize = 0;
+        while (std.mem.indexOfPos(u8, f[1], at, needle)) |i| {
+            const end = std.mem.indexOfScalarPos(u8, f[1], i, ';') orelse f[1].len;
+            if (std.mem.indexOfPos(u8, f[1], i, ".kind") == null or
+                std.mem.indexOfPos(u8, f[1], i, ".kind").? > end)
+            {
+                std.debug.print("{s}: builds a lora.Ref from an Entry without copying .kind\n", .{f[0]});
+                return error.RefDropsAdapterKind;
+            }
+            seen += 1;
+            at = i + needle.len;
+        }
+        // The scan must actually be finding the sites it claims to guard.
+        if (std.mem.eql(u8, f[0], "lora.zig")) try testing.expect(seen >= 1);
+    }
 }
