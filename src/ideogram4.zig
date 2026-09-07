@@ -422,6 +422,19 @@ pub const LogitNormalSchedule = struct {
         const t_max = 1.0 / (1.0 + @exp(0.5 * self.logsnr_min));
         return std.math.clamp(t_, t_min, t_max);
     }
+
+    /// Model time corresponding to a scheduler point. The scheduler's final
+    /// sigma is forced to zero after clamping, so the last model evaluation
+    /// must use exactly clean-data time rather than the clamped approximation.
+    pub fn modelTimeAt(self: LogitNormalSchedule, u: f64) f64 {
+        return if (u == 0.0) 1.0 else self.at(u);
+    }
+
+    /// Noise scale at a scheduler point. The initial latent is sampled from
+    /// N(0, 1) and must be scaled by the first scheduler sigma.
+    pub fn sigmaAt(self: LogitNormalSchedule, u: f64) f64 {
+        return 1.0 - self.modelTimeAt(u);
+    }
 };
 
 // ── DiT ──
@@ -1168,7 +1181,6 @@ pub fn generateFromCond(
         _ = mlx.mlx_array_free(z);
     };
     try mlx.check(mlx.mlx_random_normal(&z, &nsh, 3, .float32, 0.0, 1.0, key, s));
-
     // img2img. This schedule runs BACKWARDS from every other one here: t = 0
     // is noise and t = 1 is data (the loop walks `schedule(1)` up to
     // `schedule(0)`, and `z += v·(s−t)` with a POSITIVE step). So the flow
@@ -1195,6 +1207,14 @@ pub fn generateFromCond(
         _ = mlx.mlx_array_free(z);
         z = mixed;
         log.info("[ideogram4] img2img: strength={d:.2} -> {d}/{d} steps from t={d:.4}\n", .{ opts.strength, run_steps, steps, t0 });
+    } else {
+        // Match FlowMatchEulerDiscreteScheduler: its first sigma scales the
+        // standard-normal latent, while its terminal sigma is exactly zero.
+        const initial_sigma = mlx.mlx_array_new_float(@floatCast(sched.sigmaAt(1.0)));
+        defer _ = mlx.mlx_array_free(initial_sigma);
+        const scaled_noise = try mulA(z, initial_sigma, s);
+        _ = mlx.mlx_array_free(z);
+        z = scaled_noise;
     }
 
     // Loop index i counts DOWN; index 0 is the final polish step. img2img
@@ -1204,8 +1224,8 @@ pub fn generateFromCond(
     while (i > 0) {
         i -= 1;
         if (progress) |p| if (p.cancelled()) return error.Cancelled;
-        const t_val = sched.at(@as(f64, @floatFromInt(i + 1)) / @as(f64, @floatFromInt(steps)));
-        const s_val = sched.at(@as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps)));
+        const t_val = sched.modelTimeAt(@as(f64, @floatFromInt(i + 1)) / @as(f64, @floatFromInt(steps)));
+        const s_val = sched.modelTimeAt(@as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps)));
 
         const pos_v = try cond.forward(enc, z, t_val, &rope);
         defer _ = mlx.mlx_array_free(pos_v);
@@ -1379,6 +1399,14 @@ test "the logit-normal schedule runs high→low and clamps at both endpoints" {
         try testing.expect(v >= t_min and v <= t_max);
         prev = v;
     }
+}
+
+test "the scheduler boundaries scale noise and finish at clean time" {
+    const sch = LogitNormalSchedule.forResolution(512, 512, 0.5, 1.75);
+    try testing.expectApproxEqAbs(1.0, sch.modelTimeAt(0.0), 1e-12);
+    try testing.expectApproxEqAbs(0.0, sch.sigmaAt(0.0), 1e-12);
+    try testing.expectApproxEqAbs(1.0 - sch.at(1.0), sch.sigmaAt(1.0), 1e-12);
+    try testing.expect(sch.sigmaAt(1.0) > 0.0 and sch.sigmaAt(1.0) < 1.0);
 }
 
 test "the schedule's mean slides with the pixel count, not the step count" {
