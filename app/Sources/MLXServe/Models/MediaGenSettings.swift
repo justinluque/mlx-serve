@@ -86,6 +86,9 @@ struct ImageGenSettings: Codable, Equatable {
     /// Optional-decoded via defaults so settings from older builds still load.
     var magicPrompt: Bool = true
     var magicPromptModel: String = ""
+    /// When enabled, remove bboxes from user-authored structured captions.
+    /// Magic-prompt captions always strip bboxes regardless of this setting.
+    var stripBoundingBoxes: Bool = false
     /// Ideogram 4's Turbo adapter. Sticky like every other toggle here, and
     /// default-decoded so a settings blob from an older build still loads.
     var turbo: Bool = false
@@ -180,6 +183,7 @@ extension ImageGenSettings {
         if let v = try c.decodeIfPresent(Int.self, forKey: .customHeight) { customHeight = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .magicPrompt) { magicPrompt = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .magicPromptModel) { magicPromptModel = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .stripBoundingBoxes) { stripBoundingBoxes = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .turbo) { turbo = v }
     }
 }

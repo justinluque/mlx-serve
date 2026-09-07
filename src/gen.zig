@@ -793,6 +793,8 @@ pub const MagicPromptFields = struct {
     /// Model id to rewrite WITH. Empty = the server's default text model.
     /// Borrows from the request body.
     model: []const u8 = "",
+    /// User-caption cleanup only; magic-prompt cleanup always strips bboxes.
+    strip_bboxes: bool = false,
 };
 
 /// Read `magic_prompt` / `magic_prompt_model` off a generation body. A body
@@ -820,6 +822,9 @@ pub fn parseMagicPromptFields(allocator: std.mem.Allocator, body: []const u8, ou
             out_model.* = allocator.dupe(u8, v.string) catch &.{};
             f.model = out_model.*;
         }
+    }
+    if (parsed.value.object.get("strip_bboxes")) |v| {
+        if (v == .bool) f.strip_bboxes = v.bool;
     }
     return f;
 }
@@ -862,7 +867,7 @@ pub fn withRewrittenPromptAndRevision(
 /// The rewrite model needs these fields to plan composition, but Ideogram's
 /// renderer consumes the remaining caption semantics. This is only called for
 /// generated captions; user-provided structured captions stay untouched.
-pub fn stripMagicPromptLayoutFields(allocator: std.mem.Allocator, caption: []const u8) ![]u8 {
+pub fn stripMagicPromptLayoutFields(allocator: std.mem.Allocator, caption: []const u8, strip_bboxes: bool) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, caption, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.NotAnObject;
@@ -874,13 +879,23 @@ pub fn stripMagicPromptLayoutFields(allocator: std.mem.Allocator, caption: []con
             if (cd.object.get("elements")) |elements| {
                 if (elements == .array) {
                     for (elements.array.items) |*element| {
-                        if (element.* == .object) _ = element.object.orderedRemove("bbox");
+                        if (strip_bboxes and element.* == .object) _ = element.object.orderedRemove("bbox");
                     }
                 }
             }
         }
     }
     return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = root }, .{});
+}
+
+pub fn withPrompt(allocator: std.mem.Allocator, body: []const u8, prompt: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.NotAnObject;
+    const arena = parsed.arena.allocator();
+    var obj = parsed.value.object;
+    try obj.put(arena, "prompt", .{ .string = prompt });
+    return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = obj }, .{});
 }
 
 /// Per-request image-generation options shared by both backends.
@@ -6230,7 +6245,7 @@ test "magic prompt layout fields are stripped only from the renderer copy" {
     const caption =
         \\{"aspect_ratio":"2:3","high_level_description":"A barn","compositional_deconstruction":{"background":"field","elements":[{"type":"obj","bbox":[100,200,800,900],"desc":"barn"},{"type":"text","bbox":[10,20,30,40],"text":"HI","desc":"sign"}]}}
     ;
-    const renderer = try stripMagicPromptLayoutFields(a, caption);
+    const renderer = try stripMagicPromptLayoutFields(a, caption, true);
     defer a.free(renderer);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, renderer, .{});
     defer parsed.deinit();
@@ -6240,6 +6255,13 @@ test "magic prompt layout fields are stripped only from the renderer copy" {
     try std.testing.expect(elements.items[0].object.get("bbox") == null);
     try std.testing.expect(elements.items[1].object.get("bbox") == null);
     try std.testing.expectEqualStrings("barn", elements.items[0].object.get("desc").?.string);
+    const preserved = try stripMagicPromptLayoutFields(a, caption, false);
+    defer a.free(preserved);
+    var preserved_parsed = try std.json.parseFromSlice(std.json.Value, a, preserved, .{});
+    defer preserved_parsed.deinit();
+    try std.testing.expect(preserved_parsed.value.object.get("aspect_ratio") == null);
+    try std.testing.expect(preserved_parsed.value.object.get("compositional_deconstruction").?.object
+        .get("elements").?.array.items[0].object.get("bbox") != null);
 
     const body = "{\"prompt\":\"a barn\",\"size\":\"1024x1536\"}";
     const out = try withRewrittenPromptAndRevision(a, body, renderer, caption);

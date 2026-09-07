@@ -36,6 +36,7 @@ struct ImageGenView: View {
     /// Ideogram 4 only — see `ImageModelPreset.supportsMagicPrompt`.
     @State private var magicPrompt: Bool = true
     @State private var magicPromptModel: String = ""
+    @State private var stripBoundingBoxes: Bool = false
     @State private var turbo: Bool = false
     /// Whether the caption the rewriter produced is expanded under the image.
     /// Collapsed by default — it is long, and the image is the answer.
@@ -542,11 +543,15 @@ struct ImageGenView: View {
             // The server rewrites it with a chat model before conditioning.
             if model.supportsMagicPrompt {
                 Divider()
-                Text("Magic prompt").font(.caption.weight(.semibold))
+                Text("Prompts").font(.caption.weight(.semibold))
                 Toggle("Rewrite my prompt into a structured caption", isOn: $magicPrompt)
                     .font(.caption)
                     .help("This model was trained only on structured JSON captions describing layout, elements and colours. On (default): the server turns your sentence into one first. Off: your text is used verbatim — the right choice when you wrote the caption yourself.")
                     .onChange(of: magicPrompt) { _, _ in guard !hydrating else { return }; persist() }
+                Toggle("Strip bounding boxes", isOn: $stripBoundingBoxes)
+                    .font(.caption)
+                    .help("Magic-prompt captions always have their element coordinates removed. For a user-written structured caption, turn this on to remove its bounding boxes too. The aspect-ratio hint is always removed.")
+                    .onChange(of: stripBoundingBoxes) { _, _ in guard !hydrating else { return }; persist() }
                 if magicPrompt {
                     VStack(alignment: .leading, spacing: 4) {
                         // A PICKER, not a text field: the field takes a model
@@ -958,6 +963,7 @@ struct ImageGenView: View {
         customWidthText = String(s.customWidth)
         customHeightText = String(s.customHeight)
         magicPrompt = s.magicPrompt
+        stripBoundingBoxes = s.stripBoundingBoxes
         // Turbo is restored BEFORE steps are read back below, the same order
         // H3's pane needs: a saved 8 must not bounce to a tier's 20.
         turbo = s.turbo && model.supportsTurbo
@@ -989,6 +995,7 @@ struct ImageGenView: View {
         s.loras = loras
         s.magicPrompt = magicPrompt
         s.magicPromptModel = magicPromptModel
+        s.stripBoundingBoxes = stripBoundingBoxes
         s.turbo = turbo
         s.save()
     }
@@ -1030,6 +1037,7 @@ struct ImageGenView: View {
             strength: strength,
             magicPrompt: magicPrompt,
             magicPromptModel: magicPromptModel,
+            stripBoundingBoxes: stripBoundingBoxes,
             editMode: effectiveEditMode,
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             condGain: condGain,

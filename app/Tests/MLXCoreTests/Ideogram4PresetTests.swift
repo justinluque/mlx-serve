@@ -135,7 +135,7 @@ final class Ideogram4PresetTests: XCTestCase {
     }
 }
 
-/// The request body: `magic_prompt` travels only where the server acts on it.
+/// The request body: Ideogram-only prompt controls travel only where the server acts on them.
 @MainActor
 final class Ideogram4RequestBodyTests: XCTestCase {
 
@@ -154,6 +154,18 @@ final class Ideogram4RequestBodyTests: XCTestCase {
         // rewrite a caption the user deliberately hand-wrote.
         let off = ImageGenService.requestJson(for: request(p, magic: false), modelName: "m", seed: 1)
         XCTAssertEqual(off["magic_prompt"] as? Bool, false)
+    }
+
+    func testBoundingBoxStrippingIsSentOnlyForIdeogram() {
+        let p = ImageModelPreset.all.first { $0.variant == .ideogram4 }!
+        var keep = request(p)
+        keep.stripBoundingBoxes = false
+        XCTAssertEqual(ImageGenService.requestJson(for: keep, modelName: "m", seed: 1)["strip_bboxes"] as? Bool, false)
+
+        let other = ImageGenService.requestJson(
+            for: ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 4),
+            modelName: "m", seed: 1)
+        XCTAssertNil(other["strip_bboxes"])
     }
 
     /// `turbo` is a NAMED 400 on every other image backend and `false` is one
@@ -277,12 +289,15 @@ final class MagicPromptStickinessTests: XCTestCase {
         var s = ImageGenSettings()
         XCTAssertTrue(s.magicPrompt, "on by default — Ideogram wants a caption")
         XCTAssertEqual(s.magicPromptModel, "", "no rewriter named = the server's default")
+        XCTAssertFalse(s.stripBoundingBoxes, "user-authored bboxes stay intact by default")
         s.magicPrompt = false
         s.magicPromptModel = "org/repo"
+        s.stripBoundingBoxes = false
         let back = try JSONDecoder().decode(ImageGenSettings.self,
                                             from: try JSONEncoder().encode(s))
         XCTAssertEqual(back.magicPrompt, false)
         XCTAssertEqual(back.magicPromptModel, "org/repo")
+        XCTAssertFalse(back.stripBoundingBoxes)
     }
 
     /// Settings written by a build that had neither field still decode.

@@ -6846,7 +6846,7 @@ fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const
         return .{ .attempted = true };
     };
     defer allocator.free(cap);
-    const renderer_caption = media_mod.stripMagicPromptLayoutFields(allocator, cap) catch |err| {
+    const renderer_caption = media_mod.stripMagicPromptLayoutFields(allocator, cap, true) catch |err| {
         log.warn("[ideogram4] magic prompt: renderer caption cleanup failed ({s}); using the raw prompt\n", .{@errorName(err)});
         return .{ .attempted = true };
     };
@@ -6856,6 +6856,21 @@ fn tryMagicPromptRewrite(allocator: std.mem.Allocator, io: std.Io, body: []const
         return .{ .attempted = true };
     };
     return .{ .body = rewritten, .attempted = true };
+}
+
+fn tryUserCaptionBboxStrip(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    var model_owned: []u8 = &.{};
+    defer if (model_owned.len != 0) allocator.free(model_owned);
+    const fields = media_mod.parseMagicPromptFields(allocator, body, &model_owned);
+    if (!fields.strip_bboxes) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object or parsed.value.object.get("revised_prompt") != null) return null;
+    const prompt = parsed.value.object.get("prompt") orelse return null;
+    if (prompt != .string or !ideogram_prompt.looksLikeCaption(prompt.string)) return null;
+    const cleaned = media_mod.stripMagicPromptLayoutFields(allocator, prompt.string, true) catch return null;
+    defer allocator.free(cleaned);
+    return media_mod.withPrompt(allocator, body, cleaned) catch null;
 }
 
 fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute, already_rewritten: bool) !void {
@@ -6888,6 +6903,16 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
             if (tryMagicPromptRewrite(allocator, stream.io, body, eng.wantsStructuredCaption()).body) |nb| {
                 rewritten_body = nb;
                 effective_body = nb;
+            }
+        }
+        if (route.modality() == .image and rewritten_body == null) {
+            if (lm.image_engine) |eng| {
+                if (eng.wantsStructuredCaption()) {
+                    if (tryUserCaptionBboxStrip(allocator, effective_body)) |nb| {
+                        rewritten_body = nb;
+                        effective_body = nb;
+                    }
+                }
             }
         }
     }

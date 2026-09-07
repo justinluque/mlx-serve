@@ -1837,6 +1837,9 @@ struct ImageGenRequest {
     var magicPrompt: Bool = true
     /// Model id to rewrite WITH. Empty = the server's default text model.
     var magicPromptModel: String = ""
+    /// Remove bboxes from a user-authored structured caption. Magic-prompt
+    /// captions always strip bboxes before rendering.
+    var stripBoundingBoxes: Bool = false
     /// Instruction editing (FLUX.2 only): condition on the source as a clean
     /// in-context reference — "make the hair blue" keeps the same person.
     /// false = variation (renoise) mode.

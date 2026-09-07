@@ -237,6 +237,7 @@ final class ImageGenService: ObservableObject {
         // rewrite even when the user deliberately turned it off.
         if request.model.supportsMagicPrompt {
             json["magic_prompt"] = request.magicPrompt
+            json["strip_bboxes"] = request.stripBoundingBoxes
             let rewriter = request.magicPromptModel.trimmingCharacters(in: .whitespaces)
             if request.magicPrompt && !rewriter.isEmpty {
                 json["magic_prompt_model"] = rewriter
