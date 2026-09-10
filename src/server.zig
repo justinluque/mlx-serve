@@ -6661,7 +6661,7 @@ fn magicPromptRewrite(
             if (sc.initFromValue(allocator, schema_parsed.value, tb)) {
                 sc_init = true;
                 sampling.constraint = &sc.constraint;
-                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                log.info("[grammar] enforcing JSON schema from token 0 (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
             } else |err| {
                 log.warn("[ideogram4] magic prompt: caption schema would not compile ({s}); rewriting unconstrained\n", .{@errorName(err)});
             }
@@ -6676,8 +6676,10 @@ fn magicPromptRewrite(
     // block says `thinking_mode: disabled`, and a reasoning preamble is what a
     // fence-stripper cannot rescue — but the gate is consulted here like at
     // every other mask site so the pairing scan stays honest.
-    var mp_enable_thinking = false;
-    if (schemaMasksThinking(sc_init, false)) mp_enable_thinking = false;
+    const mp_enable_thinking = false;
+    switch (schemaMasksThinking(sc_init, false, mp_enable_thinking, false, false, null)) {
+        .no_mask, .token_zero, .fallback_thinking_off, .deferred => {},
+    }
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| sch.complete(s);
@@ -23575,6 +23577,8 @@ test "a streaming stop sequence cuts at the match, not at the token boundary" {
     const many = [_][]const u8{ "END", "N" };
     try t.expectEqual(@as(usize, 1), stopSequenceCut("aNbEND", 6, &many).?.index);
     try t.expectEqual(@as(?StopCut, null), stopSequenceCut("all clear", 3, &stops));
+}
+
 test "the rewriter's answer is split for reasoning before it is parsed as a caption" {
     // The rewrite submits with `enable_thinking = false` and the vendored
     // prompt says `thinking_mode: disabled`, but neither binds the CHECKPOINT
