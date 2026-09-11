@@ -13,6 +13,7 @@ enum ChatMode: String, Codable {
 enum AgentToolKind: String, Codable, CaseIterable, Sendable {
     case shell
     case readFile
+    case readImage = "read_image"
     case writeFile
     case editFile
     case searchFiles
@@ -39,6 +40,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         switch self {
         case .shell: "terminal"
         case .readFile: "doc.text"
+        case .readImage: "photo.on.rectangle"
         case .writeFile: "doc.text.fill"
         case .editFile: "pencil"
         case .searchFiles: "magnifyingglass"
@@ -63,6 +65,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         switch self {
         case .shell: "Shell"
         case .readFile: "Read File"
+        case .readImage: "Read Image"
         case .writeFile: "Write File"
         case .editFile: "Edit File"
         case .searchFiles: "Search Files"
@@ -121,7 +124,7 @@ enum AgentToolGroup: String, CaseIterable, Sendable {
 
     var tools: [AgentToolKind] {
         switch self {
-        case .files: [.readFile, .writeFile, .editFile, .searchFiles, .listFiles, .cwd]
+        case .files: [.readFile, .readImage, .writeFile, .editFile, .searchFiles, .listFiles, .cwd]
         case .shell: [.shell, .listProcesses, .readProcessOutput, .killProcess]
         case .web: [.browse, .webSearch]
         case .media: [.generateImage, .generateSpeech, .generateMusic, .generateVideo]

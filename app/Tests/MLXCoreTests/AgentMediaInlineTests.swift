@@ -176,9 +176,9 @@ final class AgentMediaInlineTests: XCTestCase {
         XCTAssertNil(jpeg)
     }
 
-    // MARK: - pngFileToJpegDataURI
+    // MARK: - imageFileToJpegDataURI
 
-    func testPngFileToJpegDataURITranscodes() throws {
+    func testImageFileToJpegDataURITranscodes() throws {
         let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 8,
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -189,7 +189,7 @@ final class AgentMediaInlineTests: XCTestCase {
         try png.write(to: URL(fileURLWithPath: path))
         defer { try? FileManager.default.removeItem(atPath: path) }
 
-        let uri = AgentMediaInline.pngFileToJpegDataURI(path)
+        let uri = AgentMediaInline.imageFileToJpegDataURI(path)
         XCTAssertNotNil(uri)
         XCTAssertTrue(uri!.hasPrefix("data:image/jpeg;base64,"))
         // Re-split through the same helper → decodes back to a valid bitmap.
@@ -198,7 +198,7 @@ final class AgentMediaInlineTests: XCTestCase {
         XCTAssertNotNil(NSBitmapImageRep(data: jpeg!), "transcoded payload must be a valid image")
     }
 
-    func testPngFileToJpegDataURIMissingFileReturnsNil() {
-        XCTAssertNil(AgentMediaInline.pngFileToJpegDataURI("/nonexistent/\(UUID().uuidString).png"))
+    func testImageFileToJpegDataURIMissingFileReturnsNil() {
+        XCTAssertNil(AgentMediaInline.imageFileToJpegDataURI("/nonexistent/\(UUID().uuidString).png"))
     }
 }

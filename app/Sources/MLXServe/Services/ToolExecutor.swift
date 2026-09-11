@@ -522,6 +522,36 @@ struct ReadFileHandler: ToolHandler {
     }
 }
 
+// MARK: - Read Image
+
+/// Reads an image off disk and hands it back as a `data:image/jpeg;base64,…`
+/// marker (`AgentMediaInline.jpegDataURIMarker`) for `ChatTurnEngine` to
+/// attach as real vision input. Unlike `readFile`, the bytes never ride the
+/// tool-result TEXT the model reads — only the caption does — because
+/// `AgentMediaInline` deliberately keeps multi-KB base64 out of the model's
+/// context; the picture reaches the model as an `image_url` content block on
+/// the turn's user message instead.
+struct ReadImageHandler: ToolHandler {
+    var gate = FileToolSandboxGate()
+
+    func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
+        try gate.check(workingDirectory: workingDirectory)
+        guard let path = parameters["path"] else {
+            throw ToolError.missingParameter("path")
+        }
+
+        let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
+        guard FileManager.default.fileExists(atPath: fullPath) else {
+            throw ToolError.executionFailed("No such file: \(path)")
+        }
+        guard let dataURI = AgentMediaInline.imageFileToJpegDataURI(fullPath) else {
+            throw ToolError.executionFailed(
+                "Couldn't read '\(path)' as an image. Supported formats: PNG, JPEG, GIF, BMP, TIFF, HEIC.")
+        }
+        return "Read image: \(path)\n\(dataURI)"
+    }
+}
+
 // MARK: - Write File
 
 struct WriteFileHandler: ToolHandler {
@@ -943,6 +973,7 @@ class ToolExecutor: ObservableObject {
     private let handlers: [AgentToolKind: any ToolHandler] = [
         .shell: ShellHandler(),
         .readFile: ReadFileHandler(),
+        .readImage: ReadImageHandler(),
         .writeFile: WriteFileHandler(),
         .editFile: EditFileHandler(),
         .searchFiles: SearchFilesHandler(),

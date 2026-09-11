@@ -421,7 +421,7 @@ enum AgentEngine {
 
     /// Primary argument key per tool — used to distinguish different invocations.
     private static let primaryArgKey: [String: String] = [
-        "listFiles": "path", "readFile": "path", "searchFiles": "pattern",
+        "listFiles": "path", "readFile": "path", "read_image": "path", "searchFiles": "pattern",
         "browse": "url", "webSearch": "query", "searchDocuments": "query",
     ]
 
@@ -624,6 +624,7 @@ enum AgentEngine {
         [
             .shell: ShellHandler(),
             .readFile: ReadFileHandler(),
+            .readImage: ReadImageHandler(),
             .writeFile: WriteFileHandler(),
             .editFile: EditFileHandler(),
             .searchFiles: SearchFilesHandler(),

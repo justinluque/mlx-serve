@@ -311,7 +311,7 @@ struct AgentCapabilities: Codable, Equatable, Sendable {
     /// The tool loop's own tools — everything but the web pair and the
     /// folder-gated `searchDocuments`.
     static let loopTools: Set<AgentToolKind> = [
-        .shell, .cwd, .readFile, .writeFile, .editFile, .searchFiles, .listFiles,
+        .shell, .cwd, .readFile, .readImage, .writeFile, .editFile, .searchFiles, .listFiles,
         .saveMemory, .createTask, .listProcesses, .readProcessOutput, .killProcess,
         .generateImage, .generateSpeech, .generateMusic, .generateVideo,
     ]

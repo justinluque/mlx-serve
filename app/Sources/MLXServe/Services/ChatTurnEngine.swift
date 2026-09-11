@@ -1287,6 +1287,26 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     } else {
                         toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                     }
+                } else if result.name == "read_image" && result.output.contains(AgentMediaInline.jpegDataURIMarker) {
+                    // Unlike `browse`'s screenshot (attached to the hidden TOOL
+                    // message, which `AgentEngine.buildAgentHistory` never reads
+                    // images off of), this image has to reach the model, so it
+                    // rides the session's own last USER message instead — the
+                    // one `buildAgentHistory` already knows how to turn into an
+                    // `image_url` content block on the NEXT round of this same
+                    // loop. Safe because no new user turn is appended mid-loop,
+                    // so that message stays "the last one" for the rest of it.
+                    let (caption, jpeg) = AgentMediaInline.splitInlineImage(result.output)
+                    toolMsg.content = caption.isEmpty ? "[image read]" : caption
+                    if let jpeg,
+                       let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+                       let uIdx = appState.chatSessions[sIdx].messages.lastIndex(where: {
+                           $0.role == .user && $0.toolCallId == nil
+                       }) {
+                        var imgs = appState.chatSessions[sIdx].messages[uIdx].images ?? []
+                        imgs.append(ChatImage(data: jpeg))
+                        appState.chatSessions[sIdx].messages[uIdx].images = imgs
+                    }
                 } else if result.output.contains(AgentMediaInline.mediaRefMarker) {
                     let asked = tc.arguments["prompt"] ?? tc.arguments["text"] ?? ""
                     let (caption, ref) = AgentMediaInline.splitMediaRef(result.output, prompt: asked)
@@ -1461,7 +1481,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // caption the model reads.
         let caption = "Generated a \(req.width)×\(req.height) image for: \(req.prompt). Saved to \(path)."
         let ref = AgentMediaInline.mediaRefLine(kind: .image, path: path)
-        guard let dataURI = AgentMediaInline.pngFileToJpegDataURI(path) else {
+        guard let dataURI = AgentMediaInline.imageFileToJpegDataURI(path) else {
             return "\(caption)\n\(ref)"
         }
         return "\(caption)\n\(ref)\n\(dataURI)"

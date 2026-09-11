@@ -67,10 +67,11 @@ enum AgentMediaInline {
         return (caption, ChatMediaRef(kind: kind, path: path, prompt: prompt))
     }
 
-    /// Transcode a PNG file on disk to a `data:image/jpeg;base64,<b64>` URI for
-    /// inline display (`ChatImage` is JPEG). nil when the file can't be read or
-    /// re-encoded.
-    static func pngFileToJpegDataURI(_ path: String) -> String? {
+    /// Transcode an image file on disk (PNG, JPEG, GIF, BMP, TIFF, HEIC — anything
+    /// `NSImage` opens) to a `data:image/jpeg;base64,<b64>` URI, for inline
+    /// display and for `read_image`'s vision-input marker (`ChatImage` is JPEG).
+    /// nil when the file can't be read or re-encoded.
+    static func imageFileToJpegDataURI(_ path: String) -> String? {
         guard let image = NSImage(contentsOfFile: path),
               let tiff = image.tiffRepresentation,
               let rep = NSBitmapImageRep(data: tiff),

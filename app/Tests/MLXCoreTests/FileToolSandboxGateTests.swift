@@ -39,6 +39,7 @@ final class FileToolSandboxGateTests: XCTestCase {
         -> [(String, any ToolHandler, [String: String])] {
         [
             ("readFile", ReadFileHandler(gate: gate), ["path": "f.txt"]),
+            ("read_image", ReadImageHandler(gate: gate), ["path": "f.txt"]),
             ("writeFile", WriteFileHandler(gate: gate), ["path": "f.txt", "content": "x"]),
             ("editFile", EditFileHandler(gate: gate), ["path": "f.txt", "find": "a", "replace": "b"]),
             ("searchFiles", SearchFilesHandler(gate: gate), ["pattern": "x", "path": dir]),
@@ -157,7 +158,7 @@ final class FileToolSandboxGateTests: XCTestCase {
         for (_, handler, params) in fileToolCases(gate: gate, dir: dir) {
             _ = try? await handler.execute(parameters: params, workingDirectory: dir)
         }
-        XCTAssertEqual(rec.seen.count, 5, "every file tool must ensure its folder is mounted")
+        XCTAssertEqual(rec.seen.count, 6, "every file tool must ensure its folder is mounted")
         XCTAssertTrue(rec.seen.allSatisfy { $0 == dir },
                       "each tool must pass its OWN working folder: \(rec.seen)")
     }
