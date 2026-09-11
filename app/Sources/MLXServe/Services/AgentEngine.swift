@@ -658,6 +658,7 @@ enum AgentEngine {
         documentIndex: DocumentIndex? = nil,
         createTask: ((_ goal: String, _ schedule: String?) async -> String)? = nil,
         generateMedia: ((_ kind: MediaKind, _ args: [String: String]) async -> String)? = nil,
+        listImageModels: (() -> String)? = nil,
         processRegistry: ProcessRegistry? = nil,
         sessionId: UUID? = nil,
         allowedTools: Set<AgentToolKind>? = nil
@@ -699,6 +700,14 @@ enum AgentEngine {
             let out = generateMedia != nil
                 ? await generateMedia!(kind, tc.arguments)
                 : "Error: media generation isn't available in this context."
+            return ToolResult(id: tc.id, name: name, output: out)
+        }
+
+        // list_image_models: read-only catalog listing, same meta-tool shape
+        // as createTask/generateMedia (needs AppState's live model list, no
+        // workdir, not a ToolHandler).
+        if name == "list_image_models" {
+            let out = listImageModels?() ?? "Error: listing image models isn't available in this context."
             return ToolResult(id: tc.id, name: name, output: out)
         }
 

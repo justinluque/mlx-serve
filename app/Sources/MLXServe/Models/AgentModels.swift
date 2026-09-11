@@ -28,6 +28,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
     case listProcesses
     case createTask
     case generateImage = "generate_image"
+    case listImageModels = "list_image_models"
     // Speech and music are separate tools on purpose. `generate_audio` next to
     // `generate_music` is ambiguous — music IS audio — and their arguments have
     // nothing in common (a line to speak vs. a style prompt, lyrics and a
@@ -55,6 +56,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         case .listProcesses: "list.bullet.rectangle"
         case .createTask: "calendar.badge.clock"
         case .generateImage: "photo"
+        case .listImageModels: "list.bullet"
         case .generateSpeech: "waveform"
         case .generateMusic: "music.note"
         case .generateVideo: "film"
@@ -80,6 +82,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         case .listProcesses: "List Processes"
         case .createTask: "Create Task"
         case .generateImage: "Generate Image"
+        case .listImageModels: "List Image Models"
         case .generateSpeech: "Generate Speech"
         case .generateMusic: "Generate Music"
         case .generateVideo: "Generate Video"
@@ -127,7 +130,7 @@ enum AgentToolGroup: String, CaseIterable, Sendable {
         case .files: [.readFile, .readImage, .writeFile, .editFile, .searchFiles, .listFiles, .cwd]
         case .shell: [.shell, .listProcesses, .readProcessOutput, .killProcess]
         case .web: [.browse, .webSearch]
-        case .media: [.generateImage, .generateSpeech, .generateMusic, .generateVideo]
+        case .media: [.generateImage, .listImageModels, .generateSpeech, .generateMusic, .generateVideo]
         case .knowledge: [.saveMemory, .createTask]
         }
     }

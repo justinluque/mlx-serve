@@ -25,9 +25,10 @@ final class ProcessToolSchemaTests: XCTestCase {
     func testToolCountIncludesNewProcessTools() {
         // 11 base (shell, cwd, writeFile, readFile, editFile, searchFiles,
         // listFiles, browse, webSearch, saveMemory, createTask) + 3 process
-        // (killProcess, readProcessOutput, listProcesses) + 4 media
-        // (generate_image, generate_speech, generate_music, generate_video) = 18.
-        XCTAssertEqual(defs().count, 18)
+        // (killProcess, readProcessOutput, listProcesses) + 1 read_image + 5 media
+        // (generate_image, list_image_models, generate_speech, generate_music,
+        // generate_video) = 20.
+        XCTAssertEqual(defs().count, 20)
     }
 
     /// The four media-generation tools, each with exactly one required argument
@@ -49,7 +50,7 @@ final class ProcessToolSchemaTests: XCTestCase {
     /// nothing, spent out of a small model's budget.
     func testMediaToolOptionalArgumentsAreOnesWeRead() {
         let tools = byName()
-        let expected = ["generate_image": Set(["prompt", "size"]),
+        let expected = ["generate_image": Set(["prompt", "size", "model"]),
                         "generate_speech": Set(["text", "speed"]),
                         "generate_music": Set(["prompt", "lyrics", "duration_seconds",
                                                "bpm", "keyscale", "time_signature", "vocal_language"]),

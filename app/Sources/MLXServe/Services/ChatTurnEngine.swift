@@ -1232,6 +1232,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                                            session: sessionId)
                             ?? "Error: media generation unavailable."
                     },
+                    listImageModels: { [weak self] in
+                        self?.listImageModelsText() ?? "Error: listing image models unavailable."
+                    },
                     processRegistry: appState.processRegistry,
                     sessionId: sessionId,
                     allowedTools: config.tools
@@ -1456,13 +1459,45 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         return "The \(window.lowercased()) model “\(name)” isn't downloaded yet, so I can't make that. Open the \(window) generation window once (menu-bar tray ▸ \(window)) to download it (~\(approxGB) GB), then ask me again."
     }
 
+    /// `list_image_models` meta-tool: names every id `generate_image`'s own
+    /// `model` argument accepts. Gathers the live inputs (custom on-disk
+    /// models, the saved default, download state) and hands them to the pure
+    /// `ImageModelCatalog.listingText`.
+    func listImageModelsText() -> String {
+        let allModels = appState.server.allModels
+        return ImageModelCatalog.listingText(
+            customs: CustomMediaModels.imagePresets(from: allModels),
+            currentId: ImageGenSettings.load().modelId,
+            isDownloaded: { ServerManager.resolveModelDir(repo: $0.repo) != nil })
+    }
+
     private func runImageTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = ImageGenSettings.load()
-        let model = s.resolvedModel(models: appState.server.allModels)
-        // A LAN model picked in the Image pane needs no local download — the
-        // hosting Mac has the weights.
-        let lanId = LanPick.lanId(s.modelId)
+        let allModels = appState.server.allModels
+        // An explicit `model` argument overrides the user's saved Image-pane
+        // pick for this ONE call — the id must be one `list_image_models` just
+        // named (built-in catalog id, or a custom on-disk repo id), never a
+        // fuzzy match: a model an agent invents by guessing is a model that
+        // silently generates with whatever the saved default happened to be.
+        let requestedId = args["model"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model: ImageModelPreset
+        let pickedId: String
+        if let requestedId, !requestedId.isEmpty {
+            guard let match = ImageModelCatalog.resolve(requestedId: requestedId, customLookup: {
+                CustomMediaModels.imagePreset(for: $0, from: allModels)
+            }) else {
+                return "Error: unknown image model \"\(requestedId)\". Call list_image_models to see the available ids."
+            }
+            model = match
+            pickedId = requestedId
+        } else {
+            model = s.resolvedModel(models: allModels)
+            pickedId = s.modelId
+        }
+        // A LAN model picked (in the Image pane, or by this call) needs no
+        // local download — the hosting Mac has the weights.
+        let lanId = LanPick.lanId(pickedId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: "\(model.approxDownloadGB)",
                                             window: "Image", lanId: lanId) { return notice }
@@ -1479,7 +1514,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // before the ref line) while `splitInlineImage` still finds the payload;
         // a ref line after the base64 would put the whole data URI in the
         // caption the model reads.
-        let caption = "Generated a \(req.width)×\(req.height) image for: \(req.prompt). Saved to \(path)."
+        let modelNote = requestedId != nil ? " (model: \(model.name))" : ""
+        let caption = "Generated a \(req.width)×\(req.height) image for: \(req.prompt)\(modelNote). Saved to \(path)."
         let ref = AgentMediaInline.mediaRefLine(kind: .image, path: path)
         guard let dataURI = AgentMediaInline.imageFileToJpegDataURI(path) else {
             return "\(caption)\n\(ref)"

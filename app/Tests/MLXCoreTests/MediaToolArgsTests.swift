@@ -426,9 +426,12 @@ final class MediaToolArgsTests: XCTestCase {
                        "generate_audio is ambiguous next to generate_music — it was split")
     }
 
-    func testMediaGroupHoldsAllFourTools() {
+    func testMediaGroupHoldsTheFourGenerationToolsPlusTheImageModelLister() {
+        // list_image_models is read-only (no generation), but it exists only to
+        // steer generate_image's own `model` argument — turning Media tools off
+        // must turn it off too, so it rides the same group.
         XCTAssertEqual(Set(AgentToolGroup.media.tools),
-                       [.generateImage, .generateSpeech, .generateMusic, .generateVideo])
+                       [.generateImage, .listImageModels, .generateSpeech, .generateMusic, .generateVideo])
     }
 
     @MainActor
