@@ -1842,3 +1842,24 @@ at 4 bits but 8% at 8 bits: bf16's 7-bit mantissa rounds every output, a floor
 that grows relative to the quantization error as bits rise. The quantizer's
 objective, and the check, is the f32 error of the stored VALUES — upcast scales
 and biases before dequantizing. Guard: `tests/image_quant.py --self-test`.
+
+## Image packs: what the renders saw that the metrics did not (2026-09-13)
+
+**The converter's source loader kept every tensor it had read.** `Source` held the
+dict `mx.load` returns, and an evaluated lazy array keeps its buffer while anything
+references it, so converting the klein 9B text encoder reached a 13 GB GPU
+footprint and a 26 GB Krea transformer could not have fit. The engine's media
+preflight, booted right after a conversion, read ~6 GB less free memory than it did
+a minute later. `_Tensors` hands out a fresh lazy array per lookup. Guard: `reading
+every source tensor keeps at most one resident` (6.1 held before, under 1 after).
+
+**At the same pack size, the allocator alone scored better and looked worse.** On
+klein 9B at 8.56 GB, allocator-only won SSIM on 7 of 8 held-out prompts, yet its
+renders lost lettering detail. Holding the nine conditioning linears at bf16
+(unsloth's GGUF recipe) looked near the reference; adding text-encoder `down_proj`
+at 6-bit on llama.cpp's `use_more_bits` layers was closer again (6 of 8). Edge blocks
+at 5-bit starved the middle blocks and lost. A 4-step sampler turns weight error into
+composition drift, which is what pixel metrics rank, so render A/Bs are judged by
+eye. `floor_for` carries only the pins that won; Krea's copy is the klein recipe in
+Krea's names, checked against its reference but not A/B'd alone. Guard: the
+converters' `floor_for` self-tests.

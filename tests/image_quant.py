@@ -10,9 +10,10 @@ mx.quantize's. It is the search of dsv4_imatrix.weighted_affine_quant, run on
 the GPU at every width the engine reads.
 
 Across tensors, `allocate` spends a byte budget on the largest cut in weighted
-relative error per byte, over errors MEASURED at every candidate width. Which
-layers deserve bits is read off the checkpoint and its activations, never
-written down here.
+relative error per byte, over errors MEASURED at every candidate width. A
+converter floors a linear's width (`apply_floors`) only where renders at the same
+pack size showed it matters; everything else is read off the checkpoint and its
+activations.
 
 The output is mx.quantize's affine layout (U32 weights + BF16 scales/biases,
 group 64): `flux.QLinear` and `krea.MixedLinear` solve it from geometry, and a
@@ -28,6 +29,7 @@ import heapq
 import json
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,15 +72,30 @@ def resolve_src(src: str) -> Path:
     return snap
 
 
+class _Tensors(Mapping):
+    """Every lookup is a fresh lazy array, so a tensor its caller evaluated is freed
+    when the caller drops it; a dict of `mx.load` results keeps every one resident."""
+
+    def __init__(self, index: dict[str, Path]):
+        self.index = index
+
+    def __getitem__(self, key: str) -> mx.array:
+        return mx.load(str(self.index[key]))[key]
+
+    def __iter__(self):
+        return iter(self.index)
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+
 class Source:
     """Lazy tensors from safetensors files: `mx.load` maps a file without reading
     it, and a tensor's bytes are read only when it is evaluated."""
 
     def __init__(self, files: list[Path]):
         self.files = [Path(f) for f in files]
-        self.tensors: dict[str, mx.array] = {}
-        for f in self.files:
-            self.tensors.update(mx.load(str(f)))
+        self.tensors = _Tensors({k: f for f in self.files for k in mx.load(str(f))})
         if not self.tensors:
             sys.exit(f"no tensors in {[str(f) for f in self.files]}")
 
@@ -341,6 +358,21 @@ def measure(plans: list[Plan], get, imatrix: Imatrix, cache: Path | None = None,
             + " ".join(f"{b}b={e:.2e}" for b, e in sorted(p.errors.items()) if b != DENSE))
 
 
+def use_more_bits(layer: int, n_layers: int) -> bool:
+    """llama.cpp's layers for a wider ffn_down (llama_tensor_get_type): the first and
+    last eighth of the stack and every third layer between."""
+    return layer < n_layers // 8 or layer >= 7 * n_layers // 8 or (layer - n_layers // 8) % 3 == 2
+
+
+def apply_floors(plans: list[Plan], floor_for) -> None:
+    """Drop every candidate width below `floor_for(module)` (None = no floor), so
+    `allocate` starts the plan there. DENSE is always a candidate, so no plan empties."""
+    for p in plans:
+        floor = floor_for(p.module)
+        if floor is not None:
+            p.errors = {b: e for b, e in p.errors.items() if b >= floor}
+
+
 def allocate(plans: list[Plan], budget: int) -> int:
     """Choose every plan's width to minimise summed weighted relative error in
     `budget` bytes: start each at its narrowest candidate, then keep buying the
@@ -349,7 +381,7 @@ def allocate(plans: list[Plan], budget: int) -> int:
         p.width = min(p.errors)
     spent = sum(p.bytes_at(p.width) for p in plans)
     if spent > budget:
-        sys.exit(f"budget {budget / 1e9:.3f} GB is below the {min(WIDTHS)}-bit floor ({spent / 1e9:.3f} GB)")
+        sys.exit(f"budget {budget / 1e9:.3f} GB is below the narrowest this component allows ({spent / 1e9:.3f} GB)")
     heap: list = []
 
     def offer(i: int) -> None:
@@ -452,10 +484,11 @@ def emit(writer: ShardWriter, plan: Plan, w: mx.array, ch: mx.array | None) -> N
 
 
 def convert(component: str, source: Source, rename, writer: ShardWriter, imatrix: Imatrix,
-            bits_per_weight: float, work: Path) -> dict:
+            bits_per_weight: float, work: Path, floor_for=None) -> dict:
     """One component. `rename(key)` is a tensor's pack key, or None to leave it
-    out. Every kept 2-D `.weight` is a linear placed by `allocate`; everything
-    else is stored as-is, floating tensors in bf16. Returns the config.json record."""
+    out. Every kept 2-D `.weight` is a linear placed by `allocate`, no narrower than
+    `floor_for(module)` when one is given; everything else is stored as-is, floating
+    tensors in bf16. Returns the config.json record."""
     names: dict[str, str] = {}
     for key in sorted(source.tensors):
         name = rename(key)
@@ -472,6 +505,8 @@ def convert(component: str, source: Source, rename, writer: ShardWriter, imatrix
 
     fingerprint = f"{source.fingerprint()}:{imatrix.digest}:{WIDTHS}:{GROUP_SIZE}:{SAMPLE_ROWS}"
     measure(plans, get, imatrix, work / f"{component}.errors.json", fingerprint)
+    if floor_for:
+        apply_floors(plans, floor_for)
     spent = allocate(plans, budget_for(plans, bits_per_weight))
     for i, p in enumerate(plans):
         emit(writer, p, get(p.module), imatrix.weights(p.module, p.in_dim))
@@ -580,6 +615,30 @@ def self_test() -> int:
         ("transformer", "blocks.0.attn.wq", "transformer/blocks.0.attn.wq"),
     ):
         check(module_key(comp, mod) == want, f"module_key mirrors imatrix.moduleKey: {mod}")
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "t.safetensors"
+        mx.save_safetensors(str(f), {f"t{i}": mx.random.normal((2048, 2048)) for i in range(6)})
+        src = Source([f])
+        mx.clear_cache()
+        base = mx.get_active_memory()
+        for k in sorted(src.tensors):
+            w = src.tensors[k]
+            mx.eval(mx.take(w, mx.arange(0, 2048, 16), axis=0))
+            del w
+            mx.clear_cache()
+        held = (mx.get_active_memory() - base) / (2048 * 2048 * 4)
+        check(held < 2, f"reading every source tensor keeps at most one resident ({held:.1f} held)")
+
+    check([i for i in range(36) if use_more_bits(i, 36)] == [0, 1, 2, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 31, 32, 33, 34, 35],
+          "use_more_bits is llama.cpp's first eighth, last eighth and every third layer between")
+    ps = plans()
+    apply_floors(ps, {"big": DENSE, "small": 6}.get)
+    check(sorted(ps[0].errors) == [DENSE] and min(ps[1].errors) == 6 and sorted(ps[2].errors) == [DENSE],
+          "a floor drops every narrower candidate and leaves unfloored plans alone")
+    allocate(ps, sum(p.bytes_at(min(p.errors)) for p in ps))
+    check([p.width for p in ps] == [DENSE, 6, DENSE], "the allocator starts a floored plan at its floor")
 
     print(f"\n{'OK' if not failures else 'FAILED'}: {len(failures)} failure(s)")
     return 1 if failures else 0

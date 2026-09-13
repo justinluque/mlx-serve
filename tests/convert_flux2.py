@@ -62,6 +62,23 @@ def te_name(key: str) -> str | None:
     return key
 
 
+# At the same pack size, renders read closer to the reference with the conditioning
+# path held at bf16 than with the allocator choosing its width.
+CONDITIONING = re.compile(r"^(x_embedder|context_embedder|time_guidance_embed\.linear_\d"
+                          r"|(double_stream_modulation_(img|txt)|single_stream_modulation|norm_out)\.linear|proj_out)$")
+
+
+def floor_for(component: str, module: str, te_layers: int) -> int | None:
+    """The narrowest width a linear may be stored at, or None to leave it to the allocator."""
+    if component == "transformer" and CONDITIONING.match(module):
+        return iq.DENSE
+    m = re.fullmatch(r"layers\.(\d+)\.mlp\.down_proj", module)
+    # llama.cpp's Q4_K_M widens ffn_down on these layers; renders read closer again.
+    if component == "text_encoder" and m and iq.use_more_bits(int(m.group(1)), te_layers):
+        return 6
+    return None
+
+
 def vae_name(key: str) -> str | None:
     if key.endswith("num_batches_tracked"):
         return None
@@ -101,9 +118,11 @@ def main() -> int:
     work = Path(args.work).expanduser() / out.name
     work.mkdir(parents=True, exist_ok=True)
 
+    te_layers = json.loads((src / "text_encoder" / "config.json").read_text())["num_hidden_layers"]
     te = iq.convert("text_encoder", iq.Source.dir(src / "text_encoder"), te_name,
                     iq.ShardWriter(out / "text_encoder", "model"),
-                    iq.Imatrix(args.imatrix, "text_encoder"), args.te_bpw, work)
+                    iq.Imatrix(args.imatrix, "text_encoder"), args.te_bpw, work,
+                    lambda m: floor_for("text_encoder", m, te_layers))
     convert_vae(src / "vae", out / "vae")
     shutil.copytree(src / "tokenizer", out / "tokenizer", dirs_exist_ok=True)
 
@@ -112,7 +131,8 @@ def main() -> int:
     staging = out / "transformer.partial"
     dit = iq.convert("transformer", dit_source, dit_name,
                      iq.ShardWriter(staging, "model", index="model.safetensors.index.json"),
-                     iq.Imatrix(args.imatrix, "transformer"), args.dit_bpw, work)
+                     iq.Imatrix(args.imatrix, "transformer"), args.dit_bpw, work,
+                     lambda m: floor_for("transformer", m, te_layers))
     staging.rename(out / "transformer")
 
     size = {3072: "4b", 4096: "9b"}.get(inner, f"inner{inner}")
@@ -159,6 +179,15 @@ def self_test() -> int:
     check(vae_name("bn.num_batches_tracked") is None, "vae batch-norm counter is dropped")
     conv = mx.zeros((512, 32, 3, 3)).transpose(0, 2, 3, 1)
     check(tuple(conv.shape) == (512, 3, 3, 32), "vae conv OIHW -> OHWI matches the mflux pack's decoder.conv_in")
+    for module in ("x_embedder", "context_embedder", "time_guidance_embed.linear_1", "time_guidance_embed.linear_2",
+                   "double_stream_modulation_img.linear", "double_stream_modulation_txt.linear",
+                   "single_stream_modulation.linear", "norm_out.linear", "proj_out"):
+        check(floor_for("transformer", module, 36) == iq.DENSE, f"conditioning tensor {module} is held at bf16")
+    check(floor_for("transformer", "transformer_blocks.0.attn.to_q", 36) is None, "block linears are left to the allocator")
+    check([i for i in range(TE_LAYERS_RUN) if floor_for("text_encoder", f"layers.{i}.mlp.down_proj", 36) == 6]
+          == [0, 1, 2, 3, 6, 9, 12, 15, 18, 21, 24], "text-encoder down_proj is floored at 6 bits on llama.cpp's layers")
+    check(floor_for("text_encoder", "layers.0.self_attn.q_proj", 36) is None
+          and floor_for("text_encoder", "embed_tokens", 36) is None, "other text-encoder linears are left to the allocator")
     print(f"\n{'OK' if not failures else 'FAILED'}: {len(failures)} failure(s)")
     return 1 if failures else 0
 

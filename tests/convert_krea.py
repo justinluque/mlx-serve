@@ -59,6 +59,22 @@ def te_name(key: str) -> str | None:
     return key
 
 
+# The klein 9B recipe in Krea's names: the conditioning path held at bf16 read closer
+# to the reference at the same pack size than with the allocator choosing its width.
+CONDITIONING = re.compile(r"^(first|last\.linear|tmlp\.\d+|tproj\.\d+|txtmlp\.\d+|txtfusion\.projector)$")
+
+
+def floor_for(component: str, module: str, te_layers: int) -> int | None:
+    """The narrowest width a linear may be stored at, or None to leave it to the allocator."""
+    if component == "transformer" and CONDITIONING.match(module):
+        return iq.DENSE
+    m = re.fullmatch(r"language_model\.layers\.(\d+)\.mlp\.down_proj", module)
+    # llama.cpp's Q4_K_M widens ffn_down on these layers.
+    if component == "text_encoder" and m and iq.use_more_bits(int(m.group(1)), te_layers):
+        return 6
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", default="krea/Krea-2-Turbo")
@@ -79,11 +95,17 @@ def main() -> int:
     work = Path(args.work).expanduser() / out.name
     work.mkdir(parents=True, exist_ok=True)
 
+    te_cfg = json.loads((src / "text_encoder" / "config.json").read_text())
+    te_layers = te_cfg.get("text_config", {}).get("num_hidden_layers", te_cfg.get("num_hidden_layers"))
+    if not te_layers:
+        sys.exit(f"{src / 'text_encoder' / 'config.json'}: no num_hidden_layers")
     dit = iq.convert("transformer", iq.Source([turbo]), dit_name, iq.ShardWriter(out, "transformer"),
-                     iq.Imatrix(args.imatrix, "transformer"), args.dit_bpw, work)
+                     iq.Imatrix(args.imatrix, "transformer"), args.dit_bpw, work,
+                     lambda m: floor_for("transformer", m, te_layers))
     te = iq.convert("text_encoder", iq.Source.dir(src / "text_encoder"), te_name,
                     iq.ShardWriter(out / "text_encoder", "model"),
-                    iq.Imatrix(args.imatrix, "text_encoder"), args.te_bpw, work)
+                    iq.Imatrix(args.imatrix, "text_encoder"), args.te_bpw, work,
+                    lambda m: floor_for("text_encoder", m, te_layers))
     shutil.copyfile(src / "text_encoder" / "config.json", out / "text_encoder" / "config.json")
     (out / "vae").mkdir(exist_ok=True)
     for fn in ("config.json", "diffusion_pytorch_model.safetensors"):
@@ -120,6 +142,13 @@ def self_test() -> int:
     check(te_name("visual.blocks.0.attn.proj.weight") is None, "the vision tower is dropped")
     check(te_name("language_model.embed_tokens.weight") == "language_model.embed_tokens.weight", "the token table is kept")
     check(dit_name("blocks.27.mlp.down.weight") == "blocks.27.mlp.down.weight", "transformer keys pass through unchanged")
+    for module in ("first", "last.linear", "tmlp.0", "tmlp.2", "tproj.1", "txtmlp.1", "txtmlp.3", "txtfusion.projector"):
+        check(floor_for("transformer", module, 36) == iq.DENSE, f"conditioning tensor {module} is held at bf16")
+    check(floor_for("transformer", "blocks.0.attn.wq", 36) is None, "block linears are left to the allocator")
+    check([i for i in range(TE_LAYERS_RUN) if floor_for("text_encoder", f"language_model.layers.{i}.mlp.down_proj", 36) == 6]
+          == [0, 1, 2, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 31, 32, 33, 34],
+          "text-encoder down_proj is floored at 6 bits on llama.cpp's layers")
+    check(floor_for("text_encoder", "language_model.embed_tokens", 36) is None, "the token table is left to the allocator")
     print(f"\n{'OK' if not failures else 'FAILED'}: {len(failures)} failure(s)")
     return 1 if failures else 0
 
