@@ -19,6 +19,7 @@ const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const lora_mod = @import("lora.zig");
+const imatrix_mod = @import("imatrix.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
@@ -347,8 +348,19 @@ const FluxImpl = struct {
         const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{model_dir});
         defer allocator.free(tok_dir);
         self.tok = try tok_mod.loadTokenizerAny(io, allocator, tok_dir);
+        errdefer self.tok.deinit();
+        if (imatrix_mod.active) |im| try self.armImatrix(im);
         log.info("[image] FLUX models + tokenizer ready\n", .{});
         return self;
+    }
+
+    /// Slots in the armed collector for every resident projection. A low-mem
+    /// encoder re-arms after each reload; slots are found by key, so it keeps
+    /// accumulating into the same ones.
+    fn armImatrix(self: *FluxImpl, im: *imatrix_mod.Imatrix) !void {
+        const nd = try flux.armDitImatrix(&self.dit, im);
+        const nt = if (self.te) |*t| try flux.armTextEncoderImatrix(t, im) else 0;
+        log.info("[image] FLUX imatrix armed: {d} transformer + {d} text_encoder projections\n", .{ nd, nt });
     }
 
     fn deinit(self: *FluxImpl) void {
@@ -430,6 +442,7 @@ const FluxImpl = struct {
         // (pinned by tests/test_flux_lowmem.sh).
         if (self.te == null) {
             self.te = try flux.loadTextEncoder(self.io, self.allocator, self.s, self.model_dir);
+            if (imatrix_mod.active) |im| _ = try flux.armTextEncoderImatrix(&self.te.?, im);
         }
         // Classifier-free guidance (base klein): encode the negative prompt
         // (default "" — unconditional) at the SAME fixed length, so the
@@ -537,6 +550,7 @@ pub const ImageEngine = struct {
         const self = try allocator.create(ImageEngine);
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .backend = undefined };
+        try imatrix_mod.armFromEnv(allocator);
         // Re-peek the arch to pick the backend (detectModality already proved the
         // config parses). `mage_flow*` → MageFlow; `krea*` → Krea; else FLUX.
         if (peekModelType(io, allocator, model_dir)) |mt| {
@@ -546,7 +560,10 @@ pub const ImageEngine = struct {
                 return self;
             }
             if (std.mem.startsWith(u8, mt, "krea")) {
-                self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
+                const k = try krea.Engine.load(io, allocator, model_dir);
+                errdefer k.deinit();
+                if (imatrix_mod.active) |im| try krea.armImatrix(k, im);
+                self.backend = .{ .krea = k };
                 return self;
             }
         }
@@ -681,6 +698,13 @@ pub const ImageEngine = struct {
     /// Generate the raw image [1,3,H,W] f32 [0,1] (owned mlx array). Lets the
     /// caller run the content filter on the pixels before PNG-encoding.
     pub fn generateImage(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
+        const img = try self.generateBackend(allocator, prompt, width, height, seed, steps, opts, progress);
+        // Saved per generation, so an interrupted calibration keeps what it measured.
+        if (imatrix_mod.active) |im| im.save() catch |e| log.warn("[imatrix] save failed: {}\n", .{e});
+        return img;
+    }
+
+    fn generateBackend(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
         return switch (self.backend) {
             .flux => |*f| f.generateImage(allocator, prompt, width, height, seed, steps, opts, progress),
             .krea => |k| blk: {

@@ -21,6 +21,7 @@ const png = @import("png.zig");
 const tok_mod = @import("tokenizer.zig");
 const lora_mod = @import("lora.zig");
 const ane = @import("ane.zig");
+const imatrix_mod = @import("imatrix.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -191,10 +192,23 @@ const MixedLinear = struct {
     // Fixed-capacity so attach/forward never allocate.
     lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
     lora_count: u8 = 0,
+    /// The checkpoint key this linear loaded from (`imatrix.armAll`). `im_slot`
+    /// stays -1 unless a collection is armed, so a forward pays one comparison.
+    name: []u8 = &.{},
+    name_allocator: ?std.mem.Allocator = null,
+    im_slot: i32 = -1,
 
     /// `in_features` is the module's input dim (known per call); used only on
     /// the quantized path to solve (bits, group_size) from packed geometry.
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, s: S) !MixedLinear {
+        var ml = try loadArrays(w, a, prefix, in_features, s);
+        errdefer ml.deinit();
+        ml.name = try a.dupe(u8, prefix);
+        ml.name_allocator = a;
+        return ml;
+    }
+
+    fn loadArrays(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, s: S) !MixedLinear {
         const wk = try fmtKey(a, "{s}.weight", .{prefix});
         defer a.free(wk);
         const sk = try fmtKey(a, "{s}.scales", .{prefix});
@@ -234,6 +248,7 @@ const MixedLinear = struct {
     }
 
     fn deinit(self: *MixedLinear) void {
+        if (self.name_allocator) |na| na.free(self.name);
         _ = mlx.mlx_array_free(self.w);
         if (self.quantized) {
             _ = mlx.mlx_array_free(self.scales);
@@ -243,6 +258,11 @@ const MixedLinear = struct {
     }
 
     fn forward(self: *const MixedLinear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        // The INPUT is the statistic, read before the projection and any LoRA
+        // delta: a calibrated re-quantization is of the base weight.
+        if (imatrix_mod.active) |im| {
+            if (self.im_slot >= 0) im.observe(@intCast(self.im_slot), x, s) catch {};
+        }
         const xb = try astype(x, .bfloat16, s); // reference computes in bf16
         defer _ = mlx.mlx_array_free(xb);
         var o = mlx.mlx_array_new();
@@ -352,15 +372,86 @@ const TeLayer = struct {
     }
 };
 
+/// Encoder layers the conditioner loads and runs: the last tap reads the INPUT
+/// of layer `SELECT_LAYERS[last]`, so that layer itself never reaches the DiT.
+const TE_LAYERS_RUN: usize = SELECT_LAYERS[SELECT_LAYERS.len - 1];
+
+/// A token table kept at its STORED width: rows are dequantized as they are
+/// gathered, so a quantized table never costs its bf16 size in memory.
+const TokenTable = struct {
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array = .{ .ctx = null },
+    biases: mlx.mlx_array = .{ .ctx = null },
+    bits: u32 = 0,
+    group_size: u32 = 0,
+
+    /// `cols` is the row width, which solves (bits, group_size) from geometry.
+    fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cols: u32, s: S) !TokenTable {
+        const wk = try fmtKey(a, "{s}.weight", .{prefix});
+        defer a.free(wk);
+        const sk = try fmtKey(a, "{s}.scales", .{prefix});
+        defer a.free(sk);
+        const bk = try fmtKey(a, "{s}.biases", .{prefix});
+        defer a.free(bk);
+        const raw = try ownWeight(w, wk);
+        if (ownOpt(w, sk)) |scales| {
+            errdefer {
+                _ = mlx.mlx_array_free(raw);
+                _ = mlx.mlx_array_free(scales);
+            }
+            const w_cols: u32 = @intCast(mlx.getShape(raw)[1]);
+            const s_cols: u32 = @intCast(mlx.getShape(scales)[1]);
+            return .{
+                .w = raw,
+                .scales = scales,
+                .biases = try ownWeight(w, bk),
+                .bits = @intCast(@divExact(32 * w_cols, cols)),
+                .group_size = @intCast(@divExact(cols, s_cols)),
+            };
+        }
+        defer _ = mlx.mlx_array_free(raw);
+        return .{ .w = try astype(raw, .bfloat16, s) };
+    }
+
+    fn deinit(self: *TokenTable) void {
+        _ = mlx.mlx_array_free(self.w);
+        if (self.scales.ctx != null) {
+            _ = mlx.mlx_array_free(self.scales);
+            _ = mlx.mlx_array_free(self.biases);
+        }
+    }
+
+    /// bf16 rows [n, cols] for int32 `ids` [n].
+    fn lookup(self: *const TokenTable, ids: mlx.mlx_array, s: S) !mlx.mlx_array {
+        var rows = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_take_axis(&rows, self.w, ids, 0, s)) catch |e| {
+            _ = mlx.mlx_array_free(rows);
+            return e;
+        };
+        if (self.scales.ctx == null) return rows;
+        defer _ = mlx.mlx_array_free(rows);
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        try mlx.check(mlx.mlx_take_axis(&sc, self.scales, ids, 0, s));
+        var bi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bi);
+        try mlx.check(mlx.mlx_take_axis(&bi, self.biases, ids, 0, s));
+        var o = mlx.mlx_array_new();
+        const null_gs = mlx.mlx_array{ .ctx = null };
+        try mlx.check(mlx.mlx_dequantize(&o, rows, sc, bi, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", null_gs, .{ .value = .bfloat16, .has_value = true }, s));
+        return o;
+    }
+};
+
 pub const Conditioner = struct {
     cfg: KreaConfig,
     allocator: std.mem.Allocator,
     s: S,
-    embed_table: mlx.mlx_array, // [vocab, hidden] bf16
+    embed: TokenTable, // [vocab, hidden]
     layers: []TeLayer,
 
     pub fn deinit(self: *Conditioner) void {
-        _ = mlx.mlx_array_free(self.embed_table);
+        self.embed.deinit();
         for (self.layers) |*l| l.deinit();
         self.allocator.free(self.layers);
     }
@@ -377,9 +468,8 @@ pub const Conditioner = struct {
         const id_shape = [_]c_int{seq};
         const id_arr = mlx.mlx_array_new_data(ids.ptr, &id_shape, 1, .int32);
         defer _ = mlx.mlx_array_free(id_arr);
-        var taken = mlx.mlx_array_new();
+        const taken = try self.embed.lookup(id_arr, s);
         defer _ = mlx.mlx_array_free(taken);
-        try mlx.check(mlx.mlx_take_axis(&taken, self.embed_table, id_arr, 0, s));
         var x = try reshape(taken, &[_]c_int{ 1, seq, H }, s);
 
         const attn_mask = try buildCausalMask(self.allocator, mask, seq, s);
@@ -400,17 +490,17 @@ pub const Conditioner = struct {
             _ = mlx.mlx_array_free(caps[i]);
         };
 
-        for (self.layers, 0..) |*layer, li| {
-            // HF output_hidden_states: capture BEFORE each layer.
-            for (SELECT_LAYERS) |wv| {
-                if (wv == li) {
-                    var cp = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_array_set(&cp, x));
-                    caps[ncap] = cp;
-                    ncap += 1;
-                }
+        // HF output_hidden_states: capture the INPUT of each tapped layer; the
+        // last tap is the output of the last layer run.
+        for (0..self.layers.len + 1) |li| {
+            if (std.mem.indexOfScalar(usize, &SELECT_LAYERS, li) != null) {
+                var cp = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&cp, x));
+                caps[ncap] = cp;
+                ncap += 1;
             }
-            const nx = try self.layerForward(x, layer, attn_mask, rope.cos, rope.sin, seq, s);
+            if (li == self.layers.len) break;
+            const nx = try self.layerForward(x, &self.layers[li], attn_mask, rope.cos, rope.sin, seq, s);
             _ = mlx.mlx_array_free(x);
             x = nx;
         }
@@ -582,16 +672,12 @@ pub fn loadConditioner(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir
     // key. Some flat exports omit it — fall back to no prefix.
     const pfx: []const u8 = if (w.get("language_model.embed_tokens.weight") != null) "language_model." else "";
 
-    const ek = try fmtKey(allocator, "{s}embed_tokens.weight", .{pfx});
+    const ek = try fmtKey(allocator, "{s}embed_tokens", .{pfx});
     defer allocator.free(ek);
-    te.embed_table = try ownWeight(&w, ek);
-    {
-        const bf = try astype(te.embed_table, .bfloat16, s);
-        _ = mlx.mlx_array_free(te.embed_table);
-        te.embed_table = bf;
-    }
+    te.embed = try TokenTable.load(&w, allocator, ek, te.cfg.te_hidden, s);
+    errdefer te.embed.deinit();
 
-    te.layers = try allocator.alloc(TeLayer, te.cfg.te_layers);
+    te.layers = try allocator.alloc(TeLayer, TE_LAYERS_RUN);
     const H = te.cfg.te_hidden;
     const inter = te.cfg.te_inter;
     for (te.layers, 0..) |*layer, i| {
@@ -2407,6 +2493,16 @@ pub const GenOpts = struct {
     cond_weights: ?[]const f32 = null,
 };
 
+/// Slots in the armed collector for every DiT and text-encoder projection. The
+/// ANE MLP offload stays off while collecting: its share of each MLP never
+/// passes through a `MixedLinear`, so the statistics would miss it.
+pub fn armImatrix(e: *Engine, im: *imatrix_mod.Imatrix) !void {
+    const nd = try imatrix_mod.armAll(MixedLinear, Dit, &e.dit, im, "transformer");
+    const nt = try imatrix_mod.armAll(MixedLinear, Conditioner, &e.te, im, "text_encoder");
+    e.dit.ane_tried = true;
+    log.info("[krea] imatrix armed: {d} transformer + {d} text_encoder projections (ANE offload off)\n", .{ nd, nt });
+}
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     s: S,
@@ -3123,4 +3219,81 @@ test "aneBlockEligible: fp16 plane grid, quantized only, never under a LoRA" {
     try testing.expect(!aneBlockEligible(4608, false, 0)); // bf16 pack
     try testing.expect(!aneBlockEligible(4600, true, 0)); // off the 32-row pitch
     try testing.expect(!aneBlockEligible(128, true, 0)); // under the engagement floor
+}
+
+test "krea conditioner runs through its last tap and no further" {
+    // The last tap is the INPUT of layer 35, so layer 35 is never loaded or run.
+    try testing.expectEqual(@as(usize, 35), TE_LAYERS_RUN);
+    for (SELECT_LAYERS) |l| try testing.expect(l <= TE_LAYERS_RUN);
+}
+
+test "krea token table solves its width from geometry and gathers the dequantized rows" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+    const rows = 6;
+    const cols = 128;
+    var tbuf: [rows * cols]f32 = undefined;
+    for (&tbuf, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.21);
+    const tsh = [_]c_int{ rows, cols };
+    const table = mlx.mlx_array_new_data(&tbuf, &tsh, 2, .float32);
+    defer _ = mlx.mlx_array_free(table);
+    var vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_quantize(&vec, table, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{}, s));
+    var ww = model_mod.Weights.init(a);
+    defer ww.deinit();
+    inline for (.{ "weight", "scales", "biases" }, 0..) |suffix, i| {
+        var arr = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&arr, vec, i));
+        try ww.map.put(try std.fmt.allocPrint(a, "embed_tokens.{s}", .{suffix}), arr);
+    }
+    var tt = try TokenTable.load(&ww, a, "embed_tokens", cols, s);
+    defer tt.deinit();
+    try testing.expectEqual(@as(u32, 8), tt.bits);
+    try testing.expectEqual(@as(u32, 64), tt.group_size);
+
+    var ibuf = [_]i32{ 3, 1 };
+    const ish = [_]c_int{2};
+    const ids = mlx.mlx_array_new_data(&ibuf, &ish, 1, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    const got = try tt.lookup(ids, s);
+    defer _ = mlx.mlx_array_free(got);
+    const gf = try astype(got, .float32, s);
+    defer _ = mlx.mlx_array_free(gf);
+    _ = mlx.mlx_array_eval(gf);
+    const d = mlx.mlx_array_data_float32(gf).?;
+    for (0..cols) |j| {
+        try testing.expectApproxEqAbs(tbuf[3 * cols + j], d[j], 0.02);
+        try testing.expectApproxEqAbs(tbuf[1 * cols + j], d[cols + j], 0.02);
+    }
+}
+
+test "an armed krea linear hands its input to the collector under the converter's key" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+    var wbuf = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const wsh = [_]c_int{ 2, 3 };
+    var ww = model_mod.Weights.init(a);
+    defer ww.deinit();
+    try ww.map.put(try a.dupe(u8, "language_model.layers.4.mlp.up_proj.weight"), mlx.mlx_array_new_data(&wbuf, &wsh, 2, .float32));
+    const Holder = struct { up: MixedLinear };
+    var h = Holder{ .up = try MixedLinear.load(&ww, a, "language_model.layers.4.mlp.up_proj", 3, s) };
+    defer h.up.deinit();
+    const im = try imatrix_mod.Imatrix.init(a, "/tmp/unused.safetensors");
+    defer im.deinit();
+    try testing.expectEqual(@as(usize, 1), try imatrix_mod.armAll(MixedLinear, Holder, &h, im, "text_encoder"));
+    imatrix_mod.active = im;
+    defer imatrix_mod.active = null;
+
+    var xb = [_]f32{ 1, 2, 3, 3, 2, 1, 0, 0, 1 };
+    const xsh = [_]c_int{ 1, 3, 3 };
+    const x = mlx.mlx_array_new_data(&xb, &xsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const o = try h.up.forward(x, s);
+    defer _ = mlx.mlx_array_free(o);
+    const slot: usize = @intCast(h.up.im_slot);
+    try testing.expectEqualStrings("text_encoder/layers.4.mlp.up_proj", im.keys.items[slot]);
+    try testing.expectEqual(@as(u64, 3), im.rows.items[slot]);
 }
