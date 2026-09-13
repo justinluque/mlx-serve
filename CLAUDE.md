@@ -39,7 +39,8 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `metrics.zig` | Lock-free zero-when-off observability (`--metrics`): `vllm:`+`mlx_serve:` Prometheus + JSON |
 | `ollama.zig` | `/api/*` translation, SSE→NDJSON `Sink`, tags/show/ps, `resolveName` |
 | `gen.zig` | Unified media gen: modality-named engine slots, `detectModality`/`peekModelType`, per-request handlers, img2img/edit/LoRA, residency estimators |
-| `krea.zig` / `flux.zig` | Image backends (Krea-2-Turbo / FLUX.2 klein 4B+9B); `MixedLinear` infers quant geometry |
+| `krea.zig` / `flux.zig` | Image backends (Krea-2-Turbo / FLUX.2 klein 4B+9B); `MixedLinear`/`QLinear` solve quant geometry or load dense; text encoders load only through their last tap, token tables stay quantized |
+| `imatrix.zig` | Engine-collected activation statistics for calibrated media packs (`MLX_SERVE_IMATRIX`): per-input-channel E[x²] keyed `<component>/<module>`, armed by a comptime walk over named linears. Converters: `tests/image_quant.py` |
 | `multipart.zig` | RFC 7578 form parsing, zero-copy `Part` (only non-JSON shape: `POST /v1/images/edits`) |
 | `mage_flow.zig` | MageFlow Turbo/Edit: flow DiT + DiCo VAE + Qwen3-VL TE; `MfLinear` shared with H3; DiT/TE bf16, VAE f32 (load-bearing) |
 | `hunyuan3d.zig` / `hunyuan3d_paint*.zig` | 3D shape + texture paint; converted layouts BAKE OUT per-head QKV interleaves — never "fix" it |
@@ -479,6 +480,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **Publish MTP head norms FOLDED** (`--fold-mtp-norms`): same bytes at serve time as delta + load-fold; drops reliance on detection heuristics. A pack whose BACKBONE norms move the anchor (Alis) is what breaks oMLX, not the convention.
 - **A chain that returns f32 BY DESIGN makes the CALLER own the activation dtype** (`groupLimitedRouting`): forgetting promotes the residual at the first MoE layer — ONE `[dtype-trace] residual widened` line is the symptom.
 - **Calibrated quantization**: channel weights PER-INPUT-CHANNEL and PER-EXPERT (imatrix value IS the weight); bit width beats group granularity ≤3 bits; round (s,b) to the STORED dtype before q; self-test against a weight-BLIND arm.
+- **An image pack is calibrated by the ENGINE's own activations and sized by MEASURED error per byte** (`MLX_SERVE_IMATRIX` → `imatrix.zig`, `tests/image_quant.py`), never hand tiers. No AWQ scale migration: a runtime LoRA must still compose with the stored weight. Text encoders stop at their last tap (`teLayersToLoad` refuses shallower by name).
 - **A sampler never draws a RESERVED special OR a PADDING row; the legit set is DERIVED** (`tokenizer.reservedOutputIds` + `definedVocabSize` → `installSuppressMask`, `MLX_SERVE_SUPPRESS_RESERVED=0`): `[defined, logits_dim)` decodes to nothing and is masked, unless the checkpoint declares `unpadded_vocab_size` (ONE trim, never both). Logprobs stay RAW.
 - **A hand-rolled pretokenizer is calibrated to ONE tokenizer.json — digit GROUPING is per-model** (`Tokenizer.digit_group`); mis-grouping presents as a QUALITY bug; cross-check `/tokenize` vs HF at bring-up. **A COMBINED Split regex hides the digit rule** (Llama-3 → `pretok_style = .llama3`).
 - **The degenerate-tail loop guard needs a LONG-period tier**: periods 9..64 at 10 reps (`isDegenerateTailLoopRange`).

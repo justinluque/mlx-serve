@@ -1821,3 +1821,24 @@ HF `tokenizers` on code, numbers, CJK and contractions: byte-identical ids.
 Bar: greedy 8-bit answers (thinking split, GLM `<arg_key>` tool calls,
 tool-response turn, 2.8k-token needle past the 512 window) and the HF
 reference oracle on the bf16 checkpoint (`~/claude-tmp/sparkx/oracle.py`).
+
+## Calibrating image packs: three things the obvious check could not see (2026-09-13)
+
+**A shallower FLUX text encoder was undefined behaviour, not an error.**
+`TextEncoder.encode` fills its taps after layers 9/18/27 and stacks `caps[i].?`;
+an encoder with fewer than 27 layers left a tap null and ReleaseFast unwrapped
+it. Once packs stop at the last tap the layer count is a converter choice, so
+`teLayersToLoad` refuses a shallower checkpoint by name. Guard: `flux text
+encoder loads through the last tap and refuses a shallower checkpoint`.
+
+**The ANE MLP offload hides half of every MLP from the collector.** Its share of
+gate/up/down runs inside an ANE program, never through a `MixedLinear`, so an
+imatrix collected with `--ane-image` would describe the GPU half of each channel
+set. `krea.armImatrix` sets `ane_tried` before the first forward.
+
+**`mx.dequantize` with bf16 scales computes in bf16.** A "stored error equals
+reported error" check dequantized the triple as shipped and disagreed by 0.03%
+at 4 bits but 8% at 8 bits: bf16's 7-bit mantissa rounds every output, a floor
+that grows relative to the quantization error as bits rise. The quantizer's
+objective, and the check, is the f32 error of the stored VALUES — upcast scales
+and biases before dequantizing. Guard: `tests/image_quant.py --self-test`.
