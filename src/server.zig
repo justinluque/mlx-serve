@@ -6164,7 +6164,15 @@ fn renderModelEntry(
             if (batchVerdictFor(entry) == .ok) "true" else "false",
             caps.items,
             mods.items,
-            config.model_type,
+            // A media model's `config.model_type` is `Modality.modelType()` —
+            // a generic per-modality load-dispatch marker ("flux2" for every
+            // image backend, Krea and Mage-Flow included), stamped on the CPU
+            // stub because the gen path never builds a real ModelConfig.
+            // `arch_hint` is discovery's own config.json read and survives on
+            // the registry entry across load, so a resident Krea pack reports
+            // its real architecture instead of every loaded image model
+            // reading back as "flux2" once ready.
+            if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type,
             modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
@@ -6321,6 +6329,43 @@ fn renderModelEntry(
     return std.fmt.allocPrint(allocator,
         \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
     , .{ entry.id, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+}
+
+test "renderModelEntry: a resident media model reports its OWN architecture, not the modality's generic load marker" {
+    // `config.model_type` on a media entry is `Modality.modelType()` — a
+    // fixed per-modality stub ("flux2" for every image backend, gen.zig) used
+    // only to dispatch the load, since the gen path never builds a real
+    // ModelConfig. `/v1/models` must report the checkpoint's REAL
+    // architecture (`entry.arch_hint`, discovery's own config.json read) once
+    // resident, or every loaded image model — Krea and Mage-Flow included —
+    // reads back as "flux2" and app-side family dispatch misclassifies it.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try model_registry_mod.ModelRegistry.init(std.testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStubWithArch("justintime47/Krea-2-Turbo-iQ4.5", "/path/to/krea", 1024, "krea2_turbo");
+
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    cfg.model_type = "flux2"; // the media stub's generic load marker (gen.zig Modality.modelType)
+    var chat_cfg = chat_mod.ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = std.testing.allocator,
+    };
+    e.config = &cfg;
+    e.chat_config = &chat_cfg;
+    e.state = .ready;
+    defer {
+        e.config = null;
+        e.chat_config = null;
+        e.state = .unloaded;
+    }
+
+    const json = try renderModelEntry(std.testing.allocator, io, e);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"architecture\":\"krea2_turbo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"architecture\":\"flux2\"") == null);
 }
 
 fn handleModels(
