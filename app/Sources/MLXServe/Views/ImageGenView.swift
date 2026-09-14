@@ -2,9 +2,9 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// Image generation window — native FLUX.2, Krea-2-Turbo and Mage-Flow (no
-/// Python). The model picker lists every `ImageModelPreset`; the server
-/// auto-routes to the right image backend by the model's `model_type`.
+/// Image generation window — native FLUX.2, Krea-2-Turbo, Mage-Flow and
+/// Z-Image (no Python). The model picker lists every `ImageModelPreset`; the
+/// server auto-routes to the right image backend by the model's `model_type`.
 struct ImageGenView: View {
     @EnvironmentObject var service: ImageGenService
     @EnvironmentObject var server: ServerManager

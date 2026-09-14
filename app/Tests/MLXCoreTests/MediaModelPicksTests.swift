@@ -54,8 +54,12 @@ final class MediaModelPicksTests: XCTestCase {
     /// for anything in a capability still gets the smallest option, flagged, not
     /// an empty picker that reads as "unsupported".
     func testATinyMacStillGetsAPickFlaggedAsTooBig() {
+        // Below every catalogue entry's RAM figure (Z-Image Turbo 4-bit is the
+        // cheapest at ~3 GB) — the point of this test is the FALLBACK branch,
+        // which needs a Mac too small for anything, not a hardcoded literal.
+        let tooSmall = (ImageModelPreset.all.map(\.approxRAMGB).min() ?? 1) - 1
         let picks = MediaModelPicks.featured(ImageModelPreset.all,
-                                             physicalMemoryBytes: 4 * gb,
+                                             physicalMemoryBytes: UInt64(max(0, tooSmall)) * gb,
                                              capabilityOf: \.capabilityLabel)
         XCTAssertFalse(picks.isEmpty, "never an empty picker")
         for pick in picks {

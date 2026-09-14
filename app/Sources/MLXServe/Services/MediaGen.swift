@@ -139,6 +139,8 @@ enum FluxVariant: String, Hashable, Codable {
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
+    case zImage           // Tongyi-MAI Z-Image (50-step, CFG 5) single-stream S3-DiT — served by the zimage backend
+    case zImageTurbo      // Tongyi-MAI Z-Image-Turbo — same arch, distilled 8-step, no CFG (no negative-prompt branch)
 }
 
 struct ImageQualitySettings: Hashable {
@@ -439,9 +441,97 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Microsoft's native-resolution image EDITOR, quantized to 8-bit — change or compose from one or more references in 4 steps, at half the download and memory. Open (MIT)."
     )
 
-    /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
-    /// 4B Q4 — smallest download.
+    // Z-Image's single-stream DiT accepts any multiple of 32 in [256, 2048]
+    // (`z_image.normalizeDim`) — same shape of clamp as FLUX, just a
+    // different alignment.
+    private static let zImageResolutions: [ResolutionOption] = [
+        .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
+        .init(width: 768,  height: 768,  label: "768 × 768 (square, fast)"),
+        .init(width: 512,  height: 512,  label: "512 × 512 (fast, low RAM)"),
+        .init(width: 1024, height: 1536, label: "1024 × 1536 (portrait 2:3)"),
+        .init(width: 1536, height: 1024, label: "1536 × 1024 (landscape 3:2)"),
+        .init(width: 1344, height: 768,  label: "1344 × 768 (landscape 16:9)"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (portrait 9:16)"),
+    ]
+
+    /// Z-Image-Turbo (Tongyi-MAI) — distilled 8-step flow-matching, no CFG (no
+    /// negative-prompt branch — same shape as Mage-Flow/Krea Turbo). Served by
+    /// the native `zimage` image backend, auto-detected from `model_index.json`
+    /// (`_class_name == "ZImagePipeline"`, no root config.json — same diffusers
+    /// shape as Mage-Flow). `is_turbo`/the sampling defaults are read off the
+    /// CHECKPOINT DIR NAME (`z_image.dirLooksTurbo`) — "turbo" must stay in the
+    /// repo id, or the server treats it as the 50-step base model.
+    static let zImageTurbo8bit = ImageModelPreset(
+        id: "justintime47/z-image-turbo-8bit",
+        name: "Z-Image Turbo 8-bit (~2 GB)",
+        variant: .zImageTurbo,
+        configName: "zimage",
+        repo: "justintime47/Z-Image-Turbo-MLX-Serve-8bit",
+        approxDownloadGB: 2,
+        approxRAMGB: 4,
+        resolutions: zImageResolutions,
+        defaultResolution: zImageResolutions[0],
+        qualityProfiles: [
+            // Distilled Turbo: the checkpoint's own default is 8.
+            .fast:         .init(steps: 6),
+            .good:         .init(steps: 8),
+            .quality:      .init(steps: 12),
+            .superQuality: .init(steps: 16),
+        ],
+        defaultQuality: .good,
+        description: "A small, fast image generator distilled to run in just a few steps — great for quick everyday text-to-image at a tiny download."
+    )
+
+    /// 4-bit mirror — smallest download of any image model in the catalog.
+    static let zImageTurbo4bit = ImageModelPreset(
+        id: "justintime47/z-image-turbo-4bit",
+        name: "Z-Image Turbo 4-bit (~1 GB)",
+        variant: .zImageTurbo,
+        configName: "zimage",
+        repo: "justintime47/Z-Image-Turbo-MLX-Serve-4bit",
+        approxDownloadGB: 1,
+        approxRAMGB: 3,
+        resolutions: zImageResolutions,
+        defaultResolution: zImageResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 6),
+            .good:         .init(steps: 8),
+            .quality:      .init(steps: 12),
+            .superQuality: .init(steps: 16),
+        ],
+        defaultQuality: .good,
+        description: "The smallest image model in the catalog — a 4-bit Z-Image Turbo, for the fastest possible download and the lowest memory footprint."
+    )
+
+    /// Base Z-Image — the full 50-step, CFG-5 schedule (no "turbo" in the repo
+    /// id, so the server resolves the non-distilled sampling defaults).
+    static let zImage8bit = ImageModelPreset(
+        id: "justintime47/z-image-8bit",
+        name: "Z-Image 8-bit (~2 GB)",
+        variant: .zImage,
+        configName: "zimage",
+        repo: "justintime47/Z-Image-MLX-Serve-8bit",
+        approxDownloadGB: 2,
+        approxRAMGB: 4,
+        resolutions: zImageResolutions,
+        defaultResolution: zImageResolutions[0],
+        qualityProfiles: [
+            // Full (non-distilled) schedule: the checkpoint's own default is
+            // 50 steps at CFG 5, so every tier stays meaningfully higher than
+            // Turbo's.
+            .fast:         .init(steps: 24),
+            .good:         .init(steps: 32),
+            .quality:      .init(steps: 50),
+            .superQuality: .init(steps: 64),
+        ],
+        defaultQuality: .good,
+        description: "The full (non-distilled) Z-Image — sharper detail than Turbo at a slower, many-step schedule, still a small download."
+    )
+
+    /// Catalog ordered cheapest → heaviest. Default (`first`) is Z-Image Turbo
+    /// 4-bit — smallest download in the whole catalog.
     static let all: [ImageModelPreset] = [
+        .zImageTurbo4bit, .zImageTurbo8bit, .zImage8bit,   // 1, 2, 2
         .flux2Klein4B_Q4,                              // 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
@@ -1836,6 +1926,9 @@ extension ImageModelPreset {
         switch variant {
         case .krea2Turbo: return 12
         case .mageFlowTurbo, .mageFlowEditTurbo: return 0
+        // No conditioning-rebalance wiring on Z-Image yet (`gen.zig` returns 0
+        // for `.zimage` — "not wired for Z-Image yet").
+        case .zImage, .zImageTurbo: return 0
         default: return 3
         }
     }
@@ -1853,6 +1946,9 @@ extension ImageModelPreset {
         // widest preset edge.
         case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase:
             return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 1536)
+        // `clampZImageDim` — VAE ×8 + DiT patch ×2, [256, 2048].
+        case .zImage, .zImageTurbo:
+            return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 2048)
         }
     }
 
@@ -1882,7 +1978,9 @@ extension ImageModelPreset {
     /// all: sending a source without `mode:"edit"` is a 400.
     var supportsImg2Img: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        // Z-Image has no VAE encoder in the engine yet — text-to-image only
+        // (`gen.zig` `.zimage => false`, "no VAE encoder").
+        case .mageFlowTurbo, .mageFlowEditTurbo, .zImage, .zImageTurbo: return false
         default: return true
         }
     }
@@ -1891,7 +1989,8 @@ extension ImageModelPreset {
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
     var supportsLoRA: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        // "Z-Image does not support LoRA yet" (`gen.zig` `.zimage => 0`).
+        case .mageFlowTurbo, .mageFlowEditTurbo, .zImage, .zImageTurbo: return false
         default: return true
         }
     }
