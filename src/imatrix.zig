@@ -208,6 +208,7 @@ fn armWalk(comptime L: type, comptime T: type, ptr: *T, im: *Imatrix, component:
         },
         .array => |ar| for (ptr) |*e| try armWalk(L, ar.child, e, im, component, n),
         .pointer => |p| for (ptr.*) |*e| try armWalk(L, p.child, e, im, component, n),
+        .optional => |o| if (ptr.*) |*e| try armWalk(L, o.child, e, im, component, n),
         else => {},
     }
 }
@@ -220,6 +221,7 @@ fn reaches(comptime L: type, comptime T: type) bool {
             return false;
         },
         .array => |ar| return reaches(L, ar.child),
+        .optional => |o| return reaches(L, o.child),
         .pointer => |p| return p.size == .slice and !p.attrs.@"const" and reaches(L, p.child),
         else => return false,
     }
@@ -266,6 +268,8 @@ test "arming reaches every named linear through fields, arrays and slices, and s
         pair: [2]Lin,
         blocks: []Inner,
         view: Lin,
+        present: ?Lin,
+        absent: ?Lin = null,
     };
     var inner = [_]Inner{
         .{ .x = .{ .name = "blocks.0.x" }, .deep = .{ .y = .{ .name = "blocks.0.y" } } },
@@ -277,16 +281,19 @@ test "arming reaches every named linear through fields, arrays and slices, and s
         .pair = .{ .{ .name = "pair.0" }, .{ .name = "pair.1" } },
         .blocks = &inner,
         .view = .{},
+        .present = .{ .name = "blocks.0.ada" },
     };
     const im = try Imatrix.init(testing.allocator, "/tmp/unused.safetensors");
     defer im.deinit();
-    try testing.expectEqual(@as(usize, 7), try armAll(Lin, Holder, &h, im, "transformer"));
+    try testing.expectEqual(@as(usize, 8), try armAll(Lin, Holder, &h, im, "transformer"));
     try testing.expectEqual(@as(i32, -1), h.view.im_slot);
+    try testing.expectEqual(@as(?Lin, null), h.absent);
     try testing.expectEqualStrings("transformer/blocks.1.y", im.keys.items[@intCast(inner[1].deep.y.im_slot)]);
+    try testing.expectEqualStrings("transformer/blocks.0.ada", im.keys.items[@intCast(h.present.?.im_slot)]);
     const slot = h.pair[1].im_slot;
-    try testing.expectEqual(@as(usize, 7), try armAll(Lin, Holder, &h, im, "transformer"));
+    try testing.expectEqual(@as(usize, 8), try armAll(Lin, Holder, &h, im, "transformer"));
     try testing.expectEqual(slot, h.pair[1].im_slot);
-    try testing.expectEqual(@as(usize, 7), im.keys.items.len);
+    try testing.expectEqual(@as(usize, 8), im.keys.items.len);
 }
 
 test "observe files the MEAN square per input channel across calls and leading axes" {

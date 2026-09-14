@@ -584,7 +584,10 @@ pub const ImageEngine = struct {
                 return self;
             }
             if (std.mem.startsWith(u8, mt, "zimage")) {
-                self.backend = .{ .zimage = try z_image_mod.Engine.load(io, allocator, model_dir) };
+                const z = try z_image_mod.Engine.load(io, allocator, model_dir);
+                errdefer z.deinit();
+                if (imatrix_mod.active) |im| try z_image_mod.armImatrix(z, im);
+                self.backend = .{ .zimage = z };
                 return self;
             }
             if (std.mem.startsWith(u8, mt, "krea")) {

@@ -31,6 +31,7 @@ const transformer_mod = @import("transformer.zig");
 const tok_mod = @import("tokenizer.zig");
 const sse = @import("gen_sse.zig");
 const mage_flow = @import("mage_flow.zig");
+const imatrix_mod = @import("imatrix.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -1423,6 +1424,13 @@ fn normalizeDim(size: u32) u32 {
 }
 
 // ── Engine ──
+
+/// Slots in the armed collector for every DiT projection. The text encoder runs
+/// through the chat `Transformer`, which carries no collector.
+pub fn armImatrix(e: *Engine, im: *imatrix_mod.Imatrix) !void {
+    const n = try imatrix_mod.armAll(MfLinear, Dit, &e.dit, im, "transformer");
+    log.info("[zimage] imatrix armed: {d} transformer projections (text encoder not collected)\n", .{n});
+}
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,

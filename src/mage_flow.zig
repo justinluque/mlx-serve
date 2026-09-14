@@ -27,6 +27,7 @@ const log = @import("log.zig");
 const stb = @import("stb");
 const qvis = @import("qwen_vision.zig");
 const sse = @import("gen_sse.zig");
+const imatrix_mod = @import("imatrix.zig");
 
 // ── Config ──────────────────────────────────────────────────────────────
 // Parsed from the released diffusers-style repo: transformer/config.json,
@@ -570,10 +571,23 @@ pub const MfLinear = struct {
     dtype: mlx.mlx_dtype,
     bits: u32 = 0,
     group_size: u32 = 0,
+    /// The checkpoint key this linear loaded from (`imatrix.armAll`). `im_slot`
+    /// stays -1 unless a collection is armed, so a forward pays one comparison.
+    name: []u8 = &.{},
+    name_allocator: ?std.mem.Allocator = null,
+    im_slot: i32 = -1,
 
     /// `in_features` is the module's input dim, known at every call site from
     /// `Config`; it is what makes the packed geometry solvable.
     pub fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, dtype: mlx.mlx_dtype, s: S) !MfLinear {
+        var ml = try loadArrays(w, a, prefix, in_features, dtype, s);
+        errdefer ml.deinit();
+        ml.name = try a.dupe(u8, prefix);
+        ml.name_allocator = a;
+        return ml;
+    }
+
+    fn loadArrays(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, dtype: mlx.mlx_dtype, s: S) !MfLinear {
         const wk = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
         defer a.free(wk);
         const sk = try std.fmt.allocPrint(a, "{s}.scales", .{prefix});
@@ -621,6 +635,7 @@ pub const MfLinear = struct {
     }
 
     pub fn deinit(self: *MfLinear) void {
+        if (self.name_allocator) |na| na.free(self.name);
         _ = mlx.mlx_array_free(self.w);
         if (self.quantized) {
             _ = mlx.mlx_array_free(self.scales);
@@ -631,6 +646,10 @@ pub const MfLinear = struct {
     /// x[.., in] @ W (+ bias). `bias` stays a caller-owned argument so this is a
     /// drop-in for `linearT`, which is how the dense path stays unchanged.
     pub fn forward(self: *const MfLinear, x: mlx.mlx_array, bias: ?mlx.mlx_array, s: S) !mlx.mlx_array {
+        // The INPUT is the statistic: a calibrated re-quantization is of the weight.
+        if (imatrix_mod.active) |im| {
+            if (self.im_slot >= 0) im.observe(@intCast(self.im_slot), x, s) catch {};
+        }
         // No-op when x already matches (mlx returns the input unchanged), so the
         // dense path keeps the exact arithmetic the bf16 fixtures were pinned on.
         const xc = try astype(x, self.dtype, s);
@@ -5073,4 +5092,33 @@ test "MfLinear: bias is applied in the compute dtype on both paths" {
         defer _ = mlx.mlx_array_free(delta);
         try testing.expect(try maxAbsDiff(delta, bias, s) < 1e-2);
     }
+}
+
+test "an armed MfLinear hands its input to the collector under the converter's key, optional fields included" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+    var wbuf = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const wsh = [_]c_int{ 2, 3 };
+    var ww = model_mod.Weights.init(a);
+    defer ww.deinit();
+    try ww.map.put(try a.dupe(u8, "layers.4.adaLN_modulation.0.weight"), mlx.mlx_array_new_data(&wbuf, &wsh, 2, .float32));
+    const Holder = struct { ada: ?MfLinear };
+    var h = Holder{ .ada = try MfLinear.load(&ww, a, "layers.4.adaLN_modulation.0", 3, .bfloat16, s) };
+    defer h.ada.?.deinit();
+    const im = try imatrix_mod.Imatrix.init(a, "/tmp/unused.safetensors");
+    defer im.deinit();
+    try testing.expectEqual(@as(usize, 1), try imatrix_mod.armAll(MfLinear, Holder, &h, im, "transformer"));
+    imatrix_mod.active = im;
+    defer imatrix_mod.active = null;
+
+    var xb = [_]f32{ 1, 2, 3, 3, 2, 1, 0, 0, 1 };
+    const xsh = [_]c_int{ 1, 3, 3 };
+    const x = mlx.mlx_array_new_data(&xb, &xsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const o = try h.ada.?.forward(x, null, s);
+    defer _ = mlx.mlx_array_free(o);
+    const slot: usize = @intCast(h.ada.?.im_slot);
+    try testing.expectEqualStrings("transformer/layers.4.adaLN_modulation.0", im.keys.items[slot]);
+    try testing.expectEqual(@as(u64, 3), im.rows.items[slot]);
 }
