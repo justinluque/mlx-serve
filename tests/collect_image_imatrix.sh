@@ -10,7 +10,7 @@
 # activation moment, far steadier under weight noise than the weights, but a
 # 4-bit pack is still an approximation of the source.
 #
-# Env: STEPS (Krea 8, klein 4, a dir named *base* 30), GUIDANCE (base default
+# Env: STEPS (Krea 8, Z-Image-Turbo 8, klein 4, a dir named *base* 30), GUIDANCE (base default
 #      4.0), SIZES (csv WxH), SEEDS_PER_PROMPT (1), LIMIT (stop after N images),
 #      PROMPTS (tests/fixtures/image_calibration_prompts.txt).
 set -euo pipefail
@@ -29,9 +29,14 @@ case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
 
 model_type=$(python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1] + "/config.json")).get("model_type", ""))
-except Exception: print("")' "$MODEL")
+except Exception:
+  try: print("zimage" if json.load(open(sys.argv[1] + "/model_index.json")).get("_class_name") == "ZImagePipeline" else "")
+  except Exception: print("")' "$MODEL")
 if [[ "$model_type" == krea* ]]; then
   STEPS=${STEPS:-8}
+elif [[ "$model_type" == zimage ]]; then
+  # z_image.dirLooksTurbo: "turbo" anywhere in the path picks the sampler.
+  [[ "$(echo "$MODEL" | tr A-Z a-z)" == *turbo* ]] && STEPS=${STEPS:-8} || STEPS=${STEPS:-50}
 elif [[ "$(basename "$MODEL" | tr A-Z a-z)" == *base* ]]; then
   STEPS=${STEPS:-30}
   GUIDANCE=${GUIDANCE:-4.0}

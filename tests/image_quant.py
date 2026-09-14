@@ -373,6 +373,20 @@ def apply_floors(plans: list[Plan], floor_for) -> None:
             p.errors = {b: e for b, e in p.errors.items() if b >= floor}
 
 
+def apply_ceilings(plans: list[Plan], ceil_for) -> None:
+    """Drop every candidate width above `ceil_for(module)` (None = no ceiling): a
+    loader that demands `.scales` cannot read DENSE, and a weight nothing reads is
+    worth only the narrowest. A ceiling that leaves a plan no candidate refuses."""
+    for p in plans:
+        ceil = ceil_for(p.module)
+        if ceil is None:
+            continue
+        kept = {b: e for b, e in p.errors.items() if b <= ceil}
+        if not kept:
+            sys.exit(f"{p.module}: no candidate width at or below {ceil} (candidates {sorted(p.errors)})")
+        p.errors = kept
+
+
 def allocate(plans: list[Plan], budget: int) -> int:
     """Choose every plan's width to minimise summed weighted relative error in
     `budget` bytes: start each at its narrowest candidate, then keep buying the
@@ -484,11 +498,11 @@ def emit(writer: ShardWriter, plan: Plan, w: mx.array, ch: mx.array | None) -> N
 
 
 def convert(component: str, source: Source, rename, writer: ShardWriter, imatrix: Imatrix,
-            bits_per_weight: float, work: Path, floor_for=None) -> dict:
+            bits_per_weight: float, work: Path, floor_for=None, ceil_for=None) -> dict:
     """One component. `rename(key)` is a tensor's pack key, or None to leave it
     out. Every kept 2-D `.weight` is a linear placed by `allocate`, no narrower than
-    `floor_for(module)` when one is given; everything else is stored as-is, floating
-    tensors in bf16. Returns the config.json record."""
+    `floor_for(module)` and no wider than `ceil_for(module)` when given; everything
+    else is stored as-is, floating tensors in bf16. Returns the config.json record."""
     names: dict[str, str] = {}
     for key in sorted(source.tensors):
         name = rename(key)
@@ -507,6 +521,8 @@ def convert(component: str, source: Source, rename, writer: ShardWriter, imatrix
     measure(plans, get, imatrix, work / f"{component}.errors.json", fingerprint)
     if floor_for:
         apply_floors(plans, floor_for)
+    if ceil_for:
+        apply_ceilings(plans, ceil_for)
     spent = allocate(plans, budget_for(plans, bits_per_weight))
     for i, p in enumerate(plans):
         emit(writer, p, get(p.module), imatrix.weights(p.module, p.in_dim))
@@ -639,6 +655,17 @@ def self_test() -> int:
           "a floor drops every narrower candidate and leaves unfloored plans alone")
     allocate(ps, sum(p.bytes_at(min(p.errors)) for p in ps))
     check([p.width for p in ps] == [DENSE, 6, DENSE], "the allocator starts a floored plan at its floor")
+    ps = plans()
+    apply_ceilings(ps, {"big": 4, "small": min(WIDTHS)}.get)
+    check(sorted(ps[0].errors) == [3, 4] and sorted(ps[1].errors) == [3] and sorted(ps[2].errors) == [DENSE],
+          "a ceiling drops every wider candidate, DENSE included, and leaves unceilinged plans alone")
+    allocate(ps, 10 ** 9)
+    check([p.width for p in ps] == [4, 3, DENSE], "an unbounded budget stops a plan at its ceiling")
+    try:
+        apply_ceilings(plans(), {"untileable": 8}.get)
+        check(False, "a ceiling that leaves a plan no candidate is refused")
+    except SystemExit:
+        check(True, "a ceiling that leaves a plan no candidate is refused")
 
     print(f"\n{'OK' if not failures else 'FAILED'}: {len(failures)} failure(s)")
     return 1 if failures else 0
