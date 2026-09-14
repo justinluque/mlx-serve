@@ -460,6 +460,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 ### Model loading, configs, converters, media parity (→ docs/gotchas/models-media.md)
 
 - **A `Weights` map must outlive its `Transformer`.**
+- **A text encoder that reuses a chat `Transformer` resets its cache PER PROMPT** (`z_image.TextEncoder.encode` → `resetCache()`): the forward APPENDS to the KV cache, so every prompt after the first was encoded on top of the earlier ones and the same seed rendered a different, streaky image per request order. Guard: `zimage text encoder live: a prompt encodes the same…`.
 - **A qwen4_exp checkpoint is NOT a qwen3_5 pack** (model_type `qwen4_exp`): three new blocks (hyper-connections, n-gram PLE, QSA) around the qwen3_5 trunk. The HF fixture's `hidden_states[i]` is the INPUT of layer i (stream_0 = tiled embeddings) — compare layer-i output with stream_{i+1}.
 - **A random tiny MoE oracle ties everywhere, and the tie RATE is scale-invariant** (relu leaves EXACT-ZERO block scores; bf16 noise flips one top-k expert or QSA block per prompt): `dump_qwen4_exp_fixtures.py` runs every expert and dumps the reference's OWN margins; `Qwen4Ties` acquits under 3% by those, NEVER by our output.
 - **A k < E tiny fixture ties in most trunk rows across every MoE layer, so its top-k SELECTION coverage is the MTP head's ONE MoE layer** (`dump_qwen4_exp_fixtures.py build --topk 2`; `route_gap`/`mtp_route_gap` = softmax margin at the top-k boundary, `QWEN4_TIE_REL_ROUTE` 5%). The k = E fixture stays the CI one.

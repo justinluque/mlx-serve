@@ -387,6 +387,8 @@ pub const TextEncoder = struct {
     /// `ltx_video.gemmaCapture4`'s pattern, one captured layer.
     pub fn encode(self: *TextEncoder, s: S, prompt: []const u8) !mlx.mlx_array {
         const allocator = self.allocator;
+        // The LM forward appends to its KV cache; each prompt is its own prefill.
+        try self.xfm.resetCache();
         const formatted = try formatPrompt(allocator, prompt);
         defer allocator.free(formatted);
         const enc = try self.tok.encode(allocator, formatted);
@@ -1637,4 +1639,33 @@ test "zimage text encoder live: encode returns a finite, in-range embedding" {
         if (v != 0) any_nonzero = true;
     }
     try testing.expect(any_nonzero);
+}
+
+// Bar: a prompt's embedding is bit-identical whether or not another prompt was encoded first.
+test "zimage text encoder live: a prompt encodes the same whatever was encoded before it" {
+    const model_dir = std.mem.span(std.c.getenv("ZIMAGE_TEST_MODEL") orelse return error.SkipZigTest);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+
+    var te = try TextEncoder.load(io, testing.allocator, model_dir);
+    defer te.deinit();
+    const prompt = "a red fox in the snow";
+    const first = try te.encode(s, prompt);
+    defer _ = mlx.mlx_array_free(first);
+    const other = try te.encode(s, "a neon sign above a rainy diner entrance at night");
+    _ = mlx.mlx_array_free(other);
+    const again = try te.encode(s, prompt);
+    defer _ = mlx.mlx_array_free(again);
+
+    const a = try astype(first, .float32, s);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try astype(again, .float32, s);
+    defer _ = mlx.mlx_array_free(b);
+    _ = mlx.mlx_array_eval(a);
+    _ = mlx.mlx_array_eval(b);
+    try testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    const n: usize = @intCast(mlx.mlx_array_size(a));
+    const da = mlx.mlx_array_data_float32(a) orelse return error.NullData;
+    const db = mlx.mlx_array_data_float32(b) orelse return error.NullData;
+    try testing.expectEqualSlices(f32, da[0..n], db[0..n]);
 }

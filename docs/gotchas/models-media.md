@@ -1914,3 +1914,11 @@ needed). Verified end-to-end: `/v1/images/generations` against the real
 8-bit AND 4-bit Turbo mirrors both produced a genuinely coherent photo of a
 fox in snow, not noise — the actual acceptance bar for a backend with no
 numeric oracle.
+
+## Z-Image: every prompt after the first was encoded on top of the previous ones
+
+The same prompt and seed rendered a different image depending on what the server had generated before: two identical 1024² requests on a fresh server came out 12.5 dB apart, and a 512² prompt that was clean as request 1 was 9.3 dB off as request 3, with vertical streaks and garbled structure. On the first calibrated pack it read as quantization damage, and on a 24 GB Mac (1024² peak 17.9 GiB against a 19 GiB wired limit) as a memory-edge fault. It was neither: a quantized pack is deterministic, and the 512² render at a 10 GB peak reproduced it.
+
+`TextEncoder.encode` runs the checkpoint's Qwen3 LM through `Transformer.defaultCtx()`, whose KV cache lives on the long-lived encoder, and nothing reset it. Each prefill appended to every earlier prompt, at shifted positions and attending across prompts. The bring-up only ever checked a server's first request. LTX's `gemmaCapture4` loads Gemma per call and was never affected.
+
+Fix: `self.xfm.resetCache()` at the top of `encode`. Guard: `ZIMAGE_TEST_MODEL=<pack> zig build test -Dtest-filter="zimage text encoder live"` encodes A, B, then A again and requires the two A embeddings bit-identical (red at element 0 before the fix). Anything generated through a pre-fix engine is suspect, including an imatrix collected on it: every calibration image after the first was conditioned on a contaminated caption.
