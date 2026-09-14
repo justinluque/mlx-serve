@@ -18,7 +18,8 @@ the output streams into 2 GB shards.
 - text_encoder: the Qwen3 LM the chat `Transformer` loads, allocated inside
   `--te-bpw` with the weight-only search, since the engine collects no
   text-encoder statistics. A quantized config makes that loader demand `.scales`
-  on every layer linear, so none is stored dense; the token table stays bf16. The
+  on every layer linear, so none is stored dense. The token table is allocated too:
+  `rawEmbedding` solves its width from geometry. The
   conditioner captures after layer n-2, so the last layer (and any lm_head) is
   read by nothing and is stored at the narrowest width.
 - vae, tokenizer, scheduler: copied verbatim.
@@ -70,8 +71,6 @@ def floor_for(component: str, module: str, te_layers: int) -> int | None:
     """The narrowest width a linear may be stored at, or None to leave it to the allocator."""
     if component == "transformer":
         return iq.DENSE if CONDITIONING.match(module) else None
-    if module.endswith("embed_tokens"):
-        return iq.DENSE
     layer = te_layer(module)
     # llama.cpp's Q4_K_M widens ffn_down on these layers.
     if module.endswith("mlp.down_proj") and not unread(module, te_layers) and iq.use_more_bits(layer, te_layers):
@@ -198,8 +197,9 @@ def self_test() -> int:
               "the layer after the capture is stored at the narrowest width")
         check(ceil_for("text_encoder", f"{prefix}layers.34.self_attn.q_proj", 36) == max(iq.WIDTHS),
               "a read layer may not be stored dense under a quantized config")
-        check(floor_for("text_encoder", f"{prefix}embed_tokens", 36) == iq.DENSE
-              and ceil_for("text_encoder", f"{prefix}embed_tokens", 36) is None, "the token table stays bf16")
+        check(floor_for("text_encoder", f"{prefix}embed_tokens", 36) is None
+              and ceil_for("text_encoder", f"{prefix}embed_tokens", 36) is None,
+              "the token table is left to the allocator (rawEmbedding solves its width from geometry)")
     check(ceil_for("text_encoder", "lm_head", 36) == min(iq.WIDTHS), "an lm_head nothing reads is stored narrowest")
     modules = [f"model.layers.{i}.{p}" for i in range(36) for p in
                ("self_attn.q_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.down_proj")] + ["model.embed_tokens", "lm_head"]
