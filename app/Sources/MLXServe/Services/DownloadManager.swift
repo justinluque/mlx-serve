@@ -605,6 +605,25 @@ class DownloadManager: ObservableObject {
         return true
     }
 
+    /// Ready for a Model Browser row: a verified media repo is ready only once
+    /// its FAMILY BUNDLE contract is met (`bundleReady`) — the same test
+    /// Generate gates on. The generic single-repo check below only asks
+    /// "config + tokenizer + a safetensors at this dir's ROOT", which a
+    /// Krea/FLUX/Mage-Flow layout (tokenizer/vae/text_encoder as SUBDIRS) can
+    /// satisfy or fail for reasons unrelated to whether the pack actually
+    /// loads — so the Discover pane's checkmark and Generate's own gate must
+    /// read the SAME answer, or a pack pulled outside the app (HF CLI,
+    /// `mlx-serve pull`) reads ready in the browser and still asks to
+    /// download the moment you try to generate with it.
+    func isReady(_ model: HFModel) -> Bool {
+        if model.mediaStructureVerified == true,
+           let arch = model.mediaFamilyModelType,
+           let bundle = CustomMediaModels.bundle(arch: arch, repoId: model.id) {
+            return bundleReady(bundle)
+        }
+        return isReady(model.id)
+    }
+
     /// Check if a model has all required files for loading.
     /// Verifies: config.json, tokenizer files, chat template, and ALL safetensors shards.
     /// For GGUF-backed models (ds4 engine) the check is just "directory contains

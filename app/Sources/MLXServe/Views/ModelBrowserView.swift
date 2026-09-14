@@ -656,7 +656,7 @@ private struct DiscoverPane: View {
 
             Divider()
 
-            let onDiskCount = searchService.models.filter { downloads.isReady($0.id) }.count
+            let onDiskCount = searchService.models.filter { downloads.isReady($0) }.count
 
             ScrollView {
                 LazyVStack(spacing: 0) {
@@ -1308,7 +1308,10 @@ private struct ModelBrowserRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
 
-    private var isReady: Bool { downloads.isReady(model.id) }
+    /// `DownloadManager.isReady(_:HFModel)` consults the media bundle contract
+    /// for a verified media repo, so this checkmark agrees with Generate's own
+    /// gate — see its doc comment.
+    private var isReady: Bool { downloads.isReady(model) }
     private var state: DownloadManager.DownloadState? { downloads.downloads[model.id] }
     private var disabled: Bool { !model.isCompatible }
     @State private var card: ModelCardRequest?

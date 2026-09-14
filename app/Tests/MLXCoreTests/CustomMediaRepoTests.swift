@@ -195,6 +195,52 @@ final class CustomMediaRepoTests: XCTestCase {
         XCTAssertNil(CustomMediaModels.bundle(arch: "kokoro", repoId: "x/y"))
     }
 
+    // MARK: - Discover-pane checkmark vs Generate's own gate
+
+    /// A Krea/FLUX/Mage-Flow pack pulled straight off HF (or via `mlx-serve
+    /// pull`, never through this app's downloader) lands in the family
+    /// layout: tokenizer/vae/text_encoder as SUBDIRS, no root tokenizer.json.
+    /// The generic single-repo `isReady(_:String)` demands a root tokenizer
+    /// file and reads such a pack as NOT ready, while `bundleReady` (what
+    /// Generate gates on) is satisfied — so `isReady(_:HFModel)` must defer to
+    /// the bundle contract for a verified media repo, or the Discover pane's
+    /// checkmark and the Create pane's Generate button disagree on the exact
+    /// same directory.
+    @MainActor
+    func testMediaRowReadinessFollowsTheBundleContractNotTheGenericCheck() throws {
+        let root = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("mlx-serve-tests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        let dir = (root as NSString).appendingPathComponent("someone/Krea-2-Turbo-iq")
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("config.json")))
+        try Data(count: 2_000_000).write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("transformer-00001.safetensors")))
+        for sub in ["vae", "text_encoder", "tokenizer"] {
+            let subDir = (dir as NSString).appendingPathComponent(sub)
+            try fm.createDirectory(atPath: subDir, withIntermediateDirectories: true)
+        }
+        try Data(count: 9).write(to: URL(fileURLWithPath: (dir as NSString)
+            .appendingPathComponent("text_encoder/model.safetensors")))
+        try Data("{}".utf8).write(to: URL(fileURLWithPath: (dir as NSString)
+            .appendingPathComponent("tokenizer/tokenizer.json")))
+
+        let manager = DownloadManager(modelsRoot: root)
+        let repoId = "someone/Krea-2-Turbo-iq"
+        XCTAssertFalse(manager.isReady(repoId),
+                       "no root tokenizer.json — the generic check is correctly strict here")
+
+        var model = HFModel(id: repoId, downloads: 1, likes: 0, lastModified: nil,
+                            tags: ["mlx", "mlx-serve"], safetensors: nil,
+                            pipelineTag: "text-to-image")
+        model.config = HFConfigMeta(modelType: "krea2_turbo")
+        model.mediaStructureVerified = true
+        XCTAssertTrue(manager.isReady(model),
+                      "the bundle contract is met, so the media-aware check must read ready")
+    }
+
     func testSearchURLAsksForTheConfigBlock() {
         let url = HFSearchService.searchURL(query: "minimax", filter: "mlx", skip: 0, limit: 30)!
         XCTAssertTrue(url.absoluteString.contains("expand%5B%5D=config"))
