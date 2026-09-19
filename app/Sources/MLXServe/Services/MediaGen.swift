@@ -454,11 +454,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     // the unconditional checkpoint is never loaded at all — about 10 GB
     // resident for a turbo render.
     static let ideogram4_mixed_4_8_iq = ImageModelPreset(
-        id: "justintime47/iIdeogram-4-IQ4_M",
+        id: "jlweights/iIdeogram-4-IQ4_M",
         name: "Ideogram 4 IQ4-M (4.7 bpw, ~15 GB)",
         variant: .ideogram4,
         configName: "ideogram4",
-        repo: "justintime47/justintime47/Ideogram-4-IQ4_M",
+        repo: "jlweights/jlweights/Ideogram-4-IQ4_M",
         approxDownloadGB: 16,
         approxRAMGB: 21,
         resolutions: ideogramResolutions,

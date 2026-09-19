@@ -116,7 +116,7 @@ final class TurboLoraFetchTargetTests: XCTestCase {
 
     // MARK: - A source that is not the pack (Ideogram 4)
 
-    private let ideogramPackRepo = "justintime47/fixture-ideogram-pack"
+    private let ideogramPackRepo = "jlweights/fixture-ideogram-pack"
 
     /// Ideogram's adapter is published by ostris, under ostris' filename, and
     /// the server resolves exactly one name inside the pack. So the fetch has

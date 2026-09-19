@@ -3,7 +3,7 @@
 
     python tests/convert_ideogram4.py \
         --src ideogram-ai/ideogram-4-fp8 \
-        --out ~/.mlx-serve/models/justintime47/Ideogram-4-MLX-Serve-mixed_4_8_iq \
+        --out ~/.mlx-serve/models/jlweights/Ideogram-4-MLX-Serve-mixed_4_8_iq \
         --precision mixed_3_8 --bulk-bits 4 \
         --te-imatrix ~/claude-tmp/ideogram_imatrix.safetensors \
         --dit-imatrix ~/claude-tmp/ideogram_imatrix.safetensors

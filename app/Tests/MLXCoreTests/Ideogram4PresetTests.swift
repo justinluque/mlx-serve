@@ -27,7 +27,7 @@ final class Ideogram4PresetTests: XCTestCase {
     /// choice, it is a trap.
     func testTheCatalogShipsOnlyThePacksThatRender() {
         XCTAssertEqual(presets.map(\.repo), [
-            "justintime47/Ideogram-4-MLX-Serve-mixed_4_8_iq",
+            "jlweights/Ideogram-4-MLX-Serve-mixed_4_8_iq",
         ])
         for p in ImageModelPreset.all {
             XCTAssertFalse(p.repo.hasSuffix("_2_8"), "\(p.id) is a withdrawn 2-bit pack")
@@ -342,7 +342,7 @@ final class MagicPromptChoicesFromServerTests: XCTestCase {
           "state":"unloaded","bytes_resident":0,"bytes_on_disk":5950219560,"context_length":262144,
           "max_model_len":262144,"capabilities":["chat","tool_use","streaming","json_schema","vision"],
           "input_modalities":["text","image","video"],"meta":{"architecture":"qwen3_5","engine":"mlx"}},
-         {"id":"justintime47/Ideogram-4-MLX-Serve-mixed_4_8_iq","object":"model","loaded":false,
+         {"id":"jlweights/Ideogram-4-MLX-Serve-mixed_4_8_iq","object":"model","loaded":false,
           "state":"unloaded","bytes_resident":0,"bytes_on_disk":13406659256,"context_length":0,
           "max_model_len":0,"capabilities":["image"],"meta":{"architecture":"ideogram4","engine":"mlx"}},
          {"id":"mlx-community/bge-small-en-v1.5-8bit","object":"model","loaded":false,

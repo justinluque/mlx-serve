@@ -14,7 +14,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
-IDEO="${IDEOGRAM_MODEL:-$(ls -d ~/.mlx-serve/models/justintime47/Ideogram-4-MLX-Serve-* 2>/dev/null | head -1)}"
+IDEO="${IDEOGRAM_MODEL:-$(ls -d ~/.mlx-serve/models/jlweights/Ideogram-4-MLX-Serve-* 2>/dev/null | head -1)}"
 CHAT="${CHAT_MODEL:-$(ls -d ~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit 2>/dev/null | head -1)}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
