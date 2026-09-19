@@ -6342,7 +6342,7 @@ test "renderModelEntry: a resident media model reports its OWN architecture, not
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try model_registry_mod.ModelRegistry.init(std.testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
-    const e = try reg.registerStubWithArch("justintime47/Krea-2-Turbo-iQ4.5", "/path/to/krea", 1024, "krea2_turbo");
+    const e = try reg.registerStubWithArch("jlweights/Krea-2-Turbo-iQ4.5", "/path/to/krea", 1024, "krea2_turbo");
 
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     cfg.model_type = "flux2"; // the media stub's generic load marker (gen.zig Modality.modelType)
