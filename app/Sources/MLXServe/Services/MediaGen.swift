@@ -424,11 +424,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// CHECKPOINT DIR NAME (`z_image.dirLooksTurbo`) — "turbo" must stay in the
     /// repo id, or the server treats it as the 50-step base model.
     static let zImageTurbo8bit = ImageModelPreset(
-        id: "justintime47/z-image-turbo-8bit",
+        id: "jlweights/z-image-turbo-8bit",
         name: "Z-Image Turbo 8-bit (~2 GB)",
         variant: .zImageTurbo,
         configName: "zimage",
-        repo: "justintime47/Z-Image-Turbo-MLX-Serve-8bit",
+        repo: "jlweights/Z-Image-Turbo-MLX-Serve-8bit",
         approxDownloadGB: 2,
         approxRAMGB: 4,
         resolutions: zImageResolutions,
@@ -446,11 +446,11 @@ struct ImageModelPreset: Identifiable, Hashable {
 
     /// 4-bit mirror — smallest download of any image model in the catalog.
     static let zImageTurbo4bit = ImageModelPreset(
-        id: "justintime47/z-image-turbo-4bit",
+        id: "jlweights/z-image-turbo-4bit",
         name: "Z-Image Turbo 4-bit (~1 GB)",
         variant: .zImageTurbo,
         configName: "zimage",
-        repo: "justintime47/Z-Image-Turbo-MLX-Serve-4bit",
+        repo: "jlweights/Z-Image-Turbo-MLX-Serve-4bit",
         approxDownloadGB: 1,
         approxRAMGB: 3,
         resolutions: zImageResolutions,
@@ -468,11 +468,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// Base Z-Image — the full 50-step, CFG-5 schedule (no "turbo" in the repo
     /// id, so the server resolves the non-distilled sampling defaults).
     static let zImage8bit = ImageModelPreset(
-        id: "justintime47/z-image-8bit",
+        id: "jlweights/z-image-8bit",
         name: "Z-Image 8-bit (~2 GB)",
         variant: .zImage,
         configName: "zimage",
-        repo: "justintime47/Z-Image-MLX-Serve-8bit",
+        repo: "jlweights/Z-Image-MLX-Serve-8bit",
         approxDownloadGB: 2,
         approxRAMGB: 4,
         resolutions: zImageResolutions,
